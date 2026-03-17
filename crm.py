@@ -84,6 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(entity, key);
 CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source);
 CREATE INDEX IF NOT EXISTS idx_facts_value ON facts(value);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_dedup ON facts(entity, key, value, source);
 """
 
 
@@ -93,7 +94,7 @@ class CRM:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.executescript(SCHEMA)
+        self._init_schema()
 
     def close(self):
         self.conn.close()
@@ -104,6 +105,22 @@ class CRM:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+    def _init_schema(self):
+        """Initialize schema, deduplicating existing facts if needed for the unique index."""
+        try:
+            self.conn.executescript(SCHEMA)
+        except sqlite3.IntegrityError:
+            # Existing DB has duplicate facts — deduplicate before retrying.
+            # Keep the row with the latest observed_at for each (entity, key, value, source).
+            self.conn.execute(
+                """DELETE FROM facts WHERE rowid NOT IN (
+                       SELECT MAX(rowid) FROM facts
+                       GROUP BY entity, key, value, source
+                   )"""
+            )
+            self.conn.commit()
+            self.conn.executescript(SCHEMA)
 
     # --- Contacts ---
 
@@ -308,11 +325,17 @@ class CRM:
     # --- Context Graph ---
 
     def observe(self, entity, key, value, source="manual"):
-        """Record a fact. Any entity, any key, any value, any source."""
+        """Record a fact. Any entity, any key, any value, any source.
+
+        Deduplicates: if the exact (entity, key, value, source) tuple already
+        exists, refreshes observed_at instead of creating a duplicate row.
+        """
         if not entity or not key:
             raise ValueError("entity and key must be non-empty")
         self.conn.execute(
-            "INSERT INTO facts (entity, key, value, source) VALUES (?, ?, ?, ?)",
+            """INSERT INTO facts (entity, key, value, source) VALUES (?, ?, ?, ?)
+               ON CONFLICT(entity, key, value, source)
+               DO UPDATE SET observed_at = CURRENT_TIMESTAMP""",
             (entity, key, value, source)
         )
         self.conn.commit()
@@ -322,7 +345,9 @@ class CRM:
         """Bulk insert facts in a single transaction.
 
         facts: iterable of (entity, key, value) or (entity, key, value, source) tuples.
-        Returns the number of facts inserted.
+        Deduplicates: exact (entity, key, value, source) matches refresh
+        observed_at instead of creating duplicate rows.
+        Returns the number of facts processed (inserted or refreshed).
         """
         rows = []
         for f in facts:
@@ -335,7 +360,9 @@ class CRM:
                 raise ValueError("entity and key must be non-empty")
             rows.append((entity, key, value, src))
         self.conn.executemany(
-            "INSERT INTO facts (entity, key, value, source) VALUES (?, ?, ?, ?)",
+            """INSERT INTO facts (entity, key, value, source) VALUES (?, ?, ?, ?)
+               ON CONFLICT(entity, key, value, source)
+               DO UPDATE SET observed_at = CURRENT_TIMESTAMP""",
             rows
         )
         self.conn.commit()
