@@ -1817,6 +1817,16 @@ class CRM:
             (f"%{target_lower}%",)
         ).fetchall()
 
+        # Also match by email domain: @acme.com matches target "acme"
+        # This catches contacts whose company field is empty but email reveals affiliation
+        domain_matches = self.conn.execute(
+            "SELECT * FROM contacts WHERE email IS NOT NULL AND LOWER(email) LIKE ?",
+            (f"%@{target_lower}%",)
+        ).fetchall()
+        # Merge domain matches into company_matches (avoid duplicates by id)
+        company_match_ids = {r["id"] for r in company_matches}
+        company_matches = list(company_matches) + [r for r in domain_matches if r["id"] not in company_match_ids]
+
         # Find contacts whose name matches the target
         name_matches = self.conn.execute(
             "SELECT * FROM contacts WHERE LOWER(name) LIKE ?",
@@ -1925,8 +1935,18 @@ class CRM:
             imessage_total = int(imsg.get("imessage_total", 0))
             intensity = imsg.get("message_intensity", "low")
 
-            # Direct match: connector works at target company
+            # Also check email domain for company affiliation
+            email = contact_info.get("email") or ""
+            email_domain = email.split("@")[1].split(".")[0].lower() if "@" in email else ""
+
+            # Direct match: connector works at target company (by company field or email domain)
+            matched_company = ""
             if company and target_lower in company.lower():
+                matched_company = company
+            elif email_domain and target_lower in email_domain:
+                matched_company = email_domain.title()
+
+            if matched_company:
                 seen_connectors.add(person_name)
                 display_name = person_name.title()
                 results.append({
@@ -1936,9 +1956,9 @@ class CRM:
                         "imessage_total": imessage_total,
                         "intensity": intensity,
                     },
-                    "connection_to_target": f"Works at {company}",
+                    "connection_to_target": f"Works at {matched_company}",
                     "warmth_score": self._intro_warmth_score(imessage_total, intensity),
-                    "suggested_action": self._intro_suggested_action(display_name, intensity, company, "employee"),
+                    "suggested_action": self._intro_suggested_action(display_name, intensity, matched_company, "employee"),
                 })
 
         # Strategy B: Find your contacts who know someone at the target company
@@ -2022,6 +2042,11 @@ class CRM:
             imsg = imessage_data.get(f"contact:{person_name}", {})
             imessage_total = int(imsg.get("imessage_total", 0))
             intensity = imsg.get("message_intensity", "low")
+            # Use company field if set, otherwise infer from email domain
+            company_label = row["company"]
+            if not company_label and row["email"] and "@" in row["email"]:
+                domain = row["email"].split("@")[1].split(".")[0]
+                company_label = domain.title()
             results.append({
                 "connector": display_name,
                 "connector_email": row["email"],
@@ -2029,9 +2054,9 @@ class CRM:
                     "imessage_total": imessage_total,
                     "intensity": intensity,
                 },
-                "connection_to_target": f"Works at {row['company']}",
+                "connection_to_target": f"Works at {company_label}",
                 "warmth_score": self._intro_warmth_score(imessage_total, intensity),
-                "suggested_action": self._intro_suggested_action(display_name, intensity, row["company"], "employee"),
+                "suggested_action": self._intro_suggested_action(display_name, intensity, company_label or target, "employee"),
             })
 
         # --- Step 4: Sort by warmth score (highest first) ---
