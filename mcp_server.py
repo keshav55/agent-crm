@@ -225,6 +225,38 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "crm_find_intros",
+        "description": "Find warm intro paths to a target company, person, or email using the relationship graph",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Company name, person name, or email to find intros to"},
+            },
+            "required": ["target"],
+        },
+    },
+    {
+        "name": "crm_relationship_health",
+        "description": "Analyze relationship health across all contacts — surfaces decaying relationships and opportunities",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_network_summary",
+        "description": "High-level summary of your relationship network: contacts, companies, message volumes, pipeline value",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_unified_search",
+        "description": "Search across contacts, facts, and activity simultaneously. More comprehensive than basic search.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "term": {"type": "string", "description": "Search term"},
+            },
+            "required": ["term"],
+        },
+    },
 ]
 
 
@@ -316,6 +348,22 @@ def handle_tool_call(name, arguments):
                 e, f = crm.ingest_macos_calendar()
                 result = {"calendar": {"events": e, "facts": f}}
             return json.dumps(result, indent=2)
+
+        elif name == "crm_find_intros":
+            results = crm.find_intros(arguments["target"])
+            return json.dumps(results, default=str, indent=2)
+
+        elif name == "crm_relationship_health":
+            results = crm.relationship_health()
+            return json.dumps(results, default=str, indent=2)
+
+        elif name == "crm_network_summary":
+            result = crm.network_summary()
+            return json.dumps(result, default=str, indent=2)
+
+        elif name == "crm_unified_search":
+            results = crm.unified_search(arguments["term"])
+            return json.dumps(results, default=str, indent=2)
 
         else:
             return f"Unknown tool: {name}"
