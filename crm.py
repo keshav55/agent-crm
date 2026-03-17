@@ -2231,7 +2231,6 @@ class CRM:
                 ab = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                 ab.row_factory = sqlite3.Row
             except Exception as e:
-                import sys
                 print(f"Warning: AddressBook open error ({db_path}): {e}", file=sys.stderr)
                 continue
 
@@ -2321,7 +2320,6 @@ class CRM:
                         facts.append((entity, "notes", raw_notes.strip()[:500], "macos_contacts"))
 
             except Exception as e:
-                import sys
                 print(f"Warning: AddressBook read error: {e}", file=sys.stderr)
             finally:
                 ab.close()
@@ -2346,7 +2344,6 @@ class CRM:
             mdb = sqlite3.connect(f"file:{chat_db}?mode=ro", uri=True)
             mdb.row_factory = sqlite3.Row
         except Exception as e:
-            import sys
             print(f"Warning: iMessage DB open error: {e}", file=sys.stderr)
             return (0, 0)
 
@@ -2428,7 +2425,6 @@ class CRM:
                         facts.append((crm_entity, "message_intensity", intensity, "imessage"))
 
         except Exception as e:
-            import sys
             print(f"Warning: iMessage read error: {e}", file=sys.stderr)
         finally:
             mdb.close()
@@ -2453,7 +2449,6 @@ class CRM:
             cdb = sqlite3.connect(f"file:{cal_db}?mode=ro", uri=True)
             cdb.row_factory = sqlite3.Row
         except Exception as e:
-            import sys
             print(f"Warning: Calendar DB open error: {e}", file=sys.stderr)
             return (0, 0)
 
@@ -2546,7 +2541,6 @@ class CRM:
                 pass  # Attendee table may not exist in all versions
 
         except Exception as e:
-            import sys
             print(f"Warning: Calendar read error: {e}", file=sys.stderr)
         finally:
             cdb.close()
@@ -2764,7 +2758,6 @@ class CRM:
             mdb = sqlite3.connect(f"file:{envelope_db}?mode=ro", uri=True)
             mdb.row_factory = sqlite3.Row
         except Exception as e:
-            import sys
             print(f"Warning: Mail DB open error: {e}", file=sys.stderr)
             return (0, 0)
 
@@ -2818,7 +2811,6 @@ class CRM:
                     email_counts[to_addr]["received"] += 1
 
         except Exception as e:
-            import sys
             print(f"Warning: Mail read error: {e}", file=sys.stderr)
         finally:
             mdb.close()
@@ -2903,7 +2895,6 @@ class CRM:
 
             mbox.close()
         except Exception as e:
-            import sys
             print(f"Warning: mbox read error: {e}", file=sys.stderr)
 
         for addr, counts in email_counts.items():
