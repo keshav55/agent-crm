@@ -118,8 +118,8 @@ class CRM:
         self.conn.commit()
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    def update_contact(self, email, **fields):
-        contact = self.get_contact(email)
+    def update_contact(self, identifier, **fields):
+        contact = self.get_contact(identifier)
         if not contact:
             return None
         allowed = {"name", "company", "title", "deal_size", "status", "source", "notes", "tags", "last_contacted"}
@@ -128,10 +128,10 @@ class CRM:
             return contact
         sets = ", ".join(f"{k} = ?" for k in updates)
         vals = list(updates.values())
-        vals.append(email)
-        self.conn.execute(f"UPDATE contacts SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE email = ?", vals)
+        vals.append(contact["id"])
+        self.conn.execute(f"UPDATE contacts SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", vals)
         self.conn.commit()
-        return self.get_contact(email)
+        return self.get_contact(contact.get("email") or contact["name"])
 
     def get_contact(self, identifier):
         """Get contact by email or name (partial match)."""
