@@ -3363,6 +3363,23 @@ class CRM:
                 parts.append(f"- [{date}] {a['type']}: {a['summary']}")
             parts.append("")
 
+        # Warm intro paths — surface mutual connections from the knowledge graph
+        if company and company != "unknown company":
+            try:
+                intros = self.find_intros(company)
+                if intros:
+                    parts.append("**Warm intro paths:**")
+                    for intro in intros[:3]:
+                        warmth = intro.get("warmth_score", 0)
+                        connector = intro["connector"]
+                        connection = intro["connection_to_target"]
+                        parts.append(f"- {connector} ({connection}, warmth {warmth}/100)")
+                        if intro.get("suggested_action"):
+                            parts.append(f"  Suggested: {intro['suggested_action']}")
+                    parts.append("")
+            except Exception:
+                pass  # Graph data may not exist; don't break the prompt
+
         # Action-specific instructions
         templates = {
             "follow_up": (
