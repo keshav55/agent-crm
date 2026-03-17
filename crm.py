@@ -185,11 +185,17 @@ class CRM:
         self.conn.execute("DELETE FROM activity WHERE contact_id = ?", (contact["id"],))
         self.conn.execute("DELETE FROM deals WHERE contact_id = ?", (contact["id"],))
         self.conn.execute("DELETE FROM contacts WHERE id = ?", (contact["id"],))
-        # Cascade delete facts for contact entities matching this contact
+        # Cascade delete facts for all contact entity variants
         name_lower = name.lower()
+        entity_variants = [f"contact:{name_lower}",
+                           f"contact:{name_lower.replace(' ', '_')}",
+                           f"contact:{name_lower.split()[0]}"]
+        if contact.get("email"):
+            entity_variants.append(f"contact:{contact['email'].lower()}")
+        placeholders = ",".join("?" * len(entity_variants))
         self.conn.execute(
-            "DELETE FROM facts WHERE entity LIKE 'contact:%' AND entity IN (?, ?)",
-            (f"contact:{name_lower}", f"contact:{name_lower.split()[0]}")
+            f"DELETE FROM facts WHERE entity LIKE 'contact:%' AND entity IN ({placeholders})",
+            entity_variants
         )
         self.conn.commit()
         return True
@@ -846,7 +852,10 @@ class CRM:
 
         # Facts richness + graph engagement (10 pts)
         name_lower = contact["name"].lower()
-        entity_keys = [f"contact:{name_lower}", f"contact:{name_lower.split()[0]}"]
+        entity_keys = list(set([f"contact:{name_lower}",
+                                f"contact:{name_lower.replace(' ', '_')}",
+                                f"contact:{name_lower.split()[0]}"]
+                               + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])))
         total_facts = 0
         graph_engagement_pts = 0
         for ek in entity_keys:
@@ -1214,10 +1223,15 @@ class CRM:
             for a in acts:
                 lines.append(f"- [{a['created_at'][:10]}] {a['type']}: {a['summary']}")
 
-        # Facts
+        # Facts — match all entity key variants used across the codebase:
+        #   "contact:alice smith" (ingest), "contact:alice_smith" (auto_observe),
+        #   "contact:alice" / "contact:smith" (name parts), "contact:alice@co.com" (iMessage email handle)
         name_lower = contact["name"].lower()
         parts = name_lower.split()
-        entity_keys = list(set([f"contact:{name_lower}"] + [f"contact:{p}" for p in parts]))
+        entity_keys = list(set([f"contact:{name_lower}",
+                                f"contact:{name_lower.replace(' ', '_')}"]
+                               + [f"contact:{p}" for p in parts]
+                               + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])))
         all_facts = {}
         for ek in entity_keys:
             all_facts.update(self.facts_about(ek))
