@@ -177,6 +177,34 @@ class CRM:
         t = f"%{term}%"
         return [dict(r) for r in self.conn.execute(query, (t, t, t, t, t)).fetchall()]
 
+    def unified_search(self, term):
+        """Search across contacts, facts, and activity. Returns dict with sections."""
+        t = f"%{term}%"
+        contacts = self.conn.execute(
+            """SELECT * FROM contacts WHERE
+               name LIKE ? OR company LIKE ? OR email LIKE ? OR notes LIKE ? OR tags LIKE ?
+               ORDER BY last_contacted DESC NULLS LAST""",
+            (t, t, t, t, t)
+        ).fetchall()
+        facts = self.conn.execute(
+            """SELECT entity, key, value, source, observed_at FROM facts
+               WHERE entity LIKE ? OR key LIKE ? OR value LIKE ? OR source LIKE ?
+               ORDER BY observed_at DESC""",
+            (t, t, t, t)
+        ).fetchall()
+        activities = self.conn.execute(
+            """SELECT a.type, a.summary, a.created_at, c.name as contact_name
+               FROM activity a JOIN contacts c ON a.contact_id = c.id
+               WHERE a.summary LIKE ?
+               ORDER BY a.created_at DESC LIMIT 20""",
+            (t,)
+        ).fetchall()
+        return {
+            "contacts": [dict(r) for r in contacts],
+            "facts": [dict(r) for r in facts],
+            "activities": [dict(r) for r in activities],
+        }
+
     def delete_contact(self, email):
         contact = self.get_contact(email)
         if not contact:
@@ -3810,8 +3838,20 @@ def main():
             print(f"  [{a['created_at'][:10]}] {a['type']}: {a['summary']}")
 
     elif args.command == "search":
-        results = crm.search(args.term)
-        fmt_table(results, ["name", "company", "status", "deal_size", "last_contacted"])
+        results = crm.unified_search(args.term)
+        if results["contacts"]:
+            print("Contacts:")
+            fmt_table(results["contacts"], ["name", "company", "status", "deal_size", "last_contacted"])
+        if results["facts"]:
+            print("\nFacts:")
+            for f in results["facts"][:20]:
+                print(f"  {f['entity']} → {f['key']} = {f['value']}  (via {f['source']}, {f['observed_at'][:10]})")
+        if results["activities"]:
+            print("\nActivity:")
+            for a in results["activities"]:
+                print(f"  [{a['created_at'][:10]}] {a['contact_name']} — {a['type']}: {a['summary']}")
+        if not any(results.values()):
+            print(f"  No results for: {args.term}")
 
     elif args.command == "pipeline":
         pipeline = crm.pipeline()
