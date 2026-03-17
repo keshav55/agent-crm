@@ -712,16 +712,29 @@ class CRM:
         return True
 
     def compact_markdown(self):
-        """Shorter summary of the context graph."""
+        """Shorter summary of the context graph with key insights."""
         rows = self.conn.execute(
             """SELECT entity, COUNT(DISTINCT key) as fact_count
-               FROM facts GROUP BY entity ORDER BY entity"""
+               FROM facts GROUP BY entity ORDER BY fact_count DESC"""
         ).fetchall()
-        lines = ["# Graph Summary", ""]
-        for r in rows:
-            lines.append(f"- **{r['entity']}**: {r['fact_count']} facts")
-        lines.append("")
         stats = self.graph_stats()
+        lines = ["# Graph Summary", ""]
+        # Show top entities (cap at 10 to stay compact)
+        shown = rows[:10]
+        for r in shown:
+            lines.append(f"- **{r['entity']}**: {r['fact_count']} facts")
+        if len(rows) > 10:
+            lines.append(f"- _...and {len(rows) - 10} more entities_")
+        lines.append("")
+        # Source breakdown
+        sources = self.conn.execute(
+            """SELECT source, COUNT(*) as cnt
+               FROM facts GROUP BY source ORDER BY cnt DESC"""
+        ).fetchall()
+        if sources:
+            for s in sources:
+                lines.append(f"- _{s['source']}_: {s['cnt']} facts")
+            lines.append("")
         lines.append(f"_{stats['entities']} entities, {stats['facts']} total facts_")
         return "\n".join(lines)
 
