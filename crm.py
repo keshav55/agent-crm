@@ -726,6 +726,25 @@ class CRM:
     STAGE_PROBABILITIES = {"prospect": 0.10, "contacted": 0.20, "met": 0.30, "proposal_drafted": 0.50, "verbal_yes": 0.75, "active_customer": 1.0}
 
     @staticmethod
+    def _normalize_phone(raw):
+        """Normalize a phone number: strip formatting, ensure +country code.
+
+        Strips spaces, dashes, parens, dots — keeps digits and leading +.
+        Adds +1 prefix for bare US 10-digit or 11-digit-with-leading-1 numbers.
+        Returns the normalized string, or '' if nothing useful remains.
+        """
+        if not raw:
+            return ""
+        cleaned = "".join(c for c in str(raw).strip() if c.isdigit() or c == "+")
+        if not cleaned:
+            return ""
+        if not cleaned.startswith("+") and len(cleaned) == 10:
+            cleaned = "+1" + cleaned
+        elif not cleaned.startswith("+") and len(cleaned) == 11 and cleaned.startswith("1"):
+            cleaned = "+" + cleaned
+        return cleaned
+
+    @staticmethod
     def _parse_deal_size(val):
         """Parse deal size strings into annual dollar value. Returns 0 if unparseable."""
         if not val:
@@ -2157,15 +2176,11 @@ class CRM:
                     for p in phones:
                         phone = str(p["phone"] or "").strip()
                         if phone:
-                            # Normalize: strip spaces/dashes/parens, keep +country code
-                            normalized = "".join(c for c in phone if c.isdigit() or c == "+")
-                            if not normalized.startswith("+") and len(normalized) == 10:
-                                normalized = "+1" + normalized
-                            elif not normalized.startswith("+") and len(normalized) == 11 and normalized.startswith("1"):
-                                normalized = "+" + normalized
-                            facts.append((f"phone:{normalized}", "name", name, "macos_contacts"))
-                            if company:
-                                facts.append((f"phone:{normalized}", "company", company, "macos_contacts"))
+                            normalized = self._normalize_phone(phone)
+                            if normalized:
+                                facts.append((f"phone:{normalized}", "name", name, "macos_contacts"))
+                                if company:
+                                    facts.append((f"phone:{normalized}", "company", company, "macos_contacts"))
 
                     # Build facts
                     if company:
@@ -2245,7 +2260,10 @@ class CRM:
                 if "@" in handle:
                     entity = f"contact:{handle.lower()}"
                 else:
-                    entity = f"phone:{handle}"
+                    # Apply same normalization as ingest_macos_contacts so
+                    # phone: entities match up for name resolution.
+                    normalized_phone = self._normalize_phone(handle)
+                    entity = f"phone:{normalized_phone}" if normalized_phone else f"phone:{handle}"
 
                 contacts_found.add(handle)
 
