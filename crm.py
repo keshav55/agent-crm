@@ -844,15 +844,44 @@ class CRM:
         score += status_pts
         factors.append(f"Status '{status}' (+{status_pts}pts)")
 
-        # Facts richness (10 pts)
+        # Facts richness + graph engagement (10 pts)
         name_lower = contact["name"].lower()
         entity_keys = [f"contact:{name_lower}", f"contact:{name_lower.split()[0]}"]
         total_facts = 0
+        graph_engagement_pts = 0
         for ek in entity_keys:
-            total_facts += len(self.facts_about(ek))
-        facts_pts = min(10, total_facts * 2)
+            ef = self.facts_about(ek)
+            total_facts += len(ef)
+            # iMessage engagement signal — high volume = strong relationship
+            imsg = ef.get("imessage_total")
+            if imsg:
+                try:
+                    vol = int(imsg["value"])
+                    if vol > 100:
+                        graph_engagement_pts = max(graph_engagement_pts, 5)
+                    elif vol > 20:
+                        graph_engagement_pts = max(graph_engagement_pts, 3)
+                    elif vol > 0:
+                        graph_engagement_pts = max(graph_engagement_pts, 1)
+                except (ValueError, TypeError):
+                    pass
+            # Email engagement signal
+            email_f = ef.get("email_total")
+            if email_f:
+                try:
+                    vol = int(email_f["value"])
+                    if vol > 50:
+                        graph_engagement_pts = max(graph_engagement_pts, 4)
+                    elif vol > 10:
+                        graph_engagement_pts = max(graph_engagement_pts, 2)
+                    elif vol > 0:
+                        graph_engagement_pts = max(graph_engagement_pts, 1)
+                except (ValueError, TypeError):
+                    pass
+        facts_pts = min(10, total_facts * 2 + graph_engagement_pts)
         score += facts_pts
-        factors.append(f"{total_facts} facts (+{facts_pts}pts)")
+        engagement_detail = f", graph engagement +{graph_engagement_pts}" if graph_engagement_pts else ""
+        factors.append(f"{total_facts} facts (+{facts_pts}pts{engagement_detail})")
 
         return {"score": min(score, 100), "factors": factors}
 
