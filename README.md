@@ -116,9 +116,56 @@ Maps Salesforce contacts, opportunities, accounts, and tasks. Stage mapping (Pro
 
 The pattern is the same for any CRM with an API: pull contacts and deals into the local graph, observe facts, push changes back. The `skills/` folder is where new integrations go.
 
-## MCP server
+## Agent API
 
-21 tools for any AI agent. Add to your MCP client config:
+One import. Every method returns dicts. Any agent framework can use it.
+
+```python
+from crm import CRM
+crm = CRM("crm.db")
+
+# Contacts
+crm.add_contact("Alice", email="alice@acme.com", company="Acme")
+crm.get_contact("alice@acme.com")       # by email or partial name
+crm.update_contact("Alice", status="contacted")
+crm.list_contacts(status="prospect")
+crm.delete_contact("alice@acme.com")
+
+# Activity
+crm.log_activity("alice@acme.com", "call", "Discussed pricing")
+crm.get_activity("alice@acme.com")
+
+# Deals
+crm.add_deal("alice@acme.com", "Enterprise License", value="$50K")
+
+# Knowledge graph
+crm.observe("contact:alice", "role", "CEO", source="linkedin")
+crm.facts_about("contact:alice")
+crm.graph_search("company", "acme")
+
+# Intelligence
+crm.score_contact("alice@acme.com")     # 0-100 engagement score
+crm.find_intros("Acme")                 # warm paths through your network
+crm.relationship_health()               # flag fading/one-sided relationships
+crm.network_summary()                   # full network dashboard
+crm.unified_search("Acme")              # search contacts + facts + activity
+crm.context_for_agent("alice@acme.com") # context string for any AI agent
+crm.interaction_prompt("alice@acme.com") # outreach prompt with warm intros
+
+# Pipeline
+crm.pipeline()                          # grouped by status
+crm.stats()                             # counts and metrics
+crm.next_actions()                      # prioritized recommendations
+
+# Local data
+crm.ingest_all()                        # pull Contacts, iMessage, Calendar, Mail
+```
+
+No server. No protocol. `from crm import CRM` and go.
+
+## MCP server (optional)
+
+If your tool speaks MCP, there's a server with 21 tools:
 
 ```json
 {
@@ -130,51 +177,6 @@ The pattern is the same for any CRM with an API: pull contacts and deals into th
   }
 }
 ```
-
-Works with Claude Code, Cursor, Codex, or any MCP client.
-
-**Available tools:**
-
-| Tool | What it does |
-|------|-------------|
-| `crm_add_contact` | Add a contact |
-| `crm_list_contacts` | List/filter contacts |
-| `crm_view_contact` | Full contact details + facts + activity |
-| `crm_update_contact` | Update fields |
-| `crm_log_activity` | Log calls, emails, meetings |
-| `crm_search` | Search contacts |
-| `crm_unified_search` | Search across contacts, facts, and activity |
-| `crm_observe` | Record a fact in the knowledge graph |
-| `crm_facts_about` | Get all facts about an entity |
-| `crm_search_graph` | Search the knowledge graph |
-| `crm_pipeline` | Pipeline summary |
-| `crm_stats` | CRM statistics |
-| `crm_score_contact` | Engagement score (0-100) |
-| `crm_enrich` | Full enriched profile |
-| `crm_next_actions` | Recommended next actions |
-| `crm_context_for_agent` | Context string for AI agents |
-| `crm_query` | Natural language query |
-| `crm_ingest` | Pull local macOS data |
-| `crm_find_intros` | Warm intro paths |
-| `crm_relationship_health` | Relationship health analysis |
-| `crm_network_summary` | Network dashboard |
-
-## As a library
-
-```python
-from crm import CRM
-crm = CRM("crm.db")
-
-crm.add_contact("Alice", email="alice@acme.com", company="Acme")
-crm.log_activity("alice@acme.com", "call", "Discussed pricing")
-crm.score_contact("alice@acme.com")
-crm.find_intros("Acme")
-crm.relationship_health()
-crm.network_summary()
-crm.unified_search("Acme")
-```
-
-All methods return dicts. `get_contact()` accepts email or partial name match.
 
 ## Self-improvement
 
