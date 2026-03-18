@@ -266,6 +266,14 @@ class CRM:
             (contact["id"], name, value, stage, notes)
         )
         self.conn.commit()
+        # Record deal in knowledge graph so graph queries surface it
+        entity = f"contact:{contact['name'].lower()}"
+        facts = [(entity, "deal", name, "crm_deal")]
+        if value:
+            facts.append((entity, "deal_value", str(value), "crm_deal"))
+        if stage:
+            facts.append((entity, "deal_stage", stage, "crm_deal"))
+        self.observe_many(facts, source="crm_deal")
         return True
 
     def list_deals(self, stage=None):
