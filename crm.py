@@ -1467,34 +1467,47 @@ class CRM:
         return result[:8000]
 
     def add_tag(self, identifier, tag):
-        """Add a tag to a contact's comma-separated tags field. No duplicates."""
+        """Add a tag to a contact's comma-separated tags field. No duplicates.
+        Also records the tag as a fact in the knowledge graph."""
         contact = self.get_contact(identifier)
         if not contact:
             return None
         existing = contact.get("tags") or ""
         tags = [t.strip() for t in existing.split(",") if t.strip()]
-        if tag.strip() not in tags:
-            tags.append(tag.strip())
+        clean_tag = tag.strip()
+        if clean_tag not in tags:
+            tags.append(clean_tag)
         new_tags = ",".join(tags)
         self.conn.execute(
             "UPDATE contacts SET tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (new_tags, contact["id"])
         )
         self.conn.commit()
+        # Record tag in knowledge graph so graph queries can discover it
+        entity = f"contact:{contact['name'].lower()}"
+        self.observe(entity, "tag", clean_tag, source="crm_tag")
         return True
 
     def remove_tag(self, identifier, tag):
-        """Remove a tag from a contact's tags field."""
+        """Remove a tag from a contact's tags field.
+        Also removes the corresponding fact from the knowledge graph."""
         contact = self.get_contact(identifier)
         if not contact:
             return None
         existing = contact.get("tags") or ""
         tags = [t.strip() for t in existing.split(",") if t.strip()]
-        tags = [t for t in tags if t != tag.strip()]
+        clean_tag = tag.strip()
+        tags = [t for t in tags if t != clean_tag]
         new_tags = ",".join(tags) if tags else None
         self.conn.execute(
             "UPDATE contacts SET tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (new_tags, contact["id"])
+        )
+        # Remove the tag fact from the knowledge graph
+        entity = f"contact:{contact['name'].lower()}"
+        self.conn.execute(
+            "DELETE FROM facts WHERE entity = ? AND key = 'tag' AND value = ? AND source = 'crm_tag'",
+            (entity, clean_tag)
         )
         self.conn.commit()
         return True
