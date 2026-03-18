@@ -126,7 +126,13 @@ class CRM:
 
     def add_contact(self, name, email=None, company=None, title=None,
                     deal_size=None, status="prospect", source=None,
-                    notes=None, tags=None):
+                    notes=None, tags=None, warn_duplicate=False):
+        if warn_duplicate:
+            existing = self.conn.execute(
+                "SELECT * FROM contacts WHERE LOWER(name) = LOWER(?)", (name,)
+            ).fetchone()
+            if existing:
+                return {"id": None, "duplicate_of": dict(existing)}
         self.conn.execute(
             """INSERT INTO contacts (name, email, company, title, deal_size, status, source, notes, tags)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -3666,6 +3672,7 @@ def main():
     p_add.add_argument("--source")
     p_add.add_argument("--notes", "-n")
     p_add.add_argument("--tags")
+    p_add.add_argument("--force", "-f", action="store_true", help="Add even if a contact with the same name exists")
 
     # ls
     p_ls = sub.add_parser("ls", help="List contacts")
@@ -3920,10 +3927,16 @@ def main():
     crm = CRM(args.db)
 
     if args.command == "add":
-        cid = crm.add_contact(args.name, email=args.email, company=args.company,
-                               title=args.title, deal_size=args.deal, status=args.status,
-                               source=args.source, notes=args.notes, tags=args.tags)
-        print(f"Added: {args.name} (id={cid})")
+        result = crm.add_contact(args.name, email=args.email, company=args.company,
+                                  title=args.title, deal_size=args.deal, status=args.status,
+                                  source=args.source, notes=args.notes, tags=args.tags,
+                                  warn_duplicate=not args.force)
+        if isinstance(result, dict):
+            dup = result["duplicate_of"]
+            print(f"Warning: contact '{dup['name']}' already exists (id={dup['id']}, email={dup.get('email')})")
+            print(f"  Use --force to add anyway, or 'crm.py update {dup.get('email') or dup['name']}' to update the existing contact.")
+        else:
+            print(f"Added: {args.name} (id={result})")
 
     elif args.command == "ls":
         contacts = crm.list_contacts(status=args.status, company=args.company)

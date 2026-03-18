@@ -265,8 +265,13 @@ def handle_tool_call(name, arguments):
     crm = CRM(DB_PATH)
     try:
         if name == "crm_add_contact":
-            cid = crm.add_contact(**arguments)
-            return f"Added contact (id={cid})"
+            result = crm.add_contact(**arguments, warn_duplicate=True)
+            if isinstance(result, dict):
+                dup = result["duplicate_of"]
+                return (f"Warning: contact '{dup['name']}' already exists "
+                        f"(id={dup['id']}, email={dup.get('email')}). "
+                        f"Use crm_update_contact to update, or re-add with a different name.")
+            return f"Added contact (id={result})"
 
         elif name == "crm_list_contacts":
             contacts = crm.list_contacts(**arguments)
