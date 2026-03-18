@@ -590,6 +590,15 @@ def run_benchmarks():
     except (AttributeError, TypeError):
         check("stale_contacts_excludes_active", False)
 
+    # 12t. stale_contacts — log_activity updates last_contacted so contact is not stale
+    try:
+        stale = wave1_crm.stale_contacts()
+        stale_names = [c.get("name", c) if isinstance(c, dict) else str(c) for c in stale]
+        # Dana had log_activity called today — last_contacted should be today, not stale
+        check("stale_contacts_excludes_recently_logged", not any("Dana" in n for n in stale_names))
+    except (AttributeError, TypeError):
+        check("stale_contacts_excludes_recently_logged", False)
+
     wave1_crm.close()
 
     # ── 13. Pipeline Analytics — Wave 2 (19 tests) ──
