@@ -1103,7 +1103,12 @@ class CRM:
         return dupes
 
     def stale_contacts(self, days=14):
-        """Contacts not contacted in N days, sorted by deal size (biggest first). Excludes terminal statuses."""
+        """Contacts not contacted in N days, sorted by deal size (biggest first). Excludes terminal statuses.
+
+        Cross-references the knowledge graph: if a contact has recent facts
+        (e.g. iMessage activity, calendar events) observed within the window,
+        they are NOT considered stale even if last_contacted is old.
+        """
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         rows = self.conn.execute(
             """SELECT * FROM contacts
@@ -1112,7 +1117,28 @@ class CRM:
                ORDER BY last_contacted ASC NULLS FIRST""",
             (cutoff,)
         ).fetchall()
-        contacts = [dict(r) for r in rows]
+        contacts = []
+        for r in rows:
+            c = dict(r)
+            # Check knowledge graph for recent activity on this contact
+            name_lower = c["name"].lower()
+            entity_keys = list(set(
+                [f"contact:{name_lower}",
+                 f"contact:{name_lower.replace(' ', '_')}"]
+                + [f"contact:{p}" for p in name_lower.split()]
+                + ([f"contact:{c['email'].lower()}"] if c.get("email") else [])
+            ))
+            placeholders = ",".join("?" * len(entity_keys))
+            recent_fact = self.conn.execute(
+                f"""SELECT 1 FROM facts
+                    WHERE entity IN ({placeholders})
+                    AND date(observed_at) >= date(?)
+                    LIMIT 1""",
+                entity_keys + [cutoff]
+            ).fetchone()
+            if recent_fact:
+                continue  # has recent graph activity — not truly stale
+            contacts.append(c)
         contacts.sort(key=lambda c: self._parse_deal_size(c.get("deal_size")), reverse=True)
         return contacts
 
