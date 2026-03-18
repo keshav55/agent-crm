@@ -1308,10 +1308,29 @@ class CRM:
         lines.append(f"- **MRR:** ${rev['mrr']:,.0f}")
         lines.append(f"- **Pipeline:** ${rev['pipeline_value']:,.0f}")
         lines.append(f"- **Active (7d):** {stats['contacted_last_7d']}")
+        lines.append(f"- **Stale (14d+):** {stats['stale_14d']}")
 
         # Health summary
         hc = self.health_check()
         lines.append(f"- **Health:** {len(hc['healthy'])} healthy, {len(hc['at_risk'])} at risk, {len(hc['cold'])} cold")
+
+        # Deal count by stage
+        funnel = self.conversion_funnel()
+        stage_parts = []
+        for status in self.STATUS_ORDER:
+            if status in funnel and funnel[status]["count"] > 0:
+                stage_parts.append(f"{status}: {funnel[status]['count']}")
+        if stage_parts:
+            lines.append(f"\n## Pipeline by Stage")
+            for sp in stage_parts:
+                lines.append(f"- {sp}")
+
+        # Graph stats
+        gs = self.graph_stats()
+        if gs["entities"] > 0 or gs["facts"] > 0:
+            lines.append(f"\n## Knowledge Graph")
+            lines.append(f"- **Entities:** {gs['entities']}")
+            lines.append(f"- **Facts:** {gs['facts']}")
 
         # Top 5 priority contacts
         pri = self.prioritize(limit=5)
@@ -1319,6 +1338,14 @@ class CRM:
             lines.append("\n## Top Priority Contacts")
             for p in pri:
                 lines.append(f"- **{p['name']}** ({p.get('company') or '-'}) — {p['status']}, score {p['score']}")
+
+        # Relationship health highlights (most actionable)
+        rh = self.relationship_health()
+        actionable = [r for r in rh if r["status"] in ("one-sided-in", "fading")][:3]
+        if actionable:
+            lines.append("\n## Relationship Alerts")
+            for r in actionable:
+                lines.append(f"- **{r['name']}** ({r['status']}): {r['suggestion']}")
 
         # Recent changes (last 7 days)
         changes = self.diff(since=(datetime.now() - timedelta(days=7)).isoformat())
@@ -1328,7 +1355,7 @@ class CRM:
                 lines.append(f"- {ch.get('detail', '')}")
 
         result = "\n".join(lines)
-        return result[:5000]
+        return result[:8000]
 
     def add_tag(self, identifier, tag):
         """Add a tag to a contact's comma-separated tags field. No duplicates."""
