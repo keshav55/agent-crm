@@ -1138,7 +1138,8 @@ class CRM:
     VALID_STATUSES = {"prospect", "contacted", "met", "proposal_drafted", "verbal_yes", "active_customer", "lost", "churned"}
 
     def query(self, q):
-        """Natural language-ish query. Supports status keywords, 'high value', tag/name/company search."""
+        """Natural language-ish query. Supports status keywords, 'high value',
+        'most messaged', graph fact search, tag/name/company search."""
         q = q.strip()
         q_lower = q.lower().replace(" ", "_").replace("-", "_")
         # Strip trailing 's' for plural tolerance (e.g. "active_customers" -> "active_customer")
@@ -1157,6 +1158,10 @@ class CRM:
             contacts = [c for c in all_c if self._parse_deal_size(c.get("deal_size")) > 0]
             return self._sort_by_score(contacts)
 
+        # "most messaged" / "most_messaged" — rank contacts by iMessage total from graph
+        if q_lower in ("most_messaged", "mostmessaged", "most_contacted", "mostcontacted"):
+            return self._query_most_messaged()
+
         # Fall through: search tags first, then general search
         tag_results = self.conn.execute(
             "SELECT * FROM contacts WHERE tags LIKE ?", (f"%{q}%",)
@@ -1164,7 +1169,53 @@ class CRM:
         if tag_results:
             return self._sort_by_score([dict(r) for r in tag_results])
 
-        return self._sort_by_score(self.search(q))
+        # Contact-table search
+        contact_results = self.search(q)
+        if contact_results:
+            return self._sort_by_score(contact_results)
+
+        # Graph fallback: search facts for the query term and resolve to contacts
+        return self._query_graph_fallback(q)
+
+    def _query_most_messaged(self):
+        """Return contacts ranked by iMessage total (highest first) from graph facts."""
+        rows = self.conn.execute(
+            "SELECT entity, value FROM facts WHERE key = 'imessage_total' ORDER BY CAST(value AS INTEGER) DESC"
+        ).fetchall()
+        seen_ids = set()
+        contacts = []
+        for r in rows:
+            c = self._resolve_entity_to_contact(r["entity"])
+            if c and c["id"] not in seen_ids:
+                seen_ids.add(c["id"])
+                contacts.append(c)
+        return contacts  # already ranked by message count, skip score re-sort
+
+    def _query_graph_fallback(self, q):
+        """Search the knowledge graph for q and resolve matching entities to contacts."""
+        t = f"%{q}%"
+        rows = self.conn.execute(
+            """SELECT DISTINCT entity FROM facts
+               WHERE entity LIKE ? OR key LIKE ? OR value LIKE ?
+               ORDER BY observed_at DESC""",
+            (t, t, t)
+        ).fetchall()
+        seen_ids = set()
+        contacts = []
+        for r in rows:
+            c = self._resolve_entity_to_contact(r["entity"])
+            if c and c["id"] not in seen_ids:
+                seen_ids.add(c["id"])
+                contacts.append(c)
+        return self._sort_by_score(contacts) if contacts else []
+
+    def _resolve_entity_to_contact(self, entity):
+        """Resolve a graph entity key (e.g. 'contact:alice_smith') to a contact dict."""
+        if not entity.startswith("contact:"):
+            return None
+        identifier = entity[len("contact:"):]
+        # Try direct lookup: the identifier might be an email or a name fragment
+        return self.get_contact(identifier.replace("_", " ")) or self.get_contact(identifier)
 
     def _sort_by_score(self, contacts):
         """Sort contacts by score descending. Used by query/segment."""
