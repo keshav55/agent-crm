@@ -1012,7 +1012,9 @@ class CRM:
             else:
                 healthy.append(entry)
 
-        return {"healthy": healthy, "at_risk": at_risk, "cold": cold, "actions": actions}
+        total = len(healthy) + len(at_risk) + len(cold)
+        summary = f"{total} contacts: {len(healthy)} healthy, {len(at_risk)} at risk, {len(cold)} cold"
+        return {"healthy": healthy, "at_risk": at_risk, "cold": cold, "actions": actions, "summary": summary}
 
     def conversion_funnel(self):
         """Pipeline conversion funnel — count, avg days, and conversion rate per stage."""
@@ -4226,6 +4228,7 @@ def main():
     elif args.command == "health":
         # Pipeline health
         h = crm.health_check()
+        print(f"\n  {h['summary']}")
         for category in ["healthy", "at_risk", "cold"]:
             items = h[category]
             print(f"\n  {category.upper()} ({len(items)}):")
