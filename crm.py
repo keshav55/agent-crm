@@ -319,10 +319,26 @@ class CRM:
 
     # --- Import/Export ---
 
-    def export_csv(self, path=None):
+    def export_csv(self, path=None, enrich=False):
+        """Export contacts to CSV.
+
+        If enrich=True, append activity_count, deal_count, and score columns
+        so the spreadsheet gives a complete picture of each contact.
+        """
         contacts = self.list_contacts()
         if not contacts:
             return ""
+        if enrich:
+            for c in contacts:
+                cid = c["id"]
+                c["activity_count"] = self.conn.execute(
+                    "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (cid,)
+                ).fetchone()[0]
+                c["deal_count"] = self.conn.execute(
+                    "SELECT COUNT(*) FROM deals WHERE contact_id = ?", (cid,)
+                ).fetchone()[0]
+                sc = self.score_contact(c.get("email") or c["name"])
+                c["score"] = sc["score"] if sc else 0
         output = path or sys.stdout
         should_close = False
         if isinstance(output, str):
@@ -3780,6 +3796,7 @@ def main():
     # export
     p_export = sub.add_parser("export", help="Export contacts to CSV")
     p_export.add_argument("--output", "-o", help="Output file path")
+    p_export.add_argument("--enrich", action="store_true", help="Include activity_count, deal_count, and score columns")
 
     # import
     p_import = sub.add_parser("import", help="Import contacts from CSV")
@@ -4080,7 +4097,7 @@ def main():
         print(json.dumps(crm.to_json(), indent=2, default=str))
 
     elif args.command == "export":
-        crm.export_csv(args.output)
+        crm.export_csv(args.output, enrich=args.enrich)
         if args.output:
             print(f"Exported to: {args.output}")
 
