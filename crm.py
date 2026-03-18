@@ -1650,11 +1650,53 @@ class CRM:
     # --- Automation & Intelligence (Wave 4) ---
 
     def next_actions(self, limit=10):
-        """Recommended actions prioritized by urgency and deal value."""
+        """Recommended actions prioritized by urgency and deal value.
+
+        Cross-references iMessage reciprocity and velocity data so that
+        contacts who are actively reaching out to you (one-sided-in) or
+        whose relationships are decaying surface as actionable items.
+        """
         contacts = self.list_contacts()
         actions = []
         today = date.today()
         priority_rank = {"high": 0, "medium": 1, "low": 2}
+        contacts_with_actions = set()
+
+        # --- Pre-compute iMessage reciprocity data for all contacts ---
+        # Build a lookup: lowercased contact name -> {sent, received, total, intensity}
+        imsg_rows = self.conn.execute(
+            """SELECT entity, key, value FROM facts
+               WHERE source = 'imessage'
+               AND key IN ('imessage_sent', 'imessage_received', 'imessage_total', 'message_intensity')"""
+        ).fetchall()
+        imsg_by_entity = {}
+        for r in imsg_rows:
+            e = r["entity"]
+            if e not in imsg_by_entity:
+                imsg_by_entity[e] = {}
+            imsg_by_entity[e][r["key"]] = r["value"]
+
+        def _get_imsg_data(contact):
+            """Resolve iMessage data for a CRM contact across entity key variants."""
+            nl = contact["name"].lower()
+            variants = list(set(
+                [f"contact:{nl}", f"contact:{nl.replace(' ', '_')}"]
+                + [f"contact:{p}" for p in nl.split()]
+                + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])
+            ))
+            best = None
+            for v in variants:
+                data = imsg_by_entity.get(v)
+                if data and "imessage_total" in data:
+                    total = int(data.get("imessage_total", 0))
+                    if best is None or total > best.get("total", 0):
+                        best = {
+                            "sent": int(data.get("imessage_sent", 0)),
+                            "received": int(data.get("imessage_received", 0)),
+                            "total": total,
+                            "intensity": data.get("message_intensity", "low"),
+                        }
+            return best
 
         for c in contacts:
             identifier = c.get("email") or c["name"]
@@ -1684,31 +1726,64 @@ class CRM:
             # Verbal yes -> Send contract (high) — check before stale so it takes priority
             if status == "verbal_yes":
                 actions.append({"contact": name, "action": "Send contract", "reason": "Verbal yes — close the deal", "priority": "high", "deal_value": deal_val})
+                contacts_with_actions.add(name)
+                continue
+
+            # iMessage reciprocity: they message you heavily, you barely reply (high)
+            imsg = _get_imsg_data(c)
+            if imsg and imsg["received"] > 5 and imsg["sent"] > 0 and imsg["received"] > imsg["sent"] * 5:
+                actions.append({
+                    "contact": name,
+                    "action": "Reply",
+                    "reason": f"They've sent {imsg['received']} messages, you've sent {imsg['sent']} — relationship is one-sided",
+                    "priority": "high",
+                    "deal_value": deal_val,
+                })
+                contacts_with_actions.add(name)
                 continue
 
             # Stale high-value contacts -> Follow up (high)
             if deal_val > 0 and (days_since is None or days_since > 14) and status not in ("active_customer", "lost", "churned"):
                 actions.append({"contact": name, "action": "Follow up", "reason": "High-value contact gone stale", "priority": "high", "deal_value": deal_val})
+                contacts_with_actions.add(name)
                 continue
 
             # Proposal drafted > 7 days -> Follow up on proposal (medium)
             if status == "proposal_drafted" and days_since is not None and days_since > 7:
                 actions.append({"contact": name, "action": "Follow up on proposal", "reason": "Proposal sent over 7 days ago", "priority": "medium", "deal_value": deal_val})
+                contacts_with_actions.add(name)
                 continue
 
             # Met but no proposal -> Draft proposal (medium)
             if status == "met":
                 actions.append({"contact": name, "action": "Draft proposal", "reason": "Met but no proposal yet", "priority": "medium", "deal_value": deal_val})
+                contacts_with_actions.add(name)
                 continue
+
+            # Decaying velocity on pipeline contacts -> Re-engage (medium)
+            if status not in ("active_customer", "lost", "churned") and len(acts) >= 2:
+                vel = self.velocity(identifier)
+                if vel and vel["trend"] == "decaying" and vel["days_until_cold"] is not None:
+                    actions.append({
+                        "contact": name,
+                        "action": "Re-engage",
+                        "reason": f"Engagement decaying — projected cold in {vel['days_until_cold']} days",
+                        "priority": "medium",
+                        "deal_value": deal_val,
+                    })
+                    contacts_with_actions.add(name)
+                    continue
 
             # Prospects with no activity -> Initial outreach (low)
             if status == "prospect" and len(acts) == 0:
                 actions.append({"contact": name, "action": "Initial outreach", "reason": "Prospect with no activity", "priority": "low", "deal_value": deal_val})
+                contacts_with_actions.add(name)
                 continue
 
             # Unresolved conflicts -> Verify (low)
             if has_conflicts:
                 actions.append({"contact": name, "action": "Verify conflicting info", "reason": "Conflicting facts detected", "priority": "low", "deal_value": deal_val})
+                contacts_with_actions.add(name)
                 continue
 
         # Sort: priority first (high < medium < low), then deal_value descending
