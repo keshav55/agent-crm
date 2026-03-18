@@ -3031,8 +3031,24 @@ class CRM:
 
     # --- Relationship Velocity ---
 
+    def _contact_entity_keys(self, contact):
+        """Return all entity key variants for a contact, used across graph lookups."""
+        name_lower = contact["name"].lower()
+        parts = name_lower.split()
+        keys = list(set(
+            [f"contact:{name_lower}",
+             f"contact:{name_lower.replace(' ', '_')}"]
+            + [f"contact:{p}" for p in parts]
+            + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])
+        ))
+        return keys
+
     def velocity(self, identifier, window_days=14):
         """Measure engagement velocity: acceleration or decay of interactions.
+
+        Counts both explicit activity-table entries AND graph-sourced interactions
+        (iMessage, calendar meetings, mail) from the facts table for a complete
+        picture of engagement momentum.
 
         Returns dict with velocity ratio, trend, and projected days until cold.
         """
@@ -3045,7 +3061,7 @@ class CRM:
         prev_start = (now - timedelta(days=window_days * 2)).strftime("%Y-%m-%d %H:%M:%S")
         current_end = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Count activities in each period
+        # Count activities in each period (activity table)
         current_count = self.conn.execute(
             """SELECT COUNT(*) FROM activity
                WHERE contact_id = ? AND created_at >= ?""",
@@ -3057,6 +3073,32 @@ class CRM:
                WHERE contact_id = ? AND created_at >= ? AND created_at < ?""",
             (contact["id"], prev_start, current_start)
         ).fetchone()[0]
+
+        # Also count graph-sourced interactions (iMessage, calendar, mail facts)
+        entity_keys = self._contact_entity_keys(contact)
+        if entity_keys:
+            placeholders = ",".join("?" * len(entity_keys))
+            graph_sources = ("imessage", "macos_calendar", "macos_mail")
+            src_placeholders = ",".join("?" * len(graph_sources))
+
+            current_graph = self.conn.execute(
+                f"""SELECT COUNT(*) FROM facts
+                    WHERE entity IN ({placeholders})
+                    AND source IN ({src_placeholders})
+                    AND observed_at >= ?""",
+                list(entity_keys) + list(graph_sources) + [current_start]
+            ).fetchone()[0]
+
+            prev_graph = self.conn.execute(
+                f"""SELECT COUNT(*) FROM facts
+                    WHERE entity IN ({placeholders})
+                    AND source IN ({src_placeholders})
+                    AND observed_at >= ? AND observed_at < ?""",
+                list(entity_keys) + list(graph_sources) + [prev_start, current_start]
+            ).fetchone()[0]
+
+            current_count += current_graph
+            prev_count += prev_graph
 
         # Calculate velocity
         if prev_count == 0 and current_count == 0:
