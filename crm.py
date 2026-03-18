@@ -1244,8 +1244,16 @@ class CRM:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored]
 
-    def segment(self, tags=None, status=None, min_score=None, company=None):
-        """Filter contacts by multiple AND-combined criteria."""
+    def segment(self, tags=None, status=None, min_score=None, company=None,
+                fact_key=None, fact_value=None):
+        """Filter contacts by multiple AND-combined criteria.
+
+        fact_key/fact_value: filter by knowledge graph data. When both are
+        given, only contacts whose graph entity has a fact matching key=value
+        are included. When only fact_key is given, contacts with any value
+        for that key are included. Supports graph-powered segments like
+        "contacts with high iMessage intensity" or "contacts at fintech companies".
+        """
         query = "SELECT * FROM contacts WHERE 1=1"
         params = []
         if status:
@@ -1265,6 +1273,21 @@ class CRM:
                 identifier = c.get("email") or c["name"]
                 result = self.score_contact(identifier)
                 if result and result["score"] >= min_score:
+                    filtered.append(c)
+            contacts = filtered
+
+        if fact_key is not None:
+            filtered = []
+            for c in contacts:
+                entity_keys = self._contact_entity_keys(c)
+                matched = False
+                for ek in entity_keys:
+                    facts = self.facts_about(ek)
+                    if fact_key in facts:
+                        if fact_value is None or facts[fact_key].get("value") == fact_value:
+                            matched = True
+                            break
+                if matched:
                     filtered.append(c)
             contacts = filtered
 
@@ -3427,7 +3450,8 @@ class CRM:
         self.conn.commit()
 
     def save_view(self, name, *, status=None, tags=None, company=None,
-                  min_score=None, min_deal=None, max_stale_days=None):
+                  min_score=None, min_deal=None, max_stale_days=None,
+                  fact_key=None, fact_value=None):
         """Save a named smart list. Runs live against current data."""
         self._ensure_views_table()
         query_data = {}
@@ -3443,6 +3467,10 @@ class CRM:
             query_data["min_deal"] = min_deal
         if max_stale_days is not None:
             query_data["max_stale_days"] = max_stale_days
+        if fact_key is not None:
+            query_data["fact_key"] = fact_key
+        if fact_value is not None:
+            query_data["fact_value"] = fact_value
 
         query_json = json.dumps(query_data)
         self.conn.execute(
@@ -3477,6 +3505,8 @@ class CRM:
             status=q.get("status"),
             tags=q.get("tags"),
             company=q.get("company"),
+            fact_key=q.get("fact_key"),
+            fact_value=q.get("fact_value"),
         )
 
         # Apply additional filters
@@ -3864,6 +3894,8 @@ def main():
     p_segment.add_argument("--status", "-s", help="Filter by status")
     p_segment.add_argument("--min-score", type=int, help="Minimum score")
     p_segment.add_argument("--company", "-c", help="Filter by company")
+    p_segment.add_argument("--fact-key", help="Filter by graph fact key (e.g. message_intensity)")
+    p_segment.add_argument("--fact-value", help="Filter by graph fact value (e.g. high)")
 
     p_timeline = sub.add_parser("timeline", help="Chronological timeline for a contact")
     p_timeline.add_argument("identifier", help="Email or name")
@@ -3948,6 +3980,8 @@ def main():
     p_vs.add_argument("--min-score", type=int, help="Minimum score")
     p_vs.add_argument("--min-deal", type=float, help="Minimum deal value")
     p_vs.add_argument("--max-stale-days", type=int, help="Max days since last contact")
+    p_vs.add_argument("--fact-key", help="Filter by graph fact key (e.g. message_intensity)")
+    p_vs.add_argument("--fact-value", help="Filter by graph fact value (e.g. high)")
 
     p_vr = sub.add_parser("view-run", help="Run a saved view")
     p_vr.add_argument("name", help="View name")
@@ -4256,7 +4290,9 @@ def main():
 
     elif args.command == "segment":
         results = crm.segment(tags=args.tag, status=args.status,
-                              min_score=getattr(args, "min_score", None), company=args.company)
+                              min_score=getattr(args, "min_score", None), company=args.company,
+                              fact_key=getattr(args, "fact_key", None),
+                              fact_value=getattr(args, "fact_value", None))
         if not results:
             print("  No matching contacts")
         else:
@@ -4484,7 +4520,9 @@ def main():
         count = crm.save_view(args.name, status=args.status, tags=args.tags,
                               company=args.company, min_score=getattr(args, 'min_score', None),
                               min_deal=getattr(args, 'min_deal', None),
-                              max_stale_days=getattr(args, 'max_stale_days', None))
+                              max_stale_days=getattr(args, 'max_stale_days', None),
+                              fact_key=getattr(args, 'fact_key', None),
+                              fact_value=getattr(args, 'fact_value', None))
         print(f"  Saved view '{args.name}' ({count} matches)")
 
     elif args.command == "view-run":
