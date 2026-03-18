@@ -214,12 +214,7 @@ class CRM:
         self.conn.execute("DELETE FROM deals WHERE contact_id = ?", (contact["id"],))
         self.conn.execute("DELETE FROM contacts WHERE id = ?", (contact["id"],))
         # Cascade delete facts for all contact entity variants
-        name_lower = name.lower()
-        entity_variants = [f"contact:{name_lower}",
-                           f"contact:{name_lower.replace(' ', '_')}",
-                           f"contact:{name_lower.split()[0]}"]
-        if contact.get("email"):
-            entity_variants.append(f"contact:{contact['email'].lower()}")
+        entity_variants = self._contact_entity_keys(contact)
         placeholders = ",".join("?" * len(entity_variants))
         self.conn.execute(
             f"DELETE FROM facts WHERE entity LIKE 'contact:%' AND entity IN ({placeholders})",
@@ -892,11 +887,7 @@ class CRM:
         factors.append(f"Status '{status}' (+{status_pts}pts)")
 
         # Facts richness + graph engagement (10 pts)
-        name_lower = contact["name"].lower()
-        entity_keys = list(set([f"contact:{name_lower}",
-                                f"contact:{name_lower.replace(' ', '_')}",
-                                f"contact:{name_lower.split()[0]}"]
-                               + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])))
+        entity_keys = self._contact_entity_keys(contact)
         total_facts = 0
         graph_engagement_pts = 0
         for ek in entity_keys:
@@ -1121,13 +1112,7 @@ class CRM:
         for r in rows:
             c = dict(r)
             # Check knowledge graph for recent activity on this contact
-            name_lower = c["name"].lower()
-            entity_keys = list(set(
-                [f"contact:{name_lower}",
-                 f"contact:{name_lower.replace(' ', '_')}"]
-                + [f"contact:{p}" for p in name_lower.split()]
-                + ([f"contact:{c['email'].lower()}"] if c.get("email") else [])
-            ))
+            entity_keys = self._contact_entity_keys(c)
             placeholders = ",".join("?" * len(entity_keys))
             recent_fact = self.conn.execute(
                 f"""SELECT 1 FROM facts
@@ -1232,10 +1217,8 @@ class CRM:
                 "timestamp": a["created_at"],
             })
 
-        # Facts — look up by contact:name_lower, contact:first_name_lower, and each name part
-        name_lower = contact["name"].lower()
-        parts = name_lower.split()
-        entity_keys = list(set([f"contact:{name_lower}"] + [f"contact:{p}" for p in parts]))
+        # Facts — look up all entity key variants for this contact
+        entity_keys = self._contact_entity_keys(contact)
 
         for ek in entity_keys:
             facts = self.conn.execute(
@@ -1290,15 +1273,8 @@ class CRM:
             for a in acts:
                 lines.append(f"- [{a['created_at'][:10]}] {a['type']}: {a['summary']}")
 
-        # Facts — match all entity key variants used across the codebase:
-        #   "contact:alice smith" (ingest), "contact:alice_smith" (auto_observe),
-        #   "contact:alice" / "contact:smith" (name parts), "contact:alice@co.com" (iMessage email handle)
-        name_lower = contact["name"].lower()
-        parts = name_lower.split()
-        entity_keys = list(set([f"contact:{name_lower}",
-                                f"contact:{name_lower.replace(' ', '_')}"]
-                               + [f"contact:{p}" for p in parts]
-                               + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])))
+        # Facts — match all entity key variants for this contact
+        entity_keys = self._contact_entity_keys(contact)
         all_facts = {}
         for ek in entity_keys:
             all_facts.update(self.facts_about(ek))
@@ -1678,12 +1654,7 @@ class CRM:
 
         def _get_imsg_data(contact):
             """Resolve iMessage data for a CRM contact across entity key variants."""
-            nl = contact["name"].lower()
-            variants = list(set(
-                [f"contact:{nl}", f"contact:{nl.replace(' ', '_')}"]
-                + [f"contact:{p}" for p in nl.split()]
-                + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])
-            ))
+            variants = self._contact_entity_keys(contact)
             best = None
             for v in variants:
                 data = imsg_by_entity.get(v)
@@ -1715,8 +1686,7 @@ class CRM:
             act_types = [a["type"] for a in acts]
 
             # Check for unresolved conflicts
-            name_lower = name.lower()
-            entity_keys = list(set([f"contact:{name_lower}"] + [f"contact:{p}" for p in name_lower.split()]))
+            entity_keys = self._contact_entity_keys(c)
             has_conflicts = False
             for ek in entity_keys:
                 if self.conflicts(entity=ek):
@@ -1914,9 +1884,7 @@ class CRM:
             return None
 
         name = contact["name"]
-        name_lower = name.lower()
-        entity_keys = list(set([f"contact:{name_lower}"] + [f"contact:{p}" for p in name_lower.split()]
-                               + [f"contact:{name_lower.replace(' ', '_')}"]))
+        entity_keys = self._contact_entity_keys(contact)
 
         # Gather all facts across entity key variants
         all_facts = {}
