@@ -1,8 +1,8 @@
 # agent-crm
 
-Local-first CRM. One Python file, SQLite, zero dependencies.
+Agent first CRM that self improves. One Python file, SQLite, zero dependencies.
 
-Your Mac already knows your relationships. This CRM reads them.
+It can process data from your Mac and other external CRM APIs.
 
 ```bash
 git clone https://github.com/keshav55/agent-crm.git
