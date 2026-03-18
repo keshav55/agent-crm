@@ -244,6 +244,9 @@ class CRM:
             (date.today().isoformat(), contact["id"])
         )
         self.conn.commit()
+        # Record activity in knowledge graph so graph queries can find it
+        entity = f"contact:{contact['name'].lower()}"
+        self.observe(entity, f"activity_{activity_type}", summary, source="crm_activity")
         return True
 
     def get_activity(self, identifier, limit=20):
