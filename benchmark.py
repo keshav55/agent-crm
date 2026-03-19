@@ -1730,6 +1730,33 @@ def run_benchmarks():
 
     crm.close()
 
+    # ── 25. update_contact rename without email (2 tests) ──
+    # update_contact previously re-fetched by name/email after the UPDATE.
+    # When a contact with no email was renamed, the old name no longer matched,
+    # causing update_contact to return None even though the rename succeeded.
+    # Now it re-fetches by id, which always works.
+    rename_crm = CRM(os.path.join(tempfile.mkdtemp(), "rename.db"))
+    rename_crm.add_contact("Original Name", company="RenameCo", status="prospect")
+
+    # 25a. Renaming a no-email contact returns the updated dict (not None)
+    try:
+        result = rename_crm.update_contact("Original Name", name="Brand New Name")
+        check("update_contact_rename_no_email_returns_contact",
+              result is not None and result["name"] == "Brand New Name")
+    except Exception:
+        check("update_contact_rename_no_email_returns_contact", False)
+
+    # 25b. The renamed contact is findable by new name
+    try:
+        c = rename_crm.get_contact("Brand New Name")
+        old = rename_crm.get_contact("Original Name")
+        check("update_contact_rename_no_email_findable",
+              c is not None and c["name"] == "Brand New Name" and old is None)
+    except Exception:
+        check("update_contact_rename_no_email_findable", False)
+
+    rename_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

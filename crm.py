@@ -157,7 +157,9 @@ class CRM:
         vals.append(contact["id"])
         self.conn.execute(f"UPDATE contacts SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", vals)
         self.conn.commit()
-        return self.get_contact(contact.get("email") or contact["name"])
+        # Re-fetch by id so renames (no email) still return the updated row
+        row = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (contact["id"],)).fetchone()
+        return dict(row) if row else None
 
     def get_contact(self, identifier):
         """Get contact by email or name (partial match)."""
