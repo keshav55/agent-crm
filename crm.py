@@ -3664,10 +3664,13 @@ class CRM:
         company = contact.get("company") or "unknown company"
         status = contact.get("status", "prospect")
         deal = contact.get("deal_size") or "no deal"
-        entity = f"contact:{name.lower()}"
 
-        # Gather all context
-        facts = self.facts_about(entity)
+        # Gather all context — use all entity key variants so facts stored
+        # under contact:alice_smith, contact:alice, phone:+1..., etc. are found
+        entity_keys = self._contact_entity_keys(contact)
+        facts = {}
+        for ek in entity_keys:
+            facts.update(self.facts_about(ek))
         acts = self.get_activity(identifier, limit=10)
         vel = self.velocity(identifier)
         score_data = self.score_contact(identifier)

@@ -1498,6 +1498,15 @@ def run_benchmarks():
     except (AttributeError, TypeError):
         check("batch_prompts_list", False)
 
+    # 20i. interaction_prompt finds facts stored under variant entity keys
+    # (e.g. contact:prompt_pete with underscore, not just contact:prompt pete)
+    try:
+        prompt_crm.observe("contact:prompt_pete", "funding", "Series B", source="crunchbase")
+        prompt = prompt_crm.interaction_prompt("pete@prompt.com")
+        check("prompt_variant_entity_facts", isinstance(prompt, str) and "Series B" in prompt)
+    except (AttributeError, TypeError):
+        check("prompt_variant_entity_facts", False)
+
     prompt_crm.close()
 
     # ── 21. Email Ingestion (4 tests) ──
