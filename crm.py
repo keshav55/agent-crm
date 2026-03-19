@@ -3424,12 +3424,21 @@ class CRM:
             received = int(data.get("imessage_received", 0))
             intensity = data.get("message_intensity", "low")
 
-            # Derive display name from entity
+            # Derive display name from entity, resolving phone handles to
+            # real names so the same person isn't listed twice (once as a
+            # phone number and once as a contact name).
             if entity.startswith("contact:"):
                 raw_name = entity[len("contact:"):]
                 name = " ".join(w.capitalize() for w in raw_name.split())
             elif entity.startswith("phone:"):
-                name = entity[len("phone:"):]
+                name_fact = self.conn.execute(
+                    "SELECT value FROM facts WHERE entity = ? AND key = 'name' LIMIT 1",
+                    (entity,)
+                ).fetchone()
+                if name_fact:
+                    name = name_fact[0]
+                else:
+                    name = entity[len("phone:"):]
             else:
                 name = entity
 

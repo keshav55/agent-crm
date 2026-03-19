@@ -1358,6 +1358,32 @@ def run_benchmarks():
 
     vel_crm.close()
 
+    # ── 18i. relationship_health resolves phone entities to names (1 test) ──
+    # When a person has both a contact: entity and a phone: entity with
+    # iMessage data, they should appear once (under their real name), not
+    # twice (once as a phone number and once as a name).
+    try:
+        rh_crm = CRM(os.path.join(tempfile.mkdtemp(), "rh_phone.db"))
+        rh_crm.add_contact("Phone Alice", email="palice@test.com", company="PhoneCo", deal_size="$5K/mo")
+        # iMessage data on the contact: entity
+        rh_crm.observe("contact:phone alice", "imessage_total", "50", source="imessage")
+        rh_crm.observe("contact:phone alice", "imessage_sent", "25", source="imessage")
+        rh_crm.observe("contact:phone alice", "imessage_received", "25", source="imessage")
+        rh_crm.observe("contact:phone alice", "message_intensity", "medium", source="imessage")
+        # iMessage data on the phone: entity (same person, resolved via contacts)
+        rh_crm.observe("phone:+15551234567", "imessage_total", "100", source="imessage")
+        rh_crm.observe("phone:+15551234567", "imessage_sent", "40", source="imessage")
+        rh_crm.observe("phone:+15551234567", "imessage_received", "60", source="imessage")
+        rh_crm.observe("phone:+15551234567", "message_intensity", "high", source="imessage")
+        rh_crm.observe("phone:+15551234567", "name", "Phone Alice", source="macos_contacts")
+        rh = rh_crm.relationship_health()
+        # Should appear once (deduplicated), not twice
+        alice_entries = [r for r in rh if "alice" in r["name"].lower() or "5551234567" in r["name"]]
+        check("rel_health_phone_name_resolve", len(alice_entries) == 1 and "Alice" in alice_entries[0]["name"])
+        rh_crm.close()
+    except (AttributeError, TypeError):
+        check("rel_health_phone_name_resolve", False)
+
     # ── 19. Saved Views (10 tests) ──
 
     view_crm = CRM(os.path.join(tempfile.mkdtemp(), "view.db"))
