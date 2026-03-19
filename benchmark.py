@@ -1543,6 +1543,33 @@ def run_benchmarks():
 
     email_crm.close()
 
+    # ── 21e. ingest_mbox handles timezone-aware email Date headers ──
+    # email.utils.parsedate_to_datetime returns timezone-aware datetimes for
+    # real-world emails (e.g. "Thu, 19 Mar 2026 10:30:00 +0000").  The cutoff
+    # must be tz-aware too, otherwise the comparison raises TypeError and every
+    # message is silently skipped.
+    try:
+        import mailbox as _mb
+        import email.utils as _eu
+        mbox_tz_dir = tempfile.mkdtemp()
+        mbox_tz_path = os.path.join(mbox_tz_dir, "tz_test.mbox")
+        # Write a minimal mbox with a timezone-aware Date header (recent)
+        with open(mbox_tz_path, "w") as f:
+            f.write("From sender@test.com Thu Mar 19 10:30:00 2026\n")
+            f.write("From: sender@test.com\n")
+            f.write("To: recipient@test.com\n")
+            f.write("Date: Thu, 19 Mar 2026 10:30:00 +0000\n")
+            f.write("Subject: TZ test\n")
+            f.write("\n")
+            f.write("Body\n")
+            f.write("\n")
+        tz_crm = CRM(os.path.join(tempfile.mkdtemp(), "tz.db"))
+        msgs, facts = tz_crm.ingest_mbox(mbox_tz_path, days=9999)
+        check("ingest_mbox_tz_aware_dates", msgs >= 1)
+        tz_crm.close()
+    except (AttributeError, TypeError):
+        check("ingest_mbox_tz_aware_dates", False)
+
     # ── 20. LIKE metacharacter escaping (5 tests) ──
     # Verifies that %, _, and \ in user input don't cause false LIKE matches.
     like_crm = CRM(os.path.join(tempfile.mkdtemp(), "like.db"))

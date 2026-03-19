@@ -27,7 +27,7 @@ import sys
 import os
 import json
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_DB = os.environ.get("CRM_DB", "crm.db")
@@ -3120,7 +3120,12 @@ class CRM:
         if not os.path.exists(mbox_path):
             return (0, 0)
 
-        cutoff = datetime.now() - timedelta(days=days)
+        # Use timezone-aware cutoff so comparison with timezone-aware email
+        # dates (the common case) doesn't raise TypeError.  For the rare
+        # naive date (no tz offset in the header), we fall back to a naive
+        # cutoff in the comparison below.
+        cutoff_aware = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_naive = datetime.now() - timedelta(days=days)
         facts = []
         messages_imported = 0
         email_counts = {}
@@ -3132,6 +3137,8 @@ class CRM:
                 date_str = msg.get("Date", "")
                 try:
                     date_tuple = email.utils.parsedate_to_datetime(date_str)
+                    # Compare using matching tz-awareness to avoid TypeError
+                    cutoff = cutoff_aware if date_tuple.tzinfo else cutoff_naive
                     if date_tuple < cutoff:
                         continue
                 except (TypeError, ValueError):
