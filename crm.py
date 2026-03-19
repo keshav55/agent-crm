@@ -80,6 +80,9 @@ CREATE TABLE IF NOT EXISTS facts (
     observed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX IF NOT EXISTS idx_activity_contact ON activity(contact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_deals_contact ON deals(contact_id);
+
 CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(entity, key);
 CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source);
