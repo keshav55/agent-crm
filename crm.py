@@ -161,7 +161,10 @@ class CRM:
         row = self.conn.execute("SELECT * FROM contacts WHERE email = ?", (identifier,)).fetchone()
         if row:
             return dict(row)
-        row = self.conn.execute("SELECT * FROM contacts WHERE name LIKE ?", (f"%{identifier}%",)).fetchone()
+        escaped = self._escape_like(identifier)
+        row = self.conn.execute(
+            "SELECT * FROM contacts WHERE name LIKE ? ESCAPE '\\'", (f"%{escaped}%",)
+        ).fetchone()
         return dict(row) if row else None
 
     def list_contacts(self, status=None, company=None):
@@ -171,37 +174,42 @@ class CRM:
             query += " AND status = ?"
             params.append(status)
         if company:
-            query += " AND company LIKE ?"
-            params.append(f"%{company}%")
+            query += " AND company LIKE ? ESCAPE '\\'"
+            params.append(f"%{self._escape_like(company)}%")
         query += " ORDER BY last_contacted DESC NULLS LAST, created_at DESC"
         return [dict(r) for r in self.conn.execute(query, params).fetchall()]
 
     def search(self, term):
         query = """SELECT * FROM contacts WHERE
-                   name LIKE ? OR company LIKE ? OR email LIKE ? OR notes LIKE ? OR tags LIKE ?
+                   name LIKE ? ESCAPE '\\' OR company LIKE ? ESCAPE '\\'
+                   OR email LIKE ? ESCAPE '\\' OR notes LIKE ? ESCAPE '\\'
+                   OR tags LIKE ? ESCAPE '\\'
                    ORDER BY last_contacted DESC NULLS LAST"""
-        t = f"%{term}%"
+        t = f"%{self._escape_like(term)}%"
         return [dict(r) for r in self.conn.execute(query, (t, t, t, t, t)).fetchall()]
 
     def unified_search(self, term):
         """Search across contacts, facts, and activity. Returns dict with sections."""
-        t = f"%{term}%"
+        t = f"%{self._escape_like(term)}%"
         contacts = self.conn.execute(
             """SELECT * FROM contacts WHERE
-               name LIKE ? OR company LIKE ? OR email LIKE ? OR notes LIKE ? OR tags LIKE ?
+               name LIKE ? ESCAPE '\\' OR company LIKE ? ESCAPE '\\'
+               OR email LIKE ? ESCAPE '\\' OR notes LIKE ? ESCAPE '\\'
+               OR tags LIKE ? ESCAPE '\\'
                ORDER BY last_contacted DESC NULLS LAST""",
             (t, t, t, t, t)
         ).fetchall()
         facts = self.conn.execute(
             """SELECT entity, key, value, source, observed_at FROM facts
-               WHERE entity LIKE ? OR key LIKE ? OR value LIKE ? OR source LIKE ?
+               WHERE entity LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'
+               OR value LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\'
                ORDER BY observed_at DESC""",
             (t, t, t, t)
         ).fetchall()
         activities = self.conn.execute(
             """SELECT a.type, a.summary, a.created_at, c.name as contact_name
                FROM activity a JOIN contacts c ON a.contact_id = c.id
-               WHERE a.summary LIKE ?
+               WHERE a.summary LIKE ? ESCAPE '\\'
                ORDER BY a.created_at DESC LIMIT 20""",
             (t,)
         ).fetchall()
@@ -828,6 +836,15 @@ class CRM:
     STAGE_PROBABILITIES = {"prospect": 0.10, "contacted": 0.20, "met": 0.30, "proposal_drafted": 0.50, "verbal_yes": 0.75, "active_customer": 1.0}
 
     @staticmethod
+    def _escape_like(s):
+        """Escape SQL LIKE metacharacters (% and _) so they match literally.
+
+        Without this, user input containing % or _ causes false matches:
+        e.g. get_contact('%') would match every contact.
+        """
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    @staticmethod
     def _normalize_phone(raw):
         """Normalize a phone number: strip formatting, ensure +country code.
 
@@ -1193,7 +1210,7 @@ class CRM:
 
         # Fall through: search tags first, then general search
         tag_results = self.conn.execute(
-            "SELECT * FROM contacts WHERE tags LIKE ?", (f"%{q}%",)
+            "SELECT * FROM contacts WHERE tags LIKE ? ESCAPE '\\'", (f"%{self._escape_like(q)}%",)
         ).fetchall()
         if tag_results:
             return self._sort_by_score([dict(r) for r in tag_results])
@@ -1222,10 +1239,11 @@ class CRM:
 
     def _query_graph_fallback(self, q):
         """Search the knowledge graph for q and resolve matching entities to contacts."""
-        t = f"%{q}%"
+        t = f"%{self._escape_like(q)}%"
         rows = self.conn.execute(
             """SELECT DISTINCT entity FROM facts
-               WHERE entity LIKE ? OR key LIKE ? OR value LIKE ?
+               WHERE entity LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'
+               OR value LIKE ? ESCAPE '\\'
                ORDER BY observed_at DESC""",
             (t, t, t)
         ).fetchall()
@@ -1273,11 +1291,11 @@ class CRM:
             query += " AND status = ?"
             params.append(status)
         if company:
-            query += " AND company LIKE ?"
-            params.append(f"%{company}%")
+            query += " AND company LIKE ? ESCAPE '\\'"
+            params.append(f"%{self._escape_like(company)}%")
         if tags:
-            query += " AND tags LIKE ?"
-            params.append(f"%{tags}%")
+            query += " AND tags LIKE ? ESCAPE '\\'"
+            params.append(f"%{self._escape_like(tags)}%")
         contacts = [dict(r) for r in self.conn.execute(query, params).fetchall()]
 
         if min_score is not None:
@@ -1515,8 +1533,8 @@ class CRM:
     def list_by_tag(self, tag):
         """Return contacts that have this tag in their tags field."""
         rows = self.conn.execute(
-            "SELECT * FROM contacts WHERE tags LIKE ?",
-            (f"%{tag}%",)
+            "SELECT * FROM contacts WHERE tags LIKE ? ESCAPE '\\'",
+            (f"%{self._escape_like(tag)}%",)
         ).fetchall()
         # Exact tag match within comma-separated list
         results = []
@@ -2108,6 +2126,7 @@ class CRM:
         connection_to_target, and suggested_action.
         """
         target_lower = target.strip().lower()
+        target_escaped = self._escape_like(target_lower)
         results = []
         seen_connectors = set()
 
@@ -2115,15 +2134,15 @@ class CRM:
 
         # Find contacts who work at the target company (via contacts table)
         company_matches = self.conn.execute(
-            "SELECT * FROM contacts WHERE LOWER(company) LIKE ?",
-            (f"%{target_lower}%",)
+            "SELECT * FROM contacts WHERE LOWER(company) LIKE ? ESCAPE '\\'",
+            (f"%{target_escaped}%",)
         ).fetchall()
 
         # Also match by email domain: @acme.com matches target "acme"
         # This catches contacts whose company field is empty but email reveals affiliation
         domain_matches = self.conn.execute(
-            "SELECT * FROM contacts WHERE email IS NOT NULL AND LOWER(email) LIKE ?",
-            (f"%@{target_lower}%",)
+            "SELECT * FROM contacts WHERE email IS NOT NULL AND LOWER(email) LIKE ? ESCAPE '\\'",
+            (f"%@{target_escaped}%",)
         ).fetchall()
         # Merge domain matches into company_matches (avoid duplicates by id)
         company_match_ids = {r["id"] for r in company_matches}
@@ -2131,28 +2150,28 @@ class CRM:
 
         # Find contacts whose name matches the target
         name_matches = self.conn.execute(
-            "SELECT * FROM contacts WHERE LOWER(name) LIKE ?",
-            (f"%{target_lower}%",)
+            "SELECT * FROM contacts WHERE LOWER(name) LIKE ? ESCAPE '\\'",
+            (f"%{target_escaped}%",)
         ).fetchall()
 
         # Find contacts by email match
         email_matches = self.conn.execute(
-            "SELECT * FROM contacts WHERE LOWER(email) LIKE ?",
-            (f"%{target_lower}%",)
+            "SELECT * FROM contacts WHERE LOWER(email) LIKE ? ESCAPE '\\'",
+            (f"%{target_escaped}%",)
         ).fetchall()
 
         # Also search the facts graph for company references
         graph_company_entities = self.conn.execute(
             """SELECT DISTINCT entity FROM facts
-               WHERE key = 'company' AND LOWER(value) LIKE ?""",
-            (f"%{target_lower}%",)
+               WHERE key = 'company' AND LOWER(value) LIKE ? ESCAPE '\\'""",
+            (f"%{target_escaped}%",)
         ).fetchall()
 
         # Search for any entity or value matching target in the graph
         graph_entity_matches = self.conn.execute(
             """SELECT DISTINCT entity FROM facts
-               WHERE LOWER(entity) LIKE ? OR LOWER(value) LIKE ?""",
-            (f"%{target_lower}%", f"%{target_lower}%")
+               WHERE LOWER(entity) LIKE ? ESCAPE '\\' OR LOWER(value) LIKE ? ESCAPE '\\'""",
+            (f"%{target_escaped}%", f"%{target_escaped}%")
         ).fetchall()
 
         # Collect all target-related entity names (from contact:xyz format)
@@ -2269,8 +2288,8 @@ class CRM:
             # Find who references this target person in the graph
             referrers = self.conn.execute(
                 """SELECT DISTINCT entity FROM facts
-                   WHERE LOWER(value) LIKE ?""",
-                (f"%{target_person}%",)
+                   WHERE LOWER(value) LIKE ? ESCAPE '\\'""",
+                (f"%{self._escape_like(target_person)}%",)
             ).fetchall()
 
             for ref in referrers:
@@ -2408,10 +2427,11 @@ class CRM:
 
     def search_graph(self, query):
         """Search across all facts: entity, key, value, source."""
-        q = f"%{query}%"
+        q = f"%{self._escape_like(query)}%"
         rows = self.conn.execute(
             """SELECT entity, key, value, source, observed_at FROM facts
-               WHERE entity LIKE ? OR key LIKE ? OR value LIKE ? OR source LIKE ?
+               WHERE entity LIKE ? ESCAPE '\\' OR key LIKE ? ESCAPE '\\'
+               OR value LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\'
                ORDER BY observed_at DESC""",
             (q, q, q, q)
         ).fetchall()

@@ -1534,6 +1534,50 @@ def run_benchmarks():
 
     email_crm.close()
 
+    # ── 20. LIKE metacharacter escaping (5 tests) ──
+    # Verifies that %, _, and \ in user input don't cause false LIKE matches.
+    like_crm = CRM(os.path.join(tempfile.mkdtemp(), "like.db"))
+    like_crm.add_contact("Alice Smith", email="alice@test.com", company="Acme")
+    like_crm.add_contact("Bob Jones", email="bob@test.com", company="Beta_Corp")
+    like_crm.add_contact("Weird%Name", email="weird@test.com", company="Pct%Co")
+
+    # 20a. get_contact('%') should NOT match Alice (only Weird%Name has a literal %)
+    try:
+        c = like_crm.get_contact("%")
+        check("like_escape_get_contact_pct", c is not None and c["name"] == "Weird%Name")
+    except Exception:
+        check("like_escape_get_contact_pct", False)
+
+    # 20b. get_contact('_') should NOT match any name (no name has a literal lone _)
+    try:
+        c = like_crm.get_contact("_")
+        check("like_escape_get_contact_underscore", c is None)
+    except Exception:
+        check("like_escape_get_contact_underscore", False)
+
+    # 20c. search('%') should return only contacts with literal % (1, not 3)
+    try:
+        results = like_crm.search("%")
+        check("like_escape_search_pct", len(results) == 1)
+    except Exception:
+        check("like_escape_search_pct", False)
+
+    # 20d. search('_') should return only contacts with literal _ (1, not 3)
+    try:
+        results = like_crm.search("_")
+        check("like_escape_search_underscore", len(results) == 1)
+    except Exception:
+        check("like_escape_search_underscore", False)
+
+    # 20e. list_contacts(company='%') should return only Pct%Co (1, not 3)
+    try:
+        results = like_crm.list_contacts(company="%")
+        check("like_escape_list_contacts_pct", len(results) == 1 and results[0]["company"] == "Pct%Co")
+    except Exception:
+        check("like_escape_list_contacts_pct", False)
+
+    like_crm.close()
+
     crm.close()
 
     # Clean up temp files
