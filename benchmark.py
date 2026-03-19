@@ -1651,6 +1651,35 @@ def run_benchmarks():
         check("diff_surfaces_contact_updates", False)
     diff_crm.close()
 
+    # ── 23. stale_facts returns latest row data (1 test) ──
+    # stale_facts must return the value/source/observed_at from the most
+    # recent row for each (entity, key) group, not from an arbitrary row.
+    # When multiple values exist for the same entity+key (e.g. a role that
+    # changed from Engineer to CTO), the returned row should reflect the
+    # latest observation.  An UPSERT that refreshes an older rowid's
+    # observed_at (making it the newest) must be reflected correctly.
+    stale_crm = CRM(os.path.join(tempfile.mkdtemp(), "stale_row.db"))
+    # Insert two facts for the same entity+key with different values
+    stale_crm.observe("contact:staletest", "role", "Engineer", source="old_src")
+    stale_crm.observe("contact:staletest", "role", "CTO", source="new_src")
+    # Backdate both so they're stale, but make CTO the newer one
+    stale_crm.conn.execute(
+        "UPDATE facts SET observed_at = '2020-01-01' WHERE entity = 'contact:staletest' AND value = 'Engineer'"
+    )
+    stale_crm.conn.execute(
+        "UPDATE facts SET observed_at = '2023-06-01' WHERE entity = 'contact:staletest' AND value = 'CTO'"
+    )
+    stale_crm.conn.commit()
+    try:
+        stale = stale_crm.stale_facts(days=7)
+        match = [s for s in stale if s["entity"] == "contact:staletest" and s["key"] == "role"]
+        check("stale_facts_returns_latest_row",
+              len(match) == 1 and match[0]["value"] == "CTO" and match[0]["source"] == "new_src"
+              and "2023" in match[0]["observed_at"])
+    except Exception:
+        check("stale_facts_returns_latest_row", False)
+    stale_crm.close()
+
     crm.close()
 
     # Clean up temp files

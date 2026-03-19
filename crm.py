@@ -484,20 +484,39 @@ class CRM:
         """Facts not observed in N days. What needs re-verification.
 
         Finds entity+key pairs whose *latest* observation (across all values
-        and sources) is older than the cutoff.  The previous implementation
-        filtered rows with WHERE before grouping, which caused false
-        positives: an entity+key that had been recently re-observed with a
-        new value would still appear stale because the old row survived the
-        WHERE filter.
+        and sources) is older than the cutoff.  Returns the value and source
+        from the most recently observed row so callers see accurate data.
+
+        The previous implementation selected non-aggregated columns (value,
+        source, observed_at) directly in a GROUP BY query, which in SQLite
+        returns values from an arbitrary row in the group rather than the
+        row with MAX(observed_at).  Now we identify stale (entity, key)
+        groups first, then look up the actual latest row for each group via
+        a correlated subquery so the returned columns are correct.
         """
-        return [dict(r) for r in self.conn.execute(
-            """SELECT entity, key, value, source, observed_at
+        # Step 1: find stale (entity, key) groups and their latest observed_at
+        stale_groups = self.conn.execute(
+            """SELECT entity, key, MAX(observed_at) as latest_oa
                FROM facts
                GROUP BY entity, key
-               HAVING MAX(observed_at) < date('now', ?)
-               ORDER BY observed_at ASC""",
+               HAVING MAX(observed_at) < date('now', ?)""",
             (f"-{days} days",)
-        ).fetchall()]
+        ).fetchall()
+        # Step 2: for each stale group, fetch the actual latest row
+        results = []
+        for g in stale_groups:
+            row = self.conn.execute(
+                """SELECT entity, key, value, source, observed_at
+                   FROM facts
+                   WHERE entity = ? AND key = ?
+                   ORDER BY observed_at DESC, rowid DESC
+                   LIMIT 1""",
+                (g["entity"], g["key"])
+            ).fetchone()
+            if row:
+                results.append(dict(row))
+        results.sort(key=lambda r: r["observed_at"])
+        return results
 
     def related(self, entity):
         """Find all entities related to this one via facts."""
