@@ -478,11 +478,20 @@ class CRM:
         ).fetchall()]
 
     def stale_facts(self, days=7):
-        """Facts not observed in N days. What needs re-verification."""
+        """Facts not observed in N days. What needs re-verification.
+
+        Finds entity+key pairs whose *latest* observation (across all values
+        and sources) is older than the cutoff.  The previous implementation
+        filtered rows with WHERE before grouping, which caused false
+        positives: an entity+key that had been recently re-observed with a
+        new value would still appear stale because the old row survived the
+        WHERE filter.
+        """
         return [dict(r) for r in self.conn.execute(
-            """SELECT entity, key, value, source, observed_at FROM facts
-               WHERE observed_at < date('now', ?)
-               GROUP BY entity, key HAVING observed_at = MAX(observed_at)
+            """SELECT entity, key, value, source, observed_at
+               FROM facts
+               GROUP BY entity, key
+               HAVING MAX(observed_at) < date('now', ?)
                ORDER BY observed_at ASC""",
             (f"-{days} days",)
         ).fetchall()]
