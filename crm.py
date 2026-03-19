@@ -2053,8 +2053,8 @@ class CRM:
             suggested = "proposal_drafted"
             reason = "Deal at proposal stage"
             confidence = "high"
-        # If deal at closed_won -> suggest active_customer
-        elif "closed_won" in deal_stages and current != "active_customer":
+        # If deal at closed_won -> suggest active_customer (but not if already churned/lost)
+        elif "closed_won" in deal_stages and current not in ("active_customer", "churned", "lost"):
             suggested = "active_customer"
             reason = "Deal marked as closed won"
             confidence = "high"

@@ -1806,6 +1806,28 @@ def run_benchmarks():
     except Exception:
         check("mcp_ingest_mail_source", False)
 
+    # ── 28. suggest_status does not promote churned/lost contacts (1 test) ──
+    # suggest_status previously suggested "active_customer" for contacts with
+    # a closed_won deal regardless of current status.  A churned or lost
+    # contact with a historical closed_won deal should NOT be suggested for
+    # re-activation — that would ignore the explicit decision to mark them
+    # as churned/lost.
+    try:
+        ss_crm = CRM(os.path.join(tempfile.mkdtemp(), "ss.db"))
+        ss_crm.add_contact("Churned Chad", email="chad@test.com", status="churned")
+        ss_crm.add_deal("chad@test.com", "Old Deal", value="$50K", stage="closed_won")
+        ss_crm.add_contact("Lost Lucy", email="lucy@test.com", status="lost")
+        ss_crm.add_deal("lucy@test.com", "Dead Deal", value="$30K", stage="closed_won")
+        chad_result = ss_crm.suggest_status("chad@test.com")
+        lucy_result = ss_crm.suggest_status("lucy@test.com")
+        # Neither churned nor lost contacts should be suggested as active_customer
+        check("suggest_status_no_promote_churned_lost",
+              chad_result["suggested"] != "active_customer"
+              and lucy_result["suggested"] != "active_customer")
+        ss_crm.close()
+    except Exception:
+        check("suggest_status_no_promote_churned_lost", False)
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
