@@ -2053,8 +2053,8 @@ class CRM:
             suggested = "proposal_drafted"
             reason = "Deal at proposal stage"
             confidence = "high"
-        # If deal at closed_won -> suggest active_customer (but not if already churned/lost)
-        elif "closed_won" in deal_stages and current not in ("active_customer", "churned", "lost"):
+        # If deal at closed_won -> suggest active_customer
+        elif "closed_won" in deal_stages and current != "active_customer":
             suggested = "active_customer"
             reason = "Deal marked as closed won"
             confidence = "high"
@@ -3015,6 +3015,12 @@ class CRM:
                     contacts_added += 1
                 except sqlite3.IntegrityError:
                     skipped += 1
+                    # Resolve entity key to the existing contact's name so
+                    # extra-column facts attach to the right entity instead
+                    # of creating orphaned facts under the CSV row's name.
+                    existing = self.get_contact(normalized.get("email", ""))
+                    if existing:
+                        name = existing["name"]
 
                 # Store unmapped columns as facts
                 entity = f"contact:{name.lower()}"

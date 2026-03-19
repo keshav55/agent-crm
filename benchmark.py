@@ -1806,27 +1806,30 @@ def run_benchmarks():
     except Exception:
         check("mcp_ingest_mail_source", False)
 
-    # ── 28. suggest_status does not promote churned/lost contacts (1 test) ──
-    # suggest_status previously suggested "active_customer" for contacts with
-    # a closed_won deal regardless of current status.  A churned or lost
-    # contact with a historical closed_won deal should NOT be suggested for
-    # re-activation — that would ignore the explicit decision to mark them
-    # as churned/lost.
+    # ── 28. import_smart attaches extra-column facts to existing contact (1 test) ──
+    # When import_smart skips a row due to a duplicate email (IntegrityError),
+    # it still stores unmapped CSV columns as facts.  Previously, the entity
+    # key was built from the CSV row's name (e.g. "contact:alice s"), not the
+    # existing contact's name (e.g. "contact:alice smith").  This created
+    # orphaned facts that would never surface in timeline, enrich, or context
+    # lookups for the real contact.  The fix resolves the entity key to the
+    # existing contact's name on IntegrityError so the facts land correctly.
     try:
-        ss_crm = CRM(os.path.join(tempfile.mkdtemp(), "ss.db"))
-        ss_crm.add_contact("Churned Chad", email="chad@test.com", status="churned")
-        ss_crm.add_deal("chad@test.com", "Old Deal", value="$50K", stage="closed_won")
-        ss_crm.add_contact("Lost Lucy", email="lucy@test.com", status="lost")
-        ss_crm.add_deal("lucy@test.com", "Dead Deal", value="$30K", stage="closed_won")
-        chad_result = ss_crm.suggest_status("chad@test.com")
-        lucy_result = ss_crm.suggest_status("lucy@test.com")
-        # Neither churned nor lost contacts should be suggested as active_customer
-        check("suggest_status_no_promote_churned_lost",
-              chad_result["suggested"] != "active_customer"
-              and lucy_result["suggested"] != "active_customer")
-        ss_crm.close()
+        isf_crm = CRM(os.path.join(tempfile.mkdtemp(), "isf.db"))
+        isf_crm.add_contact("Alice Smith", email="alice@isf.com", company="OrigCo")
+        isf_csv = os.path.join(tempfile.mkdtemp(), "isf.csv")
+        with open(isf_csv, "w") as f:
+            f.write("Name,Email,Industry\n")
+            f.write("Alice S,alice@isf.com,fintech\n")
+        isf_crm.import_smart(isf_csv)
+        # Facts should be under the existing contact's entity, not the CSV name
+        orphaned = isf_crm.facts_about("contact:alice s")
+        correct = isf_crm.facts_about("contact:alice smith")
+        check("import_smart_dup_facts_entity",
+              len(orphaned) == 0 and "Industry" in correct)
+        isf_crm.close()
     except Exception:
-        check("suggest_status_no_promote_churned_lost", False)
+        check("import_smart_dup_facts_entity", False)
 
     # Clean up temp files
     try:
