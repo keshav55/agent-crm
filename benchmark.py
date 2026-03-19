@@ -355,7 +355,29 @@ def run_benchmarks():
     except Exception:
         check("delete_cascade_facts", False)
 
-    # 11i. Batch performance — observe_many faster than individual observes
+    # 11i. Delete cascade — deleting contact also removes deals and activity
+    try:
+        cascade2_crm = CRM(os.path.join(tempfile.mkdtemp(), "cascade2.db"))
+        cid = cascade2_crm.add_contact("Deal Del", email="dealdel@test.com", company="TestCo")
+        cascade2_crm.add_deal("dealdel@test.com", "Big Deal", value="$50K", stage="proposal")
+        cascade2_crm.log_activity("dealdel@test.com", "call", "Discussed terms")
+        # Verify deal and activity exist before delete
+        deals_before = cascade2_crm.list_deals()
+        activities_before = cascade2_crm.conn.execute(
+            "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (cid,)
+        ).fetchone()[0]
+        pre_ok = len(deals_before) >= 1 and activities_before >= 1
+        cascade2_crm.delete_contact("dealdel@test.com")
+        deals_after = cascade2_crm.list_deals()
+        activities_after = cascade2_crm.conn.execute(
+            "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (cid,)
+        ).fetchone()[0]
+        check("delete_cascade_deals", pre_ok and len(deals_after) == 0 and activities_after == 0)
+        cascade2_crm.close()
+    except Exception:
+        check("delete_cascade_deals", False)
+
+    # 11j. Batch performance — observe_many faster than individual observes
     try:
         batch_crm = CRM(os.path.join(tempfile.mkdtemp(), "batch_perf.db"))
         batch_facts = [(f"ent:{i}", "k", f"v{i}", "bench") for i in range(200)]
@@ -367,7 +389,7 @@ def run_benchmarks():
     except (AttributeError, TypeError):
         check("observe_many_fast", False)
 
-    # 11j. Entity validation — reject empty entity or key
+    # 11k. Entity validation — reject empty entity or key
     try:
         result = stretch_crm.observe("", "key", "val")
         check("validate_empty_entity", result is False or result is None)
@@ -376,7 +398,7 @@ def run_benchmarks():
     except Exception:
         check("validate_empty_entity", False)
 
-    # 11k. Entity validation — reject empty key
+    # 11l. Entity validation — reject empty key
     try:
         result = stretch_crm.observe("entity:x", "", "val")
         check("validate_empty_key", result is False or result is None)
@@ -385,7 +407,7 @@ def run_benchmarks():
     except Exception:
         check("validate_empty_key", False)
 
-    # 11l. Compact markdown — shorter output
+    # 11m. Compact markdown — shorter output
     try:
         compact = stretch_crm.compact_markdown()
         full = stretch_crm.graph_markdown()
@@ -393,21 +415,21 @@ def run_benchmarks():
     except (AttributeError, TypeError):
         check("compact_markdown", False)
 
-    # 11m. Summary view — recent changes
+    # 11n. Summary view — recent changes
     try:
         summary = stretch_crm.recent_changes(days=7)
         check("recent_changes", isinstance(summary, list) and len(summary) >= 1)
     except (AttributeError, TypeError):
         check("recent_changes", False)
 
-    # 11n. Graph stats — entity/fact counts
+    # 11o. Graph stats — entity/fact counts
     try:
         gs = stretch_crm.graph_stats()
         check("graph_stats", isinstance(gs, dict) and "entities" in gs and "facts" in gs)
     except (AttributeError, TypeError):
         check("graph_stats", False)
 
-    # 11o. Merge entities — combine two entities into one
+    # 11p. Merge entities — combine two entities into one
     try:
         merge_crm = CRM(os.path.join(tempfile.mkdtemp(), "merge.db"))
         merge_crm.observe("contact:john", "role", "CEO", source="manual")
