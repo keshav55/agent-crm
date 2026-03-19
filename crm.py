@@ -2753,6 +2753,9 @@ class CRM:
                         crm_entity = f"contact:{existing['name'].lower()}"
                         facts.append((crm_entity, "imessage_handle", handle, "imessage"))
                         facts.append((crm_entity, "imessage_total", str(msg_count), "imessage"))
+                        facts.append((crm_entity, "imessage_sent", str(sent), "imessage"))
+                        facts.append((crm_entity, "imessage_received", str(received), "imessage"))
+                        facts.append((crm_entity, "message_intensity", intensity, "imessage"))
                 else:
                     # Check if this phone was resolved to a name via contacts ingest
                     name_fact = self.conn.execute(
@@ -2763,6 +2766,8 @@ class CRM:
                         crm_entity = f"contact:{name_fact[0].lower()}"
                         facts.append((crm_entity, "imessage_handle", handle, "imessage"))
                         facts.append((crm_entity, "imessage_total", str(msg_count), "imessage"))
+                        facts.append((crm_entity, "imessage_sent", str(sent), "imessage"))
+                        facts.append((crm_entity, "imessage_received", str(received), "imessage"))
                         facts.append((crm_entity, "message_intensity", intensity, "imessage"))
 
         except Exception as e:

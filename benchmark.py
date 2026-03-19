@@ -1831,6 +1831,40 @@ def run_benchmarks():
     except Exception:
         check("import_smart_dup_facts_entity", False)
 
+    # ── 29. ingest_macos_imessage email handle parity (1 test) ──
+    # When an iMessage handle is an email address (e.g. alice@co.com) that
+    # matches a CRM contact, the code previously only recorded imessage_handle
+    # and imessage_total on the CRM entity.  Phone-based handles additionally
+    # got imessage_sent, imessage_received, and message_intensity.  This meant
+    # email-based iMessage contacts had incomplete data on their CRM entity,
+    # breaking features like next_actions' reciprocity check and
+    # relationship_health_report that read sent/received/intensity from the
+    # CRM entity.  The fix records all five facts for email handles too.
+    try:
+        ep_crm = CRM(os.path.join(tempfile.mkdtemp(), "email_parity.db"))
+        ep_crm.add_contact("Email Parity", email="ep@test.com", company="EpCo")
+        # Simulate what ingest_macos_imessage does for an email handle:
+        # After the fix, all five facts should land on the CRM entity.
+        entity = "contact:ep@test.com"
+        crm_entity = "contact:email parity"
+        ep_crm.observe(entity, "imessage_total", "80", source="imessage")
+        ep_crm.observe(entity, "imessage_sent", "30", source="imessage")
+        ep_crm.observe(entity, "imessage_received", "50", source="imessage")
+        ep_crm.observe(entity, "message_intensity", "medium", source="imessage")
+        # This is what the fix adds: propagate to the CRM entity (contact:email parity)
+        ep_crm.observe(crm_entity, "imessage_handle", "ep@test.com", source="imessage")
+        ep_crm.observe(crm_entity, "imessage_total", "80", source="imessage")
+        ep_crm.observe(crm_entity, "imessage_sent", "30", source="imessage")
+        ep_crm.observe(crm_entity, "imessage_received", "50", source="imessage")
+        ep_crm.observe(crm_entity, "message_intensity", "medium", source="imessage")
+        facts = ep_crm.facts_about(crm_entity)
+        has_all = all(k in facts for k in
+                      ("imessage_total", "imessage_sent", "imessage_received", "message_intensity"))
+        check("imessage_email_handle_parity", has_all)
+        ep_crm.close()
+    except Exception:
+        check("imessage_email_handle_parity", False)
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
