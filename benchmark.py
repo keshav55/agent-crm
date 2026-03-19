@@ -1785,6 +1785,27 @@ def run_benchmarks():
         check("count_by_fact_latest_value", False)
     cbf_crm.close()
 
+    # ── 27. MCP crm_ingest handles "mail" source (1 test) ──
+    # The MCP server's crm_ingest handler was missing "mail" as a source
+    # option.  Passing source="mail" would leave `result` unbound, causing
+    # an UnboundLocalError.  This test verifies that the handler processes
+    # the "mail" source without crashing and returns a dict with mail data.
+    try:
+        from mcp_server import handle_tool_call
+        import mcp_server
+        mcp_mail_crm = CRM(os.path.join(tempfile.mkdtemp(), "mcp_mail.db"))
+        old_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = mcp_mail_crm.db_path
+        mcp_mail_crm.close()
+        result_json = handle_tool_call("crm_ingest", {"source": "mail", "days": 7})
+        import json as _json2
+        result_data = _json2.loads(result_json)
+        mcp_server.DB_PATH = old_db
+        check("mcp_ingest_mail_source",
+              "mail" in result_data and "threads" in result_data["mail"])
+    except Exception:
+        check("mcp_ingest_mail_source", False)
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

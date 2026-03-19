@@ -216,12 +216,12 @@ TOOLS = [
     },
     {
         "name": "crm_ingest",
-        "description": "Auto-populate CRM from local data sources (macOS Contacts, iMessage, Calendar)",
+        "description": "Auto-populate CRM from local data sources (macOS Contacts, iMessage, Calendar, Mail)",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "source": {"type": "string", "enum": ["all", "contacts", "imessage", "calendar"], "default": "all"},
-                "days": {"type": "integer", "description": "Days of iMessage history", "default": 90},
+                "source": {"type": "string", "enum": ["all", "contacts", "imessage", "calendar", "mail"], "default": "all"},
+                "days": {"type": "integer", "description": "Days of iMessage/mail history", "default": 90},
             },
         },
     },
@@ -354,6 +354,11 @@ def handle_tool_call(name, arguments):
             elif src == "calendar":
                 e, f = crm.ingest_macos_calendar()
                 result = {"calendar": {"events": e, "facts": f}}
+            elif src == "mail":
+                t, f = crm.ingest_macos_mail(days=days)
+                result = {"mail": {"threads": t, "facts": f}}
+            else:
+                result = {"error": f"Unknown source: {src}"}
             return json.dumps(result, indent=2)
 
         elif name == "crm_find_intros":
