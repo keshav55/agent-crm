@@ -628,15 +628,24 @@ class CRM:
         """Count entities by their latest value for a given key.
 
         Returns dict mapping value -> count of entities with that value.
+
+        Uses a correlated subquery to reliably select the row with the
+        highest rowid per entity.  The previous implementation used
+        ``HAVING rowid = MAX(rowid)`` inside a GROUP BY, which compares
+        an *arbitrary* row's rowid against the aggregate MAX — an
+        undefined comparison in SQL that can silently drop entire
+        entities from the result when the arbitrary rowid doesn't happen
+        to be the maximum.
         """
-        # Get the latest fact per entity for this key, then count by value
         rows = self.conn.execute(
             """SELECT value, COUNT(*) as cnt FROM (
                    SELECT entity, value
-                   FROM facts
+                   FROM facts f
                    WHERE key = ?
-                   GROUP BY entity
-                   HAVING rowid = MAX(rowid)
+                   AND rowid = (
+                       SELECT MAX(f2.rowid) FROM facts f2
+                       WHERE f2.entity = f.entity AND f2.key = f.key
+                   )
                ) GROUP BY value""",
             (key,)
         ).fetchall()

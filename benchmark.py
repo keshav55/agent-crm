@@ -1757,6 +1757,34 @@ def run_benchmarks():
 
     rename_crm.close()
 
+    # ── 26. count_by_fact picks latest value per entity (1 test) ──
+    # count_by_fact previously used ``HAVING rowid = MAX(rowid)`` inside a
+    # GROUP BY, which compares an *arbitrary* row's rowid against the
+    # aggregate MAX.  When the arbitrary rowid doesn't match the max, the
+    # entity is silently dropped from the result.  This test creates
+    # entities whose latest value (by rowid) differs from earlier values
+    # and verifies no entities are lost and only the latest value is counted.
+    cbf_crm = CRM(os.path.join(tempfile.mkdtemp(), "cbf.db"))
+    # Entity A: role changed from Engineer -> CTO (latest = CTO)
+    cbf_crm.observe("contact:a", "role", "Engineer", source="old")
+    cbf_crm.observe("contact:a", "role", "CTO", source="new")
+    # Entity B: role is VP (only one value)
+    cbf_crm.observe("contact:b", "role", "VP", source="s")
+    # Entity C: role changed Intern -> Engineer -> CTO (latest = CTO)
+    cbf_crm.observe("contact:c", "role", "Intern", source="s1")
+    cbf_crm.observe("contact:c", "role", "Engineer", source="s2")
+    cbf_crm.observe("contact:c", "role", "CTO", source="s3")
+    try:
+        counts = cbf_crm.count_by_fact("role")
+        # Expected: CTO -> 2 (entities a and c), VP -> 1 (entity b)
+        # Total entities counted = 3 (none dropped)
+        total_entities = sum(counts.values())
+        check("count_by_fact_latest_value",
+              total_entities == 3 and counts.get("CTO", 0) == 2 and counts.get("VP", 0) == 1)
+    except Exception:
+        check("count_by_fact_latest_value", False)
+    cbf_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
