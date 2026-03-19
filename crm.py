@@ -2869,10 +2869,19 @@ class CRM:
     def import_smart(self, csv_path, field_map=None):
         """Auto-detect CSV format and import. Works with Salesforce, HubSpot, or any CRM export.
 
+        Auto-detects delimiter (comma, semicolon, tab) via csv.Sniffer so
+        European-locale and TSV exports work out of the box.
+
         Returns dict with contacts_added, facts_added, skipped, mapping_used.
         """
         with open(csv_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
+            sample = f.read(8192)
+            f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            except csv.Error:
+                dialect = None  # fall back to default comma
+            reader = csv.DictReader(f, dialect=dialect) if dialect else csv.DictReader(f)
             headers = [h.strip() for h in (reader.fieldnames or [])]
             headers_lower = [h.lower() for h in headers]
 
