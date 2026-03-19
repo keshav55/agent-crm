@@ -1629,6 +1629,28 @@ def run_benchmarks():
 
     like_crm.close()
 
+    # ── 22. diff() surfaces contact updates (1 test) ──
+    # diff() previously only returned new contacts, activities, and facts.
+    # Contact field updates (status change, deal_size change, etc.) were
+    # invisible because only created_at was checked, not updated_at.
+    diff_crm = CRM(os.path.join(tempfile.mkdtemp(), "diffup.db"))
+    diff_crm.add_contact("Diff Dan", email="dan@diff.com", status="prospect")
+    # Backdate created_at so it falls before our cutoff (avoids sleep)
+    diff_crm.conn.execute(
+        "UPDATE contacts SET created_at = datetime('now', '-1 hour') WHERE email = 'dan@diff.com'"
+    )
+    diff_crm.conn.commit()
+    cutoff = diff_crm.conn.execute("SELECT datetime('now', '-30 seconds')").fetchone()[0]
+    diff_crm.update_contact("dan@diff.com", status="contacted")
+    try:
+        d = diff_crm.diff(since=cutoff)
+        update_entries = [e for e in d if e.get("type") == "contact_update"]
+        check("diff_surfaces_contact_updates",
+              len(update_entries) >= 1 and any("Dan" in e.get("name", "") for e in update_entries))
+    except (AttributeError, TypeError):
+        check("diff_surfaces_contact_updates", False)
+    diff_crm.close()
+
     crm.close()
 
     # Clean up temp files

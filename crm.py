@@ -1739,6 +1739,29 @@ class CRM:
                 "timestamp": r["created_at"],
             })
 
+        # Updated contacts (modified since cutoff but created before it)
+        updated_contacts = self.conn.execute(
+            """SELECT name, company, status, deal_size, updated_at FROM contacts
+               WHERE updated_at >= ? AND created_at < ?
+               ORDER BY updated_at DESC""",
+            (cutoff, cutoff)
+        ).fetchall()
+        for r in updated_contacts:
+            detail_parts = [f"Updated contact: {r['name']}"]
+            if r["status"]:
+                detail_parts.append(f"status={r['status']}")
+            if r["deal_size"]:
+                detail_parts.append(f"deal={r['deal_size']}")
+            changes.append({
+                "type": "contact_update",
+                "entity": r["name"],
+                "name": r["name"],
+                "company": r["company"],
+                "status": r["status"],
+                "detail": " ".join(detail_parts),
+                "timestamp": r["updated_at"],
+            })
+
         activities = self.conn.execute(
             """SELECT a.type, a.summary, a.created_at, c.name
                FROM activity a JOIN contacts c ON a.contact_id = c.id
