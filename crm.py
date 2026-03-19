@@ -751,7 +751,32 @@ class CRM:
 
         After merge, facts_about(source_entity) has facts from both.
         target_entity facts are re-attributed to source_entity.
+
+        Handles duplicate (key, value, source) tuples gracefully: when both
+        entities share a fact with the same key+value+source, the row with the
+        latest observed_at is kept and the other is deleted, avoiding a UNIQUE
+        constraint violation on idx_facts_dedup.
         """
+        # Delete target rows that would collide with existing source rows,
+        # keeping whichever has the later observed_at.  For each overlapping
+        # (key, value, source) pair, delete the older of the two rows.
+        self.conn.execute(
+            """DELETE FROM facts WHERE rowid IN (
+                   SELECT CASE
+                       WHEN t.observed_at >= s.observed_at THEN s.rowid
+                       ELSE t.rowid
+                   END
+                   FROM facts t
+                   JOIN facts s
+                     ON s.entity = ?
+                    AND t.entity = ?
+                    AND t.key = s.key
+                    AND t.value = s.value
+                    AND t.source = s.source
+               )""",
+            (source_entity, target_entity)
+        )
+        # Now re-attribute remaining target facts (no conflicts left)
         self.conn.execute(
             "UPDATE facts SET entity = ? WHERE entity = ?",
             (source_entity, target_entity)

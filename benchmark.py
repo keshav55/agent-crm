@@ -441,6 +441,21 @@ def run_benchmarks():
     except (AttributeError, TypeError):
         check("merge_entities", False)
 
+    # 11q. Merge entities — overlapping facts don't cause IntegrityError
+    try:
+        merge2_crm = CRM(os.path.join(tempfile.mkdtemp(), "merge2.db"))
+        merge2_crm.observe("contact:alice", "role", "CEO", source="manual")
+        merge2_crm.observe("contact:alice", "company", "Acme", source="manual")
+        merge2_crm.observe("contact:ali", "role", "CEO", source="manual")
+        merge2_crm.observe("contact:ali", "phone", "+1234567890", source="manual")
+        merge2_crm.merge_entities("contact:alice", "contact:ali")
+        facts = merge2_crm.facts_about("contact:alice")
+        leftover = merge2_crm.facts_about("contact:ali")
+        check("merge_entities_overlap", "role" in facts and "phone" in facts and len(leftover) == 0)
+        merge2_crm.close()
+    except Exception:
+        check("merge_entities_overlap", False)
+
     stretch_crm.close()
 
     # ── 12. Lead Intelligence — Wave 1 (19 tests) ──
