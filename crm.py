@@ -1685,7 +1685,7 @@ class CRM:
             if label not in cohorts:
                 cohorts[label] = {"added": 0, "converted": 0}
             cohorts[label]["added"] += 1
-            if r["status"] == "active_customer":
+            if r["status"] in ("active_customer", "churned"):
                 cohorts[label]["converted"] += 1
 
         result = {}
