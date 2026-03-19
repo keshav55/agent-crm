@@ -1706,6 +1706,28 @@ def run_benchmarks():
         check("stale_facts_returns_latest_row", False)
     stale_crm.close()
 
+    # ── 24. MCP view_contact uses all entity key variants (1 test) ──
+    # The MCP server's crm_view_contact handler previously only looked up
+    # facts via "contact:{name.lower()}", missing facts stored under variant
+    # entity keys like "contact:first_last" (underscore) or "contact:email".
+    # This test verifies that handle_tool_call returns facts from all variants.
+    try:
+        from mcp_server import handle_tool_call
+        mcp_crm = CRM(os.path.join(tempfile.mkdtemp(), "mcp_view.db"))
+        # Temporarily override the DB_PATH so handle_tool_call uses our test DB
+        import mcp_server
+        old_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = mcp_crm.db_path
+        mcp_crm.add_contact("Mcp Alice", email="malice@test.com", company="McpCo")
+        # Store a fact under the underscore variant (contact:mcp_alice)
+        mcp_crm.observe("contact:mcp_alice", "funding", "Series A", source="research")
+        mcp_crm.close()
+        result = handle_tool_call("crm_view_contact", {"identifier": "malice@test.com"})
+        mcp_server.DB_PATH = old_db
+        check("mcp_view_contact_entity_keys", '"Series A"' in result)
+    except Exception:
+        check("mcp_view_contact_entity_keys", False)
+
     crm.close()
 
     # Clean up temp files

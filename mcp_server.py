@@ -281,10 +281,12 @@ def handle_tool_call(name, arguments):
             c = crm.get_contact(arguments["identifier"])
             if not c:
                 return f"Not found: {arguments['identifier']}"
-            # Include activities and facts
+            # Include activities and facts across all entity key variants
             acts = crm.get_activity(arguments["identifier"], limit=10)
-            facts = crm.facts_about(f"contact:{c['name'].lower()}")
-            return json.dumps({"contact": c, "activities": acts, "facts": {k: v["value"] for k, v in facts.items()}}, default=str, indent=2)
+            all_facts = {}
+            for ek in crm._contact_entity_keys(c):
+                all_facts.update(crm.facts_about(ek))
+            return json.dumps({"contact": c, "activities": acts, "facts": {k: v["value"] for k, v in all_facts.items()}}, default=str, indent=2)
 
         elif name == "crm_update_contact":
             email = arguments.pop("email")
