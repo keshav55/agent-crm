@@ -1128,15 +1128,17 @@ class CRM:
 
             # Average days in this status (use created_at to updated_at for current)
             total_days = 0
+            parsed_count = 0
             for r in rows:
                 try:
                     created = datetime.fromisoformat(r["created_at"]).date()
                     updated = datetime.fromisoformat(r["updated_at"]).date()
                     total_days += max((updated - created).days, 0)
+                    parsed_count += 1
                 except (ValueError, TypeError):
                     pass
 
-            avg_days = round(total_days / current_count, 1) if current_count else 0
+            avg_days = round(total_days / parsed_count, 1) if parsed_count else 0
             conversion_rate = round((passed_through / total_entered) * 100, 1) if total_entered > 0 else 0
 
             funnel[status] = {
