@@ -939,7 +939,10 @@ class CRM:
         m = re.match(r'([\d.]+)\s*(k|m)?\s*(?:/\s*(mo|yr|month|year))?', s)
         if not m:
             return 0
-        num = float(m.group(1))
+        try:
+            num = float(m.group(1))
+        except (ValueError, OverflowError):
+            return 0
         mult = m.group(2)
         period = m.group(3)
         if mult == 'k':

@@ -596,6 +596,22 @@ def run_benchmarks():
     except (AttributeError, TypeError, KeyError):
         check("forecast_parses_deal_size", False)
 
+    # 12o2. _parse_deal_size — malformed float-like strings (e.g. "...", "1.2.3") return 0 instead of crashing
+    try:
+        check("parse_deal_size_malformed_dots", CRM._parse_deal_size("...") == 0)
+    except Exception:
+        check("parse_deal_size_malformed_dots", False)
+
+    try:
+        check("parse_deal_size_multi_decimal", CRM._parse_deal_size("1.2.3k") == 0)
+    except Exception:
+        check("parse_deal_size_multi_decimal", False)
+
+    try:
+        check("parse_deal_size_lone_dot", CRM._parse_deal_size(".") == 0)
+    except Exception:
+        check("parse_deal_size_lone_dot", False)
+
     # 12p. find_duplicates — returns list
     try:
         dups = wave1_crm.find_duplicates()
