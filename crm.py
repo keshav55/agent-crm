@@ -1107,6 +1107,15 @@ class CRM:
         """Pipeline conversion funnel — count, avg days, and conversion rate per stage."""
         funnel = {}
         today_str = date.today().isoformat()
+
+        # Count lost/churned contacts once — they entered the pipeline but
+        # dropped out.  Without stage-transition history we attribute them to
+        # the earliest stage ("prospect") so top-of-funnel conversion rates
+        # aren't artificially inflated.
+        lost_churned = self.conn.execute(
+            "SELECT COUNT(*) FROM contacts WHERE status IN ('lost', 'churned')"
+        ).fetchone()[0]
+
         for status in self.STATUS_ORDER:
             rows = self.conn.execute(
                 "SELECT created_at, updated_at, status FROM contacts WHERE status = ?",
@@ -1125,6 +1134,11 @@ class CRM:
 
             current_count = len(rows)
             total_entered = current_count + passed_through
+
+            # For the first pipeline stage, include lost/churned contacts in
+            # the denominator — they entered the funnel but never converted.
+            if idx == 0:
+                total_entered += lost_churned
 
             # Average days in this status (use created_at to updated_at for current)
             total_days = 0
