@@ -1166,9 +1166,16 @@ class CRM:
         return funnel
 
     def forecast(self):
-        """Weighted pipeline forecast based on stage probabilities and deal sizes."""
+        """Weighted pipeline forecast based on stage probabilities and deal sizes.
+
+        ``weighted_pipeline`` only includes deals still in the pipeline
+        (stages before ``active_customer``).  Already-closed revenue is
+        reported separately as ``closed_revenue`` so callers get the full
+        picture without double-counting with ``revenue_report()``.
+        """
         by_stage = []
         weighted_total = 0
+        closed_revenue = 0
 
         for status in self.STATUS_ORDER:
             rows = self.conn.execute(
@@ -1178,7 +1185,10 @@ class CRM:
             count = len(rows)
             total_value = sum(self._parse_deal_size(r["deal_size"]) for r in rows)
             weighted = total_value * prob
-            weighted_total += weighted
+            if status == "active_customer":
+                closed_revenue += total_value
+            else:
+                weighted_total += weighted
             by_stage.append({
                 "stage": status,
                 "count": count,
@@ -1187,7 +1197,11 @@ class CRM:
                 "weighted_value": round(weighted, 2),
             })
 
-        return {"weighted_pipeline": round(weighted_total, 2), "by_stage": by_stage}
+        return {
+            "weighted_pipeline": round(weighted_total, 2),
+            "closed_revenue": round(closed_revenue, 2),
+            "by_stage": by_stage,
+        }
 
     def find_duplicates(self):
         """Find potential duplicate contact pairs based on email, name similarity, or company+title."""
