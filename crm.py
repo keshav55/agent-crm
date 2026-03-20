@@ -1683,8 +1683,10 @@ class CRM:
 
         total_closed = len(wins) + len(losses)
         win_rate = round((len(wins) / total_closed) * 100, 1) if total_closed else 0.0
-        avg_deal_size = round(sum(w["deal_size"] for w in wins) / len(wins), 2) if wins else 0
-        avg_days = round(sum(w["days_to_close"] for w in wins) / len(wins), 1) if wins else 0
+        wins_with_deal = [w for w in wins if w["deal_size"] > 0]
+        avg_deal_size = round(sum(w["deal_size"] for w in wins_with_deal) / len(wins_with_deal), 2) if wins_with_deal else 0
+        wins_with_days = [w for w in wins if w["days_to_close"] > 0]
+        avg_days = round(sum(w["days_to_close"] for w in wins_with_days) / len(wins_with_days), 1) if wins_with_days else 0
 
         source_counts = {}
         for w in wins:
