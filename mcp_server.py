@@ -365,6 +365,71 @@ TOOLS = [
             "required": ["identifiers"],
         },
     },
+    {
+        "name": "crm_touch_plan",
+        "description": "Auto-generate a follow-up schedule for a contact based on status and deal value",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "crm_detect_churning",
+        "description": "Find contacts with decaying engagement that need intervention, sorted by deal value",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_deal_velocity_report",
+        "description": "How fast deals move through stages — avg days per stage, pipeline speed metrics",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_company_summary",
+        "description": "Roll up all contacts, deals, and activity for a company",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "company": {"type": "string", "description": "Company name"},
+            },
+            "required": ["company"],
+        },
+    },
+    {
+        "name": "crm_recent_contacts",
+        "description": "Contacts sorted by most recent interaction, newest first",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max contacts to return (default 10)"},
+            },
+        },
+    },
+    {
+        "name": "crm_contact_summary",
+        "description": "One-line summary of a contact for quick scanning",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "crm_compare_contacts",
+        "description": "Side-by-side comparison of two contacts for dedup decisions",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contact_a": {"type": "string", "description": "First contact (email or name)"},
+                "contact_b": {"type": "string", "description": "Second contact (email or name)"},
+            },
+            "required": ["contact_a", "contact_b"],
+        },
+    },
 ]
 
 
@@ -530,6 +595,31 @@ def handle_tool_call(name, arguments):
         elif name == "crm_delete_contacts":
             count = crm.delete_contacts(arguments["identifiers"])
             return f"Deleted {count} contacts"
+
+        elif name == "crm_touch_plan":
+            result = crm.touch_plan(arguments["identifier"])
+            return json.dumps(result, default=str, indent=2) if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_detect_churning":
+            return json.dumps(crm.detect_churning(), default=str, indent=2)
+
+        elif name == "crm_deal_velocity_report":
+            return json.dumps(crm.deal_velocity_report(), default=str, indent=2)
+
+        elif name == "crm_company_summary":
+            result = crm.company_summary(arguments["company"])
+            return json.dumps(result, default=str, indent=2) if result else f"No contacts at: {arguments['company']}"
+
+        elif name == "crm_recent_contacts":
+            return json.dumps(crm.recent_contacts(limit=arguments.get("limit", 10)), default=str, indent=2)
+
+        elif name == "crm_contact_summary":
+            result = crm.contact_summary(arguments["identifier"])
+            return result if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_compare_contacts":
+            result = crm.compare_contacts(arguments["contact_a"], arguments["contact_b"])
+            return json.dumps(result, default=str, indent=2) if result else "One or both contacts not found"
 
         else:
             return f"Unknown tool: {name}"

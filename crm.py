@@ -4834,6 +4834,30 @@ def main():
 
     sub.add_parser("dashboard", help="All-in-one CRM dashboard")
 
+    sub.add_parser("churning", help="Detect contacts with decaying engagement")
+
+    p_untouched = sub.add_parser("untouched", help="Contacts with zero activity")
+    p_untouched.add_argument("--days", type=int, default=30)
+
+    p_touch = sub.add_parser("touch-plan", help="Auto-generate follow-up schedule")
+    p_touch.add_argument("identifier")
+
+    sub.add_parser("deal-velocity", help="Deal stage velocity report")
+
+    p_comp = sub.add_parser("company", help="Company summary")
+    p_comp.add_argument("company_name")
+
+    p_compare = sub.add_parser("compare", help="Side-by-side contact comparison")
+    p_compare.add_argument("contact_a")
+    p_compare.add_argument("contact_b")
+
+    p_recent = sub.add_parser("recent", help="Most recently active contacts")
+    p_recent.add_argument("--limit", type=int, default=10)
+
+    sub.add_parser("top-companies", help="Companies ranked by deal value")
+
+    sub.add_parser("all-tags", help="List all tags in use")
+
     # log
     p_log = sub.add_parser("log", help="Log activity on a contact")
     p_log.add_argument("identifier")
@@ -5200,6 +5224,80 @@ def main():
         if g["entities"] > 0:
             print(f"\n  Graph: {g['entities']} entities, {g['facts']} facts")
         print()
+
+    elif args.command == "churning":
+        churning = crm.detect_churning()
+        if not churning:
+            print("  No decaying relationships detected")
+        else:
+            for c in churning:
+                deal = f"${c['deal_value']:,.0f}" if c["deal_value"] else "-"
+                cold = f"cold in {c['days_until_cold']}d" if c.get("days_until_cold") else ""
+                print(f"  {c['name']} ({c.get('company') or '-'}) — {c['velocity']:.1f}x velocity, deal {deal} {cold}")
+
+    elif args.command == "untouched":
+        untouched = crm.untouched_contacts(days=args.days)
+        if not untouched:
+            print(f"  No untouched contacts (>{args.days} days)")
+        else:
+            fmt_table(untouched, ["name", "company", "status", "deal_size"])
+
+    elif args.command == "touch-plan":
+        plan = crm.touch_plan(args.identifier)
+        if not plan:
+            print(f"  Not found: {args.identifier}")
+        else:
+            status = "OVERDUE" if plan["overdue"] else f"in {plan['days_until_next']}d"
+            print(f"  {plan['contact']}: {plan['channel']} every {plan['frequency_days']}d — next: {plan['next_touch']} ({status})")
+
+    elif args.command == "deal-velocity":
+        report = crm.deal_velocity_report()
+        print(f"  Deals: {report['total_deals']}  |  Avg pipeline time: {report['avg_days_in_pipeline']}d")
+        for stage, data in report["by_stage"].items():
+            print(f"    {stage}: {data['count']} deals, avg {data['avg_days']}d")
+
+    elif args.command == "company":
+        summary = crm.company_summary(args.company_name)
+        if not summary:
+            print(f"  No contacts at: {args.company_name}")
+        else:
+            print(f"  {summary['company']}: {summary['contact_count']} contacts, ${summary['total_deal_value']:,.0f} total deal value")
+            for c in summary["contacts"]:
+                print(f"    {c['name']} ({c.get('title') or '-'}) — {c.get('status')}")
+
+    elif args.command == "compare":
+        result = crm.compare_contacts(args.contact_a, args.contact_b)
+        if not result:
+            print("  One or both contacts not found")
+        else:
+            a, b = result["contact_a"], result["contact_b"]
+            print(f"  {'':20} {'A':>20} {'B':>20}")
+            for key in ("name", "company", "status", "score", "activity_count"):
+                print(f"  {key:20} {str(a.get(key, '-')):>20} {str(b.get(key, '-')):>20}")
+            if result["overlap"]:
+                print(f"\n  Overlap: {', '.join(result['overlap'])}")
+
+    elif args.command == "recent":
+        recent = crm.recent_contacts(limit=args.limit)
+        if not recent:
+            print("  No contacts")
+        else:
+            fmt_table(recent, ["name", "company", "status", "last_contacted"])
+
+    elif args.command == "top-companies":
+        top = crm.top_companies()
+        if not top:
+            print("  No companies with contacts")
+        else:
+            for t in top:
+                print(f"  {t['company']}: {t['contact_count']} contacts, ${t['total_deal_value']:,.0f}")
+
+    elif args.command == "all-tags":
+        tags = crm.all_tags()
+        if not tags:
+            print("  No tags in use")
+        else:
+            print(f"  Tags ({len(tags)}): {', '.join(tags)}")
 
     elif args.command == "log":
         if crm.log_activity(args.identifier, args.type, args.summary):
