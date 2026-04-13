@@ -492,6 +492,73 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_evolve",
+        "description": "Run one self-improvement cycle: analyze CRM, identify bottleneck, propose experiment",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_experiments",
+        "description": "List all past CRM experiments with status and results",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_win_patterns",
+        "description": "What do closed deals have in common — sources, activity types, touches to close",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_optimal_cadence",
+        "description": "Data-driven follow-up timing from actual conversion data",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_dead_pipeline",
+        "description": "Find contacts that should be marked as lost — stale + dead velocity",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stale_days": {"type": "integer", "description": "Days without activity to consider dead (default 60)"},
+            },
+        },
+    },
+    {
+        "name": "crm_contact_360",
+        "description": "Complete 360-degree view — profile, scores, velocity, reminders, fields, everything",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "crm_pipeline_health_score",
+        "description": "Single 0-100 score for overall pipeline health with breakdown",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_period_comparison",
+        "description": "Compare this period vs previous: new contacts, activities, deals. Trend spotting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Period length in days (default 30)"},
+            },
+        },
+    },
+    {
+        "name": "crm_quick_add",
+        "description": "Parse natural text into a contact: 'Alice Smith, CTO at Acme, alice@co.com'",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Natural language contact description"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
         "name": "crm_compare_contacts",
         "description": "Side-by-side comparison of two contacts for dedup decisions",
         "inputSchema": {
@@ -716,6 +783,35 @@ def handle_tool_call(name, arguments):
         elif name == "crm_relationship_score":
             result = crm.relationship_score(arguments["identifier"])
             return json.dumps(result, default=str, indent=2) if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_evolve":
+            return json.dumps(crm.evolve(), default=str, indent=2)
+
+        elif name == "crm_experiments":
+            return json.dumps(crm.experiments(), default=str, indent=2)
+
+        elif name == "crm_win_patterns":
+            return json.dumps(crm.win_patterns(), default=str, indent=2)
+
+        elif name == "crm_optimal_cadence":
+            return json.dumps(crm.optimal_cadence(), default=str, indent=2)
+
+        elif name == "crm_dead_pipeline":
+            return json.dumps(crm.dead_pipeline(stale_days=arguments.get("stale_days", 60)), default=str, indent=2)
+
+        elif name == "crm_contact_360":
+            result = crm.contact_360(arguments["identifier"])
+            return json.dumps(result, default=str, indent=2) if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_pipeline_health_score":
+            return json.dumps(crm.pipeline_health_score(), default=str, indent=2)
+
+        elif name == "crm_period_comparison":
+            return json.dumps(crm.period_comparison(days=arguments.get("days", 30)), default=str, indent=2)
+
+        elif name == "crm_quick_add":
+            cid = crm.quick_add(arguments["text"])
+            return f"Added contact (id={cid})" if cid else "Could not parse contact from text"
 
         elif name == "crm_compare_contacts":
             result = crm.compare_contacts(arguments["contact_a"], arguments["contact_b"])

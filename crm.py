@@ -6038,6 +6038,28 @@ def main():
 
     sub.add_parser("all-tags", help="List all tags in use")
 
+    # self-improvement
+    sub.add_parser("evolve", help="Run one self-improvement cycle")
+    sub.add_parser("experiments", help="List past experiments")
+    sub.add_parser("win-patterns", help="What do closed deals have in common")
+    sub.add_parser("loss-patterns", help="What do lost deals have in common")
+    sub.add_parser("dead", help="Find contacts that should be marked as lost")
+    sub.add_parser("cadence", help="Data-driven optimal follow-up timing")
+
+    p_qa = sub.add_parser("quick-add", help="Parse natural text into a contact")
+    p_qa.add_argument("text", nargs="+", help="Natural language contact description")
+
+    p_domain = sub.add_parser("domain", help="Find contacts by email domain")
+    p_domain.add_argument("domain", help="Email domain (e.g. acme.com)")
+
+    p_c360 = sub.add_parser("360", help="Complete 360-degree contact view")
+    p_c360.add_argument("identifier", help="Email or name")
+
+    sub.add_parser("pipeline-score", help="Single 0-100 pipeline health score")
+
+    p_period = sub.add_parser("period", help="Compare this period vs previous")
+    p_period.add_argument("--days", type=int, default=30)
+
     # reminders
     p_remind = sub.add_parser("remind", help="Set a reminder for a contact")
     p_remind.add_argument("identifier")
@@ -6502,6 +6524,112 @@ def main():
             print("  No tags in use")
         else:
             print(f"  Tags ({len(tags)}): {', '.join(tags)}")
+
+    elif args.command == "evolve":
+        result = crm.evolve()
+        print(f"\n  === Evolve Cycle ===")
+        print(f"  Bottleneck: {result['bottleneck']}")
+        a = result["analysis"]
+        print(f"  Contacts: {a['total_contacts']} | Stale: {a['stale_pct']}% | Win rate: {a['win_rate']}%")
+        p = result["proposal"]
+        print(f"\n  PROPOSAL: {p['experiment']}")
+        print(f"  Change: {p['change']}")
+        print(f"  Measure: {p['measure']}")
+        print(f"  Batch size: {p['batch_size']}")
+        print(f"  Experiment ID: {result['experiment_id']}\n")
+
+    elif args.command == "experiments":
+        exps = crm.experiments()
+        if not exps:
+            print("  No experiments recorded")
+        else:
+            for e in exps:
+                status = e["status"] or "unknown"
+                print(f"  [{status.upper()}] {e['id']}")
+                if e.get("proposal"):
+                    print(f"    {e['proposal']}")
+                if e.get("result"):
+                    print(f"    Result: {e['result']}")
+
+    elif args.command == "win-patterns":
+        wp = crm.win_patterns()
+        print(f"  Wins: {wp['win_count']} | Avg activities to close: {wp['avg_activities_to_close']}")
+        for p in wp["patterns"]:
+            print(f"    • {p}")
+
+    elif args.command == "loss-patterns":
+        lp = crm.loss_patterns()
+        print(f"  Losses: {lp['loss_count']} | Avg activities before loss: {lp['avg_activities_before_loss']}")
+        for p in lp["patterns"]:
+            print(f"    • {p}")
+
+    elif args.command == "dead":
+        dead = crm.dead_pipeline()
+        if not dead:
+            print("  No dead pipeline contacts")
+        else:
+            for d in dead:
+                print(f"  {d['name']} ({d.get('company') or '-'}) — {d['trend']}: {d['recommendation']}")
+
+    elif args.command == "cadence":
+        oc = crm.optimal_cadence()
+        w = oc["won_deals"]
+        l = oc["lost_deals"]
+        print(f"  Won deals: avg gap {w['avg_gap_days']}d, median {w['median_gap_days']}d ({w['sample_size']} gaps)")
+        print(f"  Lost deals: avg gap {l['avg_gap_days']}d, median {l['median_gap_days']}d ({l['sample_size']} gaps)")
+        print(f"\n  Recommendation: {oc['recommendation']}")
+
+    elif args.command == "quick-add":
+        text = " ".join(args.text)
+        cid = crm.quick_add(text)
+        if cid:
+            c = crm.conn.execute("SELECT name, email, company FROM contacts WHERE id = ?", (cid,)).fetchone()
+            print(f"  Added: {c['name']} ({c['email'] or 'no email'}) at {c['company'] or '-'}")
+        else:
+            print("  Could not parse contact from text")
+
+    elif args.command == "domain":
+        contacts = crm.find_by_domain(args.domain)
+        if not contacts:
+            print(f"  No contacts at @{args.domain}")
+        else:
+            fmt_table(contacts, ["name", "email", "company", "status"])
+
+    elif args.command == "360":
+        view = crm.contact_360(args.identifier)
+        if not view:
+            print(f"  Not found: {args.identifier}")
+        else:
+            p = view["profile"]
+            print(f"\n  === {p['name']} ===")
+            print(f"  Company: {p.get('company') or '-'} | Status: {p.get('status')} | Deal: {p.get('deal_size') or '-'}")
+            print(f"  Score: {p.get('score', 0)}/100 | Relationship: {view['relationship_score']}/100")
+            if view["velocity"]:
+                print(f"  Velocity: {view['velocity']['trend']} ({view['velocity']['velocity']}x)")
+            if view["streak"]:
+                print(f"  Streak: {view['streak']['current_streak']}d current, {view['streak']['longest_streak']}d longest")
+            if view["custom_fields"]:
+                print(f"  Fields: {view['custom_fields']}")
+            if view["reminders"]:
+                print(f"  Reminders: {len(view['reminders'])} pending")
+            print()
+
+    elif args.command == "pipeline-score":
+        phs = crm.pipeline_health_score()
+        print(f"  Pipeline Health: {phs['score']}/100")
+        for f in phs["factors"]:
+            print(f"    • {f}")
+
+    elif args.command == "period":
+        pc = crm.period_comparison(days=args.days)
+        c = pc["current_period"]
+        p = pc["previous_period"]
+        ch = pc["changes"]
+        print(f"  {pc['period_days']}-day comparison")
+        print(f"  {'':20} {'Current':>10} {'Previous':>10} {'Change':>10}")
+        print(f"  {'Contacts':20} {c['new_contacts']:>10} {p['new_contacts']:>10} {ch['contacts']:>10}")
+        print(f"  {'Activities':20} {c['activities']:>10} {p['activities']:>10} {ch['activities']:>10}")
+        print(f"  {'Deals':20} {c['new_deals']:>10} {p['new_deals']:>10} {ch['deals']:>10}")
 
     elif args.command == "remind":
         # Parse date shortcuts
