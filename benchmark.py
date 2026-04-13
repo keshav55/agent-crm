@@ -2422,6 +2422,88 @@ def run_benchmarks():
 
     dash_crm.close()
 
+    # ── 42. Notes (3 tests) ──
+
+    notes_crm = CRM(os.path.join(tempfile.mkdtemp(), "notes.db"))
+    notes_crm.add_contact("Notes Nora", email="nora@notes.com", company="NotesCo")
+
+    # 42a. add_note stores as activity type="note"
+    try:
+        result = notes_crm.add_note("nora@notes.com", "Met at conference, interested in AI")
+        check("add_note_works", result is True)
+    except (AttributeError, TypeError):
+        check("add_note_works", False)
+
+    # 42b. get_notes returns notes only
+    try:
+        notes_crm.log_activity("nora@notes.com", "call", "Follow up call")
+        notes_crm.add_note("nora@notes.com", "Second note about budget")
+        notes = notes_crm.get_notes("nora@notes.com")
+        check("get_notes_returns_notes", isinstance(notes, list) and len(notes) == 2 and all(
+            n["type"] == "note" for n in notes))
+    except (AttributeError, TypeError):
+        check("get_notes_returns_notes", False)
+
+    # 42c. get_notes returns None-like for missing contact
+    try:
+        notes = notes_crm.get_notes("nobody@void.com")
+        check("get_notes_not_found", notes == [])
+    except (AttributeError, TypeError):
+        check("get_notes_not_found", False)
+
+    notes_crm.close()
+
+    # ── 43. Company Operations (5 tests) ──
+
+    comp_crm = CRM(os.path.join(tempfile.mkdtemp(), "comp.db"))
+    comp_crm.add_contact("Comp Alice", email="alice@comp.com", company="TechCorp", title="CTO", deal_size="$10K/mo")
+    comp_crm.add_contact("Comp Bob", email="bob@comp.com", company="TechCorp", title="VP Sales")
+    comp_crm.add_contact("Comp Carol", email="carol@comp.com", company="OtherCo")
+    comp_crm.add_contact("No Email Person", company="TechCorp")
+    comp_crm.log_activity("alice@comp.com", "call", "Demo call")
+    comp_crm.add_deal("alice@comp.com", "Enterprise", value="$50K", stage="proposal")
+
+    # 43a. contacts_by_company returns matching contacts
+    try:
+        contacts = comp_crm.contacts_by_company("TechCorp")
+        check("contacts_by_company", len(contacts) == 3 and all(
+            c["company"].lower() == "techcorp" for c in contacts))
+    except (AttributeError, TypeError):
+        check("contacts_by_company", False)
+
+    # 43b. contacts_without_email finds them
+    try:
+        no_email = comp_crm.contacts_without_email()
+        check("contacts_without_email", len(no_email) >= 1 and any(
+            c["name"] == "No Email Person" for c in no_email))
+    except (AttributeError, TypeError):
+        check("contacts_without_email", False)
+
+    # 43c. company_summary returns dict
+    try:
+        summary = comp_crm.company_summary("TechCorp")
+        has_keys = isinstance(summary, dict) and all(k in summary for k in (
+            "company", "contact_count", "contacts", "total_deal_value", "deals"))
+        check("company_summary_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("company_summary_keys", False)
+
+    # 43d. company_summary contact count
+    try:
+        summary = comp_crm.company_summary("TechCorp")
+        check("company_summary_count", summary["contact_count"] == 3)
+    except (AttributeError, TypeError, KeyError):
+        check("company_summary_count", False)
+
+    # 43e. company_summary not found
+    try:
+        summary = comp_crm.company_summary("NonexistentCorp")
+        check("company_summary_not_found", summary is None)
+    except (AttributeError, TypeError):
+        check("company_summary_not_found", False)
+
+    comp_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

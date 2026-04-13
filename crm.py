@@ -2014,6 +2014,67 @@ class CRM:
                 results.append(dict(r))
         return results
 
+    def add_note(self, identifier, note):
+        """Append a timestamped note to a contact's activity log. Notes are permanent."""
+        return self.log_activity(identifier, "note", note)
+
+    def get_notes(self, identifier):
+        """Get all notes (type='note') for a contact, newest first."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return []
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM activity WHERE contact_id = ? AND type = 'note' ORDER BY created_at DESC",
+            (contact["id"],)
+        ).fetchall()]
+
+    def contacts_without_email(self):
+        """Find contacts missing an email address. Useful for data cleanup."""
+        rows = self.conn.execute(
+            "SELECT * FROM contacts WHERE (email IS NULL OR email = '') AND archived = 0 ORDER BY name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def contacts_by_company(self, company):
+        """List all contacts at a specific company (exact match, case-insensitive)."""
+        rows = self.conn.execute(
+            "SELECT * FROM contacts WHERE LOWER(company) = LOWER(?) AND archived = 0 ORDER BY name",
+            (company,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def company_summary(self, company):
+        """Roll up all contacts, deals, and activity for a company."""
+        contacts = self.contacts_by_company(company)
+        if not contacts:
+            return None
+        total_deal_value = 0
+        total_activities = 0
+        all_deals = []
+        statuses = {}
+        for c in contacts:
+            total_deal_value += self._parse_deal_size(c.get("deal_size"))
+            act_count = self.conn.execute(
+                "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (c["id"],)
+            ).fetchone()[0]
+            total_activities += act_count
+            deals = self.conn.execute(
+                "SELECT name, value, stage FROM deals WHERE contact_id = ?", (c["id"],)
+            ).fetchall()
+            all_deals.extend([dict(d) for d in deals])
+            s = c.get("status", "prospect")
+            statuses[s] = statuses.get(s, 0) + 1
+
+        return {
+            "company": company,
+            "contact_count": len(contacts),
+            "contacts": [{"name": c["name"], "title": c.get("title"), "status": c.get("status")} for c in contacts],
+            "total_deal_value": round(total_deal_value, 2),
+            "total_activities": total_activities,
+            "deals": all_deals,
+            "statuses": statuses,
+        }
+
     def all_tags(self):
         """Return all unique tags in use across contacts, sorted alphabetically."""
         rows = self.conn.execute(
