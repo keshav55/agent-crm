@@ -242,6 +242,90 @@ class CRM:
         self.conn.commit()
         return True
 
+    def merge_contacts(self, keep_identifier, merge_identifier):
+        """Merge two contacts into one. Keeps the first, absorbs the second.
+
+        Transfers all activities, deals, and facts from merge_identifier
+        to keep_identifier. Deletes the merged contact.
+        Returns the updated kept contact, or None if either not found.
+        """
+        keep = self.get_contact(keep_identifier)
+        merge = self.get_contact(merge_identifier)
+        if not keep or not merge:
+            return None
+        if keep["id"] == merge["id"]:
+            return keep  # same contact
+
+        # Transfer activities
+        self.conn.execute(
+            "UPDATE activity SET contact_id = ? WHERE contact_id = ?",
+            (keep["id"], merge["id"])
+        )
+        # Transfer deals
+        self.conn.execute(
+            "UPDATE deals SET contact_id = ? WHERE contact_id = ?",
+            (keep["id"], merge["id"])
+        )
+        # Merge graph entities
+        keep_entity_keys = self._contact_entity_keys(keep)
+        merge_entity_keys = self._contact_entity_keys(merge)
+        primary_keep = f"contact:{keep['name'].lower()}"
+        for mek in merge_entity_keys:
+            if mek not in keep_entity_keys:
+                self.merge_entities(primary_keep, mek)
+
+        # Fill in missing fields from merged contact
+        fillable = {"company", "title", "deal_size", "source", "notes", "tags"}
+        updates = {}
+        for field in fillable:
+            if not keep.get(field) and merge.get(field):
+                updates[field] = merge[field]
+        if updates:
+            self.update_contact(keep_identifier, **updates)
+
+        # Delete the merged contact
+        self.conn.execute("DELETE FROM contacts WHERE id = ?", (merge["id"],))
+        self.conn.commit()
+
+        return self.get_contact(keep_identifier)
+
+    def batch_add_contacts(self, contacts_list):
+        """Add many contacts in a single transaction. Much faster than individual add_contact calls.
+
+        contacts_list: list of dicts with keys matching add_contact params
+            (name, email, company, title, deal_size, status, source, notes, tags)
+        Returns dict with added, skipped, errors counts.
+        """
+        added = 0
+        skipped = 0
+        errors = 0
+        for c in contacts_list:
+            try:
+                name = c.get("name", "").strip()
+                if not name:
+                    errors += 1
+                    continue
+                self.conn.execute(
+                    """INSERT INTO contacts (name, email, company, title, deal_size, status, source, notes, tags)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (name, c.get("email"), c.get("company"), c.get("title"),
+                     c.get("deal_size"), c.get("status", "prospect"),
+                     c.get("source"), c.get("notes"), c.get("tags"))
+                )
+                added += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+            except Exception:
+                errors += 1
+        self.conn.commit()
+        return {"added": added, "skipped": skipped, "errors": errors}
+
+    def delete_activity(self, activity_id):
+        """Delete an activity entry by id."""
+        result = self.conn.execute("DELETE FROM activity WHERE id = ?", (activity_id,))
+        self.conn.commit()
+        return result.rowcount > 0
+
     # --- Activity ---
 
     def log_activity(self, identifier, activity_type, summary):
@@ -291,6 +375,97 @@ class CRM:
             facts.append((entity, "deal_stage", stage, "crm_deal"))
         self.observe_many(facts, source="crm_deal")
         return True
+
+    def get_deal(self, deal_id):
+        """Get a deal by its id."""
+        row = self.conn.execute(
+            "SELECT d.*, c.name as contact_name, c.company FROM deals d JOIN contacts c ON d.contact_id = c.id WHERE d.id = ?",
+            (deal_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_deal(self, deal_id, **fields):
+        """Update a deal by id. Allowed fields: name, value, stage, notes."""
+        deal = self.get_deal(deal_id)
+        if not deal:
+            return None
+        allowed = {"name", "value", "stage", "notes"}
+        updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if not updates:
+            return deal
+        # If stage is changing to closed_won, set closed_at
+        if updates.get("stage") == "closed_won" and deal.get("stage") != "closed_won":
+            updates["closed_at"] = datetime.now().isoformat()
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values())
+        vals.append(deal_id)
+        self.conn.execute(f"UPDATE deals SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", vals)
+        self.conn.commit()
+        # Update knowledge graph
+        contact = self.conn.execute("SELECT name FROM contacts WHERE id = ?", (deal["contact_id"],)).fetchone()
+        if contact:
+            entity = f"contact:{contact['name'].lower()}"
+            if "stage" in updates:
+                self.observe(entity, "deal_stage", updates["stage"], source="crm_deal")
+            if "value" in updates:
+                self.observe(entity, "deal_value", str(updates["value"]), source="crm_deal")
+        return self.get_deal(deal_id)
+
+    def delete_deal(self, deal_id):
+        """Delete a deal by id."""
+        deal = self.get_deal(deal_id)
+        if not deal:
+            return False
+        self.conn.execute("DELETE FROM deals WHERE id = ?", (deal_id,))
+        self.conn.commit()
+        return True
+
+    def close_deal(self, deal_id, notes=None):
+        """Close a deal as won. Sets stage to closed_won and records closed_at."""
+        updates = {"stage": "closed_won"}
+        if notes:
+            updates["notes"] = notes
+        return self.update_deal(deal_id, **updates)
+
+    def deals_for_contact(self, identifier):
+        """Get all deals for a specific contact."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return []
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM deals WHERE contact_id = ? ORDER BY updated_at DESC",
+            (contact["id"],)
+        ).fetchall()]
+
+    def deal_pipeline(self):
+        """Pipeline view focused on deals (not contacts).
+
+        Returns stages with deal counts, total value, and top deals per stage.
+        """
+        stages = ["prospect", "qualification", "proposal", "negotiation", "closed_won", "closed_lost"]
+        all_deals = self.conn.execute(
+            "SELECT d.*, c.name as contact_name, c.company FROM deals d JOIN contacts c ON d.contact_id = c.id"
+        ).fetchall()
+
+        by_stage = {s: [] for s in stages}
+        for d in all_deals:
+            s = d["stage"]
+            if s not in by_stage:
+                by_stage[s] = []
+            by_stage[s].append(dict(d))
+
+        pipeline = []
+        for stage in stages:
+            deals = by_stage[stage]
+            total_value = sum(self._parse_deal_size(d.get("value")) for d in deals)
+            pipeline.append({
+                "stage": stage,
+                "count": len(deals),
+                "total_value": round(total_value, 2),
+                "deals": [{"name": d["name"], "value": d.get("value"), "contact": d.get("contact_name")}
+                          for d in sorted(deals, key=lambda x: self._parse_deal_size(x.get("value")), reverse=True)[:5]],
+            })
+        return pipeline
 
     def list_deals(self, stage=None):
         query = "SELECT d.*, c.name as contact_name, c.company FROM deals d JOIN contacts c ON d.contact_id = c.id"
@@ -4156,6 +4331,31 @@ def main():
     p_sgraph = sub.add_parser("search-graph", help="Search across the context graph")
     p_sgraph.add_argument("query", help="Search term")
 
+    # deal management
+    p_deal_update = sub.add_parser("deal-update", help="Update a deal")
+    p_deal_update.add_argument("deal_id", type=int, help="Deal ID")
+    p_deal_update.add_argument("--name", help="Deal name")
+    p_deal_update.add_argument("--value", help="Deal value")
+    p_deal_update.add_argument("--stage", help="Deal stage")
+    p_deal_update.add_argument("--notes", help="Deal notes")
+
+    p_deal_close = sub.add_parser("deal-close", help="Close a deal as won")
+    p_deal_close.add_argument("deal_id", type=int, help="Deal ID")
+    p_deal_close.add_argument("--notes", help="Closing notes")
+
+    p_deal_delete = sub.add_parser("deal-delete", help="Delete a deal")
+    p_deal_delete.add_argument("deal_id", type=int, help="Deal ID")
+
+    p_deal_view = sub.add_parser("deals", help="List deals for a contact")
+    p_deal_view.add_argument("identifier", nargs="?", help="Email or name (omit for all)")
+    p_deal_view.add_argument("--stage", help="Filter by stage")
+
+    sub.add_parser("deal-pipeline", help="Deal-centric pipeline view")
+
+    p_merge = sub.add_parser("merge", help="Merge two contacts into one")
+    p_merge.add_argument("keep", help="Contact to keep (email or name)")
+    p_merge.add_argument("merge_into", help="Contact to merge in (will be deleted)")
+
     # ingest
     p_ingest = sub.add_parser("ingest", help="Import from local data sources (macOS)")
     p_ingest.add_argument("source", nargs="?", default="all",
@@ -4671,6 +4871,55 @@ def main():
         else:
             for r in results:
                 print(f"  {r['entity']} → {r['key']} = {r['value']}  (via {r['source']}, {r['observed_at'][:10]})")
+
+    elif args.command == "deal-update":
+        result = crm.update_deal(args.deal_id, name=args.name, value=args.value,
+                                  stage=args.stage, notes=args.notes)
+        if result:
+            print(f"  Updated deal {args.deal_id}: {result['name']} [{result['stage']}]")
+        else:
+            print(f"  Deal not found: {args.deal_id}")
+
+    elif args.command == "deal-close":
+        result = crm.close_deal(args.deal_id, notes=args.notes)
+        if result:
+            print(f"  Closed deal: {result['name']} ✓")
+        else:
+            print(f"  Deal not found: {args.deal_id}")
+
+    elif args.command == "deal-delete":
+        if crm.delete_deal(args.deal_id):
+            print(f"  Deleted deal {args.deal_id}")
+        else:
+            print(f"  Deal not found: {args.deal_id}")
+
+    elif args.command == "deals":
+        if args.identifier:
+            deals = crm.deals_for_contact(args.identifier)
+        else:
+            deals = crm.list_deals(stage=args.stage)
+        if not deals:
+            print("  No deals found")
+        else:
+            fmt_table(deals, ["id", "name", "value", "stage", "contact_name", "updated_at"])
+
+    elif args.command == "deal-pipeline":
+        pipeline = crm.deal_pipeline()
+        print(f"\n  {'Stage':<18} {'Count':>6} {'Total Value':>12}")
+        print(f"  {'-'*18} {'-'*6} {'-'*12}")
+        for s in pipeline:
+            if s["count"] > 0:
+                print(f"  {s['stage']:<18} {s['count']:>6} ${s['total_value']:>10,.0f}")
+                for d in s["deals"]:
+                    print(f"    • {d['name']} ({d['contact']}) — {d.get('value') or '-'}")
+        print()
+
+    elif args.command == "merge":
+        result = crm.merge_contacts(args.keep, args.merge_into)
+        if result:
+            print(f"  Merged into: {result['name']} (activities, deals, and facts combined)")
+        else:
+            print("  One or both contacts not found")
 
     elif args.command == "ingest":
         src = args.source

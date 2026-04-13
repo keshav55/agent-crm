@@ -247,6 +247,76 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "crm_add_deal",
+        "description": "Add a deal to a contact. Track sales opportunities.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+                "name": {"type": "string", "description": "Deal name"},
+                "value": {"type": "string", "description": "Deal value (e.g. '$50K/yr')"},
+                "stage": {"type": "string", "description": "Stage: prospect, qualification, proposal, negotiation, closed_won, closed_lost"},
+                "notes": {"type": "string", "description": "Notes"},
+            },
+            "required": ["identifier", "name"],
+        },
+    },
+    {
+        "name": "crm_update_deal",
+        "description": "Update a deal's fields (name, value, stage, notes)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Deal ID"},
+                "name": {"type": "string"},
+                "value": {"type": "string"},
+                "stage": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["deal_id"],
+        },
+    },
+    {
+        "name": "crm_close_deal",
+        "description": "Close a deal as won",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deal_id": {"type": "integer", "description": "Deal ID"},
+                "notes": {"type": "string", "description": "Closing notes"},
+            },
+            "required": ["deal_id"],
+        },
+    },
+    {
+        "name": "crm_list_deals",
+        "description": "List all deals, optionally filtered by stage or for a specific contact",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name (optional)"},
+                "stage": {"type": "string", "description": "Filter by stage"},
+            },
+        },
+    },
+    {
+        "name": "crm_deal_pipeline",
+        "description": "Deal-centric pipeline view with stages, counts, and values",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_merge_contacts",
+        "description": "Merge two contacts into one. Combines activities, deals, and facts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keep": {"type": "string", "description": "Contact to keep (email or name)"},
+                "merge": {"type": "string", "description": "Contact to absorb and delete"},
+            },
+            "required": ["keep", "merge"],
+        },
+    },
+    {
         "name": "crm_unified_search",
         "description": "Search across contacts, facts, and activity simultaneously. More comprehensive than basic search.",
         "inputSchema": {
@@ -372,6 +442,37 @@ def handle_tool_call(name, arguments):
         elif name == "crm_network_summary":
             result = crm.network_summary()
             return json.dumps(result, default=str, indent=2)
+
+        elif name == "crm_add_deal":
+            result = crm.add_deal(arguments["identifier"], arguments["name"],
+                                   value=arguments.get("value"), stage=arguments.get("stage", "prospect"),
+                                   notes=arguments.get("notes"))
+            return f"Added deal '{arguments['name']}'" if result else f"Contact not found: {arguments['identifier']}"
+
+        elif name == "crm_update_deal":
+            deal_id = arguments.pop("deal_id")
+            result = crm.update_deal(deal_id, **{k: v for k, v in arguments.items() if v is not None})
+            return json.dumps(result, default=str, indent=2) if result else f"Deal not found: {deal_id}"
+
+        elif name == "crm_close_deal":
+            result = crm.close_deal(arguments["deal_id"], notes=arguments.get("notes"))
+            return json.dumps(result, default=str, indent=2) if result else f"Deal not found: {arguments['deal_id']}"
+
+        elif name == "crm_list_deals":
+            if arguments.get("identifier"):
+                deals = crm.deals_for_contact(arguments["identifier"])
+            else:
+                deals = crm.list_deals(stage=arguments.get("stage"))
+            return json.dumps(deals, default=str, indent=2)
+
+        elif name == "crm_deal_pipeline":
+            return json.dumps(crm.deal_pipeline(), default=str, indent=2)
+
+        elif name == "crm_merge_contacts":
+            result = crm.merge_contacts(arguments["keep"], arguments["merge"])
+            if result:
+                return json.dumps(result, default=str, indent=2)
+            return "One or both contacts not found"
 
         elif name == "crm_unified_search":
             results = crm.unified_search(arguments["term"])

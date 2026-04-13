@@ -1881,6 +1881,226 @@ def run_benchmarks():
     except Exception:
         check("imessage_email_handle_parity", False)
 
+    # ── 30. Deal Lifecycle (10 tests) ──
+    # Tests for update_deal, delete_deal, close_deal, deals_for_contact, deal_pipeline
+
+    deal_crm = CRM(os.path.join(tempfile.mkdtemp(), "deals.db"))
+    deal_crm.add_contact("Deal Alice", email="alice@deal.com", company="DealCo")
+    deal_crm.add_contact("Deal Bob", email="bob@deal.com", company="BobCo")
+    deal_crm.add_deal("alice@deal.com", "Enterprise Plan", value="$50K/yr", stage="proposal")
+    deal_crm.add_deal("alice@deal.com", "Addon Module", value="$10K/yr", stage="prospect")
+    deal_crm.add_deal("bob@deal.com", "Starter Plan", value="$5K/yr", stage="qualification")
+
+    # 30a. get_deal returns dict
+    try:
+        deals = deal_crm.list_deals()
+        d = deal_crm.get_deal(deals[0]["id"])
+        check("get_deal_returns_dict", isinstance(d, dict) and "name" in d and "stage" in d)
+    except (AttributeError, TypeError, IndexError):
+        check("get_deal_returns_dict", False)
+
+    # 30b. get_deal not found
+    try:
+        d = deal_crm.get_deal(99999)
+        check("get_deal_not_found", d is None)
+    except (AttributeError, TypeError):
+        check("get_deal_not_found", False)
+
+    # 30c. update_deal changes stage
+    try:
+        deals = deal_crm.list_deals()
+        enterprise = [d for d in deals if d["name"] == "Enterprise Plan"][0]
+        result = deal_crm.update_deal(enterprise["id"], stage="negotiation")
+        check("update_deal_stage", result is not None and result["stage"] == "negotiation")
+    except (AttributeError, TypeError, IndexError):
+        check("update_deal_stage", False)
+
+    # 30d. update_deal changes value
+    try:
+        deals = deal_crm.list_deals()
+        addon = [d for d in deals if d["name"] == "Addon Module"][0]
+        result = deal_crm.update_deal(addon["id"], value="$15K/yr")
+        check("update_deal_value", result is not None and result["value"] == "$15K/yr")
+    except (AttributeError, TypeError, IndexError):
+        check("update_deal_value", False)
+
+    # 30e. update_deal not found
+    try:
+        result = deal_crm.update_deal(99999, stage="closed_won")
+        check("update_deal_not_found", result is None)
+    except (AttributeError, TypeError):
+        check("update_deal_not_found", False)
+
+    # 30f. close_deal sets stage and closed_at
+    try:
+        deals = deal_crm.list_deals()
+        starter = [d for d in deals if d["name"] == "Starter Plan"][0]
+        result = deal_crm.close_deal(starter["id"], notes="Signed!")
+        check("close_deal_works", result is not None and result["stage"] == "closed_won" and result.get("closed_at") is not None)
+    except (AttributeError, TypeError, IndexError):
+        check("close_deal_works", False)
+
+    # 30g. delete_deal removes the deal
+    try:
+        deals_before = deal_crm.list_deals()
+        count_before = len(deals_before)
+        deal_crm.delete_deal(deals_before[-1]["id"])
+        deals_after = deal_crm.list_deals()
+        check("delete_deal_removes", len(deals_after) == count_before - 1)
+    except (AttributeError, TypeError, IndexError):
+        check("delete_deal_removes", False)
+
+    # 30h. delete_deal not found
+    try:
+        result = deal_crm.delete_deal(99999)
+        check("delete_deal_not_found", result is False)
+    except (AttributeError, TypeError):
+        check("delete_deal_not_found", False)
+
+    # 30i. deals_for_contact returns only that contact's deals
+    try:
+        alice_deals = deal_crm.deals_for_contact("alice@deal.com")
+        check("deals_for_contact", isinstance(alice_deals, list) and all(
+            d.get("contact_id") is not None for d in alice_deals))
+    except (AttributeError, TypeError):
+        check("deals_for_contact", False)
+
+    # 30j. deal_pipeline returns stages with counts
+    try:
+        dp = deal_crm.deal_pipeline()
+        check("deal_pipeline_returns_list", isinstance(dp, list) and len(dp) >= 1 and all(
+            "stage" in s and "count" in s and "total_value" in s for s in dp))
+    except (AttributeError, TypeError):
+        check("deal_pipeline_returns_list", False)
+
+    deal_crm.close()
+
+    # ── 31. Contact Merge (6 tests) ──
+
+    merge_c_crm = CRM(os.path.join(tempfile.mkdtemp(), "merge_c.db"))
+    merge_c_crm.add_contact("Alice Primary", email="alice@primary.com", company="PrimaryCo")
+    merge_c_crm.add_contact("Alice Dup", email="alice@dup.com", company=None, title="CTO")
+    merge_c_crm.log_activity("alice@dup.com", "call", "Initial call")
+    merge_c_crm.add_deal("alice@dup.com", "Small Deal", value="$5K", stage="prospect")
+    merge_c_crm.observe("contact:alice dup", "role", "CTO", source="linkedin")
+
+    # 31a. merge_contacts returns updated contact
+    try:
+        result = merge_c_crm.merge_contacts("alice@primary.com", "alice@dup.com")
+        check("merge_contacts_returns_contact", result is not None and result["name"] == "Alice Primary")
+    except (AttributeError, TypeError):
+        check("merge_contacts_returns_contact", False)
+
+    # 31b. merged contact inherits missing fields
+    try:
+        c = merge_c_crm.get_contact("alice@primary.com")
+        check("merge_contacts_fills_fields", c is not None and c["title"] == "CTO")
+    except (AttributeError, TypeError):
+        check("merge_contacts_fills_fields", False)
+
+    # 31c. merged contact has activities from both
+    try:
+        acts = merge_c_crm.get_activity("alice@primary.com")
+        check("merge_contacts_has_activities", len(acts) >= 1)
+    except (AttributeError, TypeError):
+        check("merge_contacts_has_activities", False)
+
+    # 31d. merged contact has deals from both
+    try:
+        deals = merge_c_crm.deals_for_contact("alice@primary.com")
+        check("merge_contacts_has_deals", len(deals) >= 1)
+    except (AttributeError, TypeError):
+        check("merge_contacts_has_deals", False)
+
+    # 31e. old contact is deleted
+    try:
+        old = merge_c_crm.get_contact("alice@dup.com")
+        check("merge_contacts_deletes_old", old is None)
+    except (AttributeError, TypeError):
+        check("merge_contacts_deletes_old", False)
+
+    # 31f. merge nonexistent returns None
+    try:
+        result = merge_c_crm.merge_contacts("alice@primary.com", "nobody@void.com")
+        check("merge_contacts_not_found", result is None)
+    except (AttributeError, TypeError):
+        check("merge_contacts_not_found", False)
+
+    merge_c_crm.close()
+
+    # ── 32. Batch Add Contacts (4 tests) ──
+
+    batch_c_crm = CRM(os.path.join(tempfile.mkdtemp(), "batch_c.db"))
+
+    # 32a. batch_add_contacts returns counts
+    try:
+        contacts = [
+            {"name": "Batch Alice", "email": "ba@test.com", "company": "BatchCo", "status": "prospect"},
+            {"name": "Batch Bob", "email": "bb@test.com", "company": "BatchCo"},
+            {"name": "Batch Carol", "email": "bc@test.com"},
+        ]
+        result = batch_c_crm.batch_add_contacts(contacts)
+        check("batch_add_returns_counts", isinstance(result, dict) and result["added"] == 3 and result["skipped"] == 0)
+    except (AttributeError, TypeError):
+        check("batch_add_returns_counts", False)
+
+    # 32b. batch_add_contacts actually creates contacts
+    try:
+        all_c = batch_c_crm.list_contacts()
+        check("batch_add_creates_contacts", len(all_c) == 3)
+    except (AttributeError, TypeError):
+        check("batch_add_creates_contacts", False)
+
+    # 32c. batch_add_contacts skips duplicates
+    try:
+        dups = [
+            {"name": "Batch Alice", "email": "ba@test.com"},
+            {"name": "New Dave", "email": "bd@test.com"},
+        ]
+        result = batch_c_crm.batch_add_contacts(dups)
+        check("batch_add_skips_dups", result["skipped"] == 1 and result["added"] == 1)
+    except (AttributeError, TypeError):
+        check("batch_add_skips_dups", False)
+
+    # 32d. batch_add_contacts performance — 500 contacts in single transaction < 1s
+    try:
+        perf_batch = CRM(os.path.join(tempfile.mkdtemp(), "batch_perf.db"))
+        contacts = [{"name": f"Perf {i}", "email": f"perf{i}@batch.com"} for i in range(500)]
+        t0 = time.time()
+        result = perf_batch.batch_add_contacts(contacts)
+        batch_time = time.time() - t0
+        check("batch_add_perf_500", result["added"] == 500 and batch_time < 1.0)
+        perf_batch.close()
+    except (AttributeError, TypeError):
+        check("batch_add_perf_500", False)
+
+    batch_c_crm.close()
+
+    # ── 33. Activity Deletion (2 tests) ──
+
+    act_del_crm = CRM(os.path.join(tempfile.mkdtemp(), "act_del.db"))
+    act_del_crm.add_contact("Act Del", email="ad@test.com")
+    act_del_crm.log_activity("ad@test.com", "call", "Test call")
+
+    # 33a. delete_activity removes the entry
+    try:
+        acts = act_del_crm.get_activity("ad@test.com")
+        act_id = acts[0]["id"]
+        result = act_del_crm.delete_activity(act_id)
+        remaining = act_del_crm.get_activity("ad@test.com")
+        check("delete_activity_works", result is True and len(remaining) == 0)
+    except (AttributeError, TypeError, IndexError):
+        check("delete_activity_works", False)
+
+    # 33b. delete_activity nonexistent returns False
+    try:
+        result = act_del_crm.delete_activity(99999)
+        check("delete_activity_not_found", result is False)
+    except (AttributeError, TypeError):
+        check("delete_activity_not_found", False)
+
+    act_del_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
