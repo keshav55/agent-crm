@@ -3388,6 +3388,98 @@ def run_benchmarks():
 
     cne_crm.close()
 
+    # ── 68. Quick Add (4 tests) ──
+
+    qa_crm = CRM(os.path.join(tempfile.mkdtemp(), "qa.db"))
+
+    # 68a. quick_add from email only
+    try:
+        cid = qa_crm.quick_add("alice@example.com")
+        c = qa_crm.get_contact("alice@example.com")
+        check("quick_add_email_only", cid is not None and c is not None and c["email"] == "alice@example.com")
+    except (AttributeError, TypeError):
+        check("quick_add_email_only", False)
+
+    # 68b. quick_add with name and email
+    try:
+        cid = qa_crm.quick_add("Bob Smith bob@example.com")
+        c = qa_crm.get_contact("bob@example.com")
+        check("quick_add_name_email", cid is not None and c is not None and "Bob" in c["name"])
+    except (AttributeError, TypeError):
+        check("quick_add_name_email", False)
+
+    # 68c. quick_add with title and company
+    try:
+        cid = qa_crm.quick_add("Carol Lee, CTO at TechCorp, carol@tech.com")
+        c = qa_crm.get_contact("carol@tech.com")
+        check("quick_add_full", cid is not None and c is not None and c.get("company") == "TechCorp")
+    except (AttributeError, TypeError):
+        check("quick_add_full", False)
+
+    # 68d. quick_add empty returns None
+    try:
+        cid = qa_crm.quick_add("")
+        check("quick_add_empty", cid is None)
+    except (AttributeError, TypeError):
+        check("quick_add_empty", False)
+
+    qa_crm.close()
+
+    # ── 69. Find By Domain (2 tests) ──
+
+    fd_crm = CRM(os.path.join(tempfile.mkdtemp(), "fd.db"))
+    fd_crm.add_contact("FD Alice", email="alice@techcorp.com")
+    fd_crm.add_contact("FD Bob", email="bob@techcorp.com")
+    fd_crm.add_contact("FD Carol", email="carol@other.com")
+
+    # 69a. find_by_domain returns matching contacts
+    try:
+        matches = fd_crm.find_by_domain("techcorp.com")
+        check("find_by_domain_matches", len(matches) == 2)
+    except (AttributeError, TypeError):
+        check("find_by_domain_matches", False)
+
+    # 69b. find_by_domain no matches
+    try:
+        matches = fd_crm.find_by_domain("nonexistent.com")
+        check("find_by_domain_empty", len(matches) == 0)
+    except (AttributeError, TypeError):
+        check("find_by_domain_empty", False)
+
+    fd_crm.close()
+
+    # ── 70. Interaction Frequency (3 tests) ──
+
+    if_crm = CRM(os.path.join(tempfile.mkdtemp(), "if.db"))
+    if_crm.add_contact("IF Alice", email="alice@if.com")
+    for i in range(5):
+        if_crm.log_activity("alice@if.com", "email", f"Email {i}")
+
+    # 70a. interaction_frequency returns dict
+    try:
+        freq = if_crm.interaction_frequency("alice@if.com")
+        has_keys = isinstance(freq, dict) and all(k in freq for k in (
+            "total_interactions", "weekly_avg", "active_weeks", "longest_gap_days"))
+        check("interaction_freq_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("interaction_freq_keys", False)
+
+    # 70b. total count is correct
+    try:
+        freq = if_crm.interaction_frequency("alice@if.com")
+        check("interaction_freq_count", freq["total_interactions"] == 5)
+    except (AttributeError, TypeError, KeyError):
+        check("interaction_freq_count", False)
+
+    # 70c. not found
+    try:
+        freq = if_crm.interaction_frequency("nobody@void.com")
+        check("interaction_freq_not_found", freq is None)
+    except (AttributeError, TypeError):
+        check("interaction_freq_not_found", False)
+
+    if_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

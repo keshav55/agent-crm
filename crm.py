@@ -3055,6 +3055,102 @@ class CRM:
             heatmap[day]["_total"] = sum(heatmap[day].values())
         return heatmap
 
+    def quick_add(self, text):
+        """Parse a natural-language-ish string into a contact.
+
+        Supports formats like:
+        - "Alice Smith alice@co.com Acme"
+        - "alice@co.com"
+        - "Bob Jones, CEO at TechCo, bob@tech.com"
+
+        Returns the new contact id or None.
+        """
+        text = text.strip()
+        if not text:
+            return None
+
+        # Extract email if present
+        email_match = re.search(r'[\w.%+-]+@[\w.-]+\.\w{2,}', text)
+        email = email_match.group(0) if email_match else None
+
+        # Remove email from text for name parsing
+        remaining = text.replace(email, '').strip() if email else text
+        remaining = remaining.strip(',').strip()
+
+        # Try to parse "Name, Title at Company" or "Name at Company"
+        company = None
+        title = None
+        at_match = re.search(r',?\s*(?:(\w[\w\s]*?)\s+)?(?:at|@)\s+(.+?)(?:,|$)', remaining, re.IGNORECASE)
+        if at_match:
+            title = at_match.group(1)
+            company = at_match.group(2).strip().rstrip(',')
+            remaining = remaining[:at_match.start()].strip().rstrip(',')
+
+        name = remaining.strip() if remaining.strip() else (email.split('@')[0].replace('.', ' ').title() if email else None)
+        if not name:
+            return None
+
+        try:
+            self._validate_email(email)
+            return self.add_contact(name=name, email=email, company=company, title=title)
+        except (sqlite3.IntegrityError, ValueError):
+            return None
+
+    def find_by_domain(self, domain):
+        """Find all contacts with email at a specific domain. For company prospecting."""
+        domain = domain.lower().strip()
+        if not domain:
+            return []
+        rows = self.conn.execute(
+            "SELECT * FROM contacts WHERE LOWER(email) LIKE ? AND archived = 0 ORDER BY name",
+            (f"%@{domain}",)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def interaction_frequency(self, identifier, days=90):
+        """How often you interact with a contact: weekly average, busiest week, gaps."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = self.conn.execute(
+            "SELECT date(created_at) as d FROM activity WHERE contact_id = ? AND created_at >= ? ORDER BY d",
+            (contact["id"], cutoff)
+        ).fetchall()
+
+        if not rows:
+            return {"weekly_avg": 0, "total_interactions": 0, "active_weeks": 0, "longest_gap_days": days}
+
+        dates = [date.fromisoformat(r["d"]) for r in rows]
+        total = len(dates)
+
+        # Group by week
+        weeks = {}
+        for d in dates:
+            week_key = d.isocalendar()[:2]
+            weeks[week_key] = weeks.get(week_key, 0) + 1
+
+        active_weeks = len(weeks)
+        total_weeks = max(1, days // 7)
+        weekly_avg = round(total / total_weeks, 1)
+        busiest_week = max(weeks.values()) if weeks else 0
+
+        # Longest gap
+        longest_gap = 0
+        for i in range(1, len(dates)):
+            gap = (dates[i] - dates[i - 1]).days
+            longest_gap = max(longest_gap, gap)
+
+        return {
+            "total_interactions": total,
+            "weekly_avg": weekly_avg,
+            "active_weeks": active_weeks,
+            "total_weeks": total_weeks,
+            "busiest_week_count": busiest_week,
+            "longest_gap_days": longest_gap,
+        }
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""
