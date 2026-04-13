@@ -420,6 +420,107 @@ class CRM:
             output.close()
         return path or "stdout"
 
+    def export_vcard(self, path=None):
+        """Export all contacts as vCard 3.0 (.vcf). Standard format importable everywhere."""
+        contacts = self.list_contacts()
+        lines = []
+        for c in contacts:
+            lines.append("BEGIN:VCARD")
+            lines.append("VERSION:3.0")
+            name = c["name"]
+            parts = name.split(None, 1)
+            first = parts[0] if parts else name
+            last = parts[1] if len(parts) > 1 else ""
+            lines.append(f"N:{last};{first};;;")
+            lines.append(f"FN:{name}")
+            if c.get("email"):
+                lines.append(f"EMAIL;TYPE=WORK:{c['email']}")
+            if c.get("company"):
+                lines.append(f"ORG:{c['company']}")
+            if c.get("title"):
+                lines.append(f"TITLE:{c['title']}")
+            if c.get("notes"):
+                # vCard escapes: newlines, commas, semicolons, backslashes
+                note = c["notes"].replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+                lines.append(f"NOTE:{note}")
+            lines.append("END:VCARD")
+        vcf_text = "\n".join(lines) + "\n"
+        if path:
+            with open(path, "w") as f:
+                f.write(vcf_text)
+            return path
+        return vcf_text
+
+    def import_vcard(self, path):
+        """Import contacts from a vCard (.vcf) file. Returns count imported."""
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r") as f:
+            content = f.read()
+        count = 0
+        # Split into individual vCards
+        cards = content.split("BEGIN:VCARD")
+        for card in cards:
+            if not card.strip():
+                continue
+            name = email = company = title = notes = None
+            for line in card.split("\n"):
+                line = line.strip()
+                if line.startswith("FN:"):
+                    name = line[3:].strip()
+                elif line.startswith("EMAIL"):
+                    email = line.split(":", 1)[1].strip() if ":" in line else None
+                elif line.startswith("ORG:"):
+                    company = line[4:].strip()
+                elif line.startswith("TITLE:"):
+                    title = line[6:].strip()
+                elif line.startswith("NOTE:"):
+                    notes = line[5:].replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+            if name:
+                try:
+                    self._validate_email(email)
+                    self.add_contact(name=name, email=email, company=company,
+                                     title=title, notes=notes, source="vcard_import")
+                    count += 1
+                except (sqlite3.IntegrityError, ValueError):
+                    pass  # skip duplicates and invalid emails
+        return count
+
+    def dashboard(self):
+        """All-in-one CRM dashboard: metrics, pipeline, actions, health — single call.
+
+        Returns a dict with everything an agent needs for a daily briefing.
+        """
+        stats = self.stats()
+        rev = self.revenue_report()
+        pipeline = self.pipeline()
+        actions = self.next_actions(limit=5)
+        hc = self.health_check()
+        stale = self.stale_contacts(days=14)
+        gs = self.graph_stats()
+
+        return {
+            "metrics": {
+                "total_contacts": stats["total_contacts"],
+                "mrr": rev["mrr"],
+                "arr": rev["arr"],
+                "pipeline_value": rev["pipeline_value"],
+                "active_last_7d": stats["contacted_last_7d"],
+                "stale_14d": stats["stale_14d"],
+            },
+            "pipeline": pipeline,
+            "top_actions": actions,
+            "health": {
+                "healthy": len(hc["healthy"]),
+                "at_risk": len(hc["at_risk"]),
+                "cold": len(hc["cold"]),
+                "actions": hc["actions"][:5],
+            },
+            "stale_contacts": [{"name": c["name"], "company": c.get("company"),
+                                "deal_size": c.get("deal_size")} for c in stale[:5]],
+            "graph": gs,
+        }
+
     # --- Activity ---
 
     def log_activity(self, identifier, activity_type, summary):
@@ -4330,6 +4431,14 @@ def main():
     p_export_deals = sub.add_parser("export-deals", help="Export deals as CSV")
     p_export_deals.add_argument("--output", "-o", help="Output file path")
 
+    p_export_vcf = sub.add_parser("export-vcard", help="Export contacts as vCard (.vcf)")
+    p_export_vcf.add_argument("--output", "-o", help="Output file path")
+
+    p_import_vcf = sub.add_parser("import-vcard", help="Import contacts from vCard (.vcf) file")
+    p_import_vcf.add_argument("file", help="Path to .vcf file")
+
+    sub.add_parser("dashboard", help="All-in-one CRM dashboard")
+
     # log
     p_log = sub.add_parser("log", help="Log activity on a contact")
     p_log.add_argument("identifier")
@@ -4663,6 +4772,39 @@ def main():
         crm.export_deals_csv(args.output)
         if args.output:
             print(f"Exported deals to: {args.output}")
+
+    elif args.command == "export-vcard":
+        result = crm.export_vcard(args.output)
+        if args.output:
+            print(f"Exported vCard to: {args.output}")
+        else:
+            print(result)
+
+    elif args.command == "import-vcard":
+        count = crm.import_vcard(args.file)
+        print(f"Imported: {count} contacts")
+
+    elif args.command == "dashboard":
+        d = crm.dashboard()
+        m = d["metrics"]
+        print(f"\n  === CRM Dashboard ===\n")
+        print(f"  Contacts: {m['total_contacts']}  |  MRR: ${m['mrr']:,.0f}  |  Pipeline: ${m['pipeline_value']:,.0f}")
+        print(f"  Active (7d): {m['active_last_7d']}  |  Stale (14d+): {m['stale_14d']}")
+        h = d["health"]
+        print(f"  Health: {h['healthy']} healthy, {h['at_risk']} at risk, {h['cold']} cold")
+        if d["top_actions"]:
+            print(f"\n  Top Actions:")
+            for a in d["top_actions"]:
+                prio = a["priority"].upper()
+                print(f"    [{prio}] {a['contact']}: {a['action']}")
+        if d["stale_contacts"]:
+            print(f"\n  Stale Contacts:")
+            for s in d["stale_contacts"]:
+                print(f"    {s['name']} ({s.get('company') or '-'}) — {s.get('deal_size') or 'no deal'}")
+        g = d["graph"]
+        if g["entities"] > 0:
+            print(f"\n  Graph: {g['entities']} entities, {g['facts']} facts")
+        print()
 
     elif args.command == "log":
         if crm.log_activity(args.identifier, args.type, args.summary):

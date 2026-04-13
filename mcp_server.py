@@ -350,6 +350,11 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_dashboard",
+        "description": "All-in-one CRM dashboard: metrics, pipeline, actions, health, graph stats. One call for daily briefing.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "crm_delete_contacts",
         "description": "Bulk delete multiple contacts by email/name in a single transaction",
         "inputSchema": {
@@ -518,6 +523,9 @@ def handle_tool_call(name, arguments):
         elif name == "crm_unarchive_contact":
             result = crm.unarchive_contact(arguments["identifier"])
             return f"Unarchived {arguments['identifier']}" if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_dashboard":
+            return json.dumps(crm.dashboard(), default=str, indent=2)
 
         elif name == "crm_delete_contacts":
             count = crm.delete_contacts(arguments["identifiers"])

@@ -2339,6 +2339,89 @@ def run_benchmarks():
 
     sum_crm.close()
 
+    # ── 40. vCard Import/Export (5 tests) ──
+
+    vcf_crm = CRM(os.path.join(tempfile.mkdtemp(), "vcf.db"))
+    vcf_crm.add_contact("VCF Alice", email="alice@vcf.com", company="VcfCo", title="CTO", notes="Key decision maker")
+    vcf_crm.add_contact("VCF Bob", email="bob@vcf.com", company="BobCo")
+
+    # 40a. export_vcard returns string with vCard format
+    try:
+        vcf_text = vcf_crm.export_vcard()
+        check("vcard_export_format", isinstance(vcf_text, str) and "BEGIN:VCARD" in vcf_text and "END:VCARD" in vcf_text)
+    except (AttributeError, TypeError):
+        check("vcard_export_format", False)
+
+    # 40b. export_vcard includes contact data
+    try:
+        vcf_text = vcf_crm.export_vcard()
+        check("vcard_export_data", "VCF Alice" in vcf_text and "alice@vcf.com" in vcf_text and "VcfCo" in vcf_text)
+    except (AttributeError, TypeError):
+        check("vcard_export_data", False)
+
+    # 40c. export_vcard to file
+    try:
+        vcf_path = os.path.join(tempfile.mkdtemp(), "contacts.vcf")
+        vcf_crm.export_vcard(vcf_path)
+        check("vcard_export_file", os.path.exists(vcf_path))
+    except (AttributeError, TypeError):
+        check("vcard_export_file", False)
+
+    # 40d. import_vcard roundtrip
+    try:
+        vcf_path2 = os.path.join(tempfile.mkdtemp(), "roundtrip.vcf")
+        vcf_crm.export_vcard(vcf_path2)
+        import_crm2 = CRM(os.path.join(tempfile.mkdtemp(), "vcf_import.db"))
+        count = import_crm2.import_vcard(vcf_path2)
+        check("vcard_import_roundtrip", count == 2)
+        import_crm2.close()
+    except (AttributeError, TypeError):
+        check("vcard_import_roundtrip", False)
+
+    # 40e. import_vcard missing file returns 0
+    try:
+        count = vcf_crm.import_vcard("/nonexistent/path.vcf")
+        check("vcard_import_missing", count == 0)
+    except (AttributeError, TypeError):
+        check("vcard_import_missing", False)
+
+    vcf_crm.close()
+
+    # ── 41. Dashboard (3 tests) ──
+
+    dash_crm = CRM(os.path.join(tempfile.mkdtemp(), "dash.db"))
+    dash_crm.add_contact("Dash Alice", email="alice@dash.com", company="DashCo", status="active_customer", deal_size="$10K/mo")
+    dash_crm.add_contact("Dash Bob", email="bob@dash.com", company="BobCo", status="prospect")
+    dash_crm.log_activity("alice@dash.com", "call", "Check-in")
+
+    # 41a. dashboard returns dict with expected keys
+    try:
+        d = dash_crm.dashboard()
+        has_keys = isinstance(d, dict) and all(k in d for k in ("metrics", "pipeline", "top_actions", "health", "graph"))
+        check("dashboard_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("dashboard_keys", False)
+
+    # 41b. dashboard metrics have expected fields
+    try:
+        d = dash_crm.dashboard()
+        m = d["metrics"]
+        has_fields = all(k in m for k in ("total_contacts", "mrr", "pipeline_value"))
+        check("dashboard_metrics", has_fields and m["total_contacts"] == 2)
+    except (AttributeError, TypeError, KeyError):
+        check("dashboard_metrics", False)
+
+    # 41c. dashboard health has counts
+    try:
+        d = dash_crm.dashboard()
+        h = d["health"]
+        has_counts = all(k in h for k in ("healthy", "at_risk", "cold"))
+        check("dashboard_health", has_counts)
+    except (AttributeError, TypeError, KeyError):
+        check("dashboard_health", False)
+
+    dash_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
