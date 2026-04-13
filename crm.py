@@ -2725,6 +2725,48 @@ class CRM:
         forecast.sort(key=lambda x: x["expected_value"], reverse=True)
         return forecast
 
+    def search_activity(self, term, limit=50):
+        """Search across all activity summaries. Returns matching activities with contact info."""
+        t = f"%{self._escape_like(term)}%"
+        rows = self.conn.execute(
+            """SELECT a.id, a.type, a.summary, a.created_at, c.name, c.email, c.company
+               FROM activity a JOIN contacts c ON a.contact_id = c.id
+               WHERE a.summary LIKE ? ESCAPE '\\'
+               ORDER BY a.created_at DESC LIMIT ?""",
+            (t, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def contacts_count(self):
+        """Quick count of contacts by status. Lighter than full stats()."""
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) as n FROM contacts WHERE archived = 0 GROUP BY status"
+        ).fetchall()
+        result = {r["status"]: r["n"] for r in rows}
+        result["total"] = sum(result.values())
+        return result
+
+    def deals_summary(self):
+        """Quick summary of all deals: total count, value, by stage."""
+        deals = self.conn.execute(
+            "SELECT stage, COUNT(*) as n, GROUP_CONCAT(name, ', ') as names FROM deals GROUP BY stage ORDER BY n DESC"
+        ).fetchall()
+        total_value = 0
+        stages = []
+        for d in deals:
+            stage_deals = self.conn.execute(
+                "SELECT value FROM deals WHERE stage = ?", (d["stage"],)
+            ).fetchall()
+            val = sum(self._parse_deal_size(r["value"]) for r in stage_deals)
+            total_value += val
+            stages.append({
+                "stage": d["stage"],
+                "count": d["n"],
+                "value": round(val, 2),
+                "deals": d["names"],
+            })
+        return {"total_deals": sum(d["n"] for d in deals), "total_value": round(total_value, 2), "by_stage": stages}
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""

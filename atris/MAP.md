@@ -4,7 +4,7 @@
 | File | What |
 |------|------|
 | `crm.py` | CRM library + CLI. Contacts, activity, deals, knowledge graph |
-| `benchmark.py` | 295 tests. Correctness, edge cases, performance |
+| `benchmark.py` | 320 tests. Correctness, edge cases, performance |
 | `mcp_server.py` | 35 tools for any AI agent via MCP |
 
 ## Schema

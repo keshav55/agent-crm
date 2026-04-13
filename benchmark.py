@@ -3062,6 +3062,61 @@ def run_benchmarks():
 
     pf_crm.close()
 
+    # ── 60. Search Activity & Quick Counts (6 tests) ──
+
+    sq_crm = CRM(os.path.join(tempfile.mkdtemp(), "sq.db"))
+    sq_crm.add_contact("SQ Alice", email="alice@sq.com", company="SqCo", status="active_customer", deal_size="$10K/mo")
+    sq_crm.add_contact("SQ Bob", email="bob@sq.com", company="BobCo", status="prospect")
+    sq_crm.log_activity("alice@sq.com", "call", "Discussed renewal pricing")
+    sq_crm.log_activity("alice@sq.com", "email", "Sent pricing sheet")
+    sq_crm.log_activity("bob@sq.com", "email", "Cold outreach about pricing")
+    sq_crm.add_deal("alice@sq.com", "Renewal", value="$12K/mo", stage="negotiation")
+
+    # 60a. search_activity finds matching activities
+    try:
+        results = sq_crm.search_activity("pricing")
+        check("search_activity_finds", isinstance(results, list) and len(results) >= 2)
+    except (AttributeError, TypeError):
+        check("search_activity_finds", False)
+
+    # 60b. search_activity includes contact info
+    try:
+        results = sq_crm.search_activity("renewal")
+        check("search_activity_contact_info", len(results) >= 1 and "name" in results[0] and "company" in results[0])
+    except (AttributeError, TypeError):
+        check("search_activity_contact_info", False)
+
+    # 60c. search_activity no results
+    try:
+        results = sq_crm.search_activity("xyznonexistent")
+        check("search_activity_empty", results == [])
+    except (AttributeError, TypeError):
+        check("search_activity_empty", False)
+
+    # 60d. contacts_count returns dict with totals
+    try:
+        counts = sq_crm.contacts_count()
+        check("contacts_count_dict", isinstance(counts, dict) and "total" in counts and counts["total"] == 2)
+    except (AttributeError, TypeError):
+        check("contacts_count_dict", False)
+
+    # 60e. deals_summary returns overview
+    try:
+        ds = sq_crm.deals_summary()
+        has_keys = isinstance(ds, dict) and all(k in ds for k in ("total_deals", "total_value", "by_stage"))
+        check("deals_summary_keys", has_keys and ds["total_deals"] >= 1)
+    except (AttributeError, TypeError):
+        check("deals_summary_keys", False)
+
+    # 60f. deals_summary value is correct
+    try:
+        ds = sq_crm.deals_summary()
+        check("deals_summary_value", ds["total_value"] > 0)
+    except (AttributeError, TypeError, KeyError):
+        check("deals_summary_value", False)
+
+    sq_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
