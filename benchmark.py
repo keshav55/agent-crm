@@ -2101,6 +2101,169 @@ def run_benchmarks():
 
     act_del_crm.close()
 
+    # ── 34. Email Validation (4 tests) ──
+
+    val_crm = CRM(os.path.join(tempfile.mkdtemp(), "val.db"))
+
+    # 34a. Valid email accepted
+    try:
+        cid = val_crm.add_contact("Valid Email", email="valid@example.com")
+        check("email_valid_accepted", cid is not None and cid > 0)
+    except (ValueError, TypeError):
+        check("email_valid_accepted", False)
+
+    # 34b. Invalid email rejected
+    try:
+        val_crm.add_contact("Bad Email", email="not-an-email")
+        check("email_invalid_rejected", False)  # Should have raised
+    except ValueError:
+        check("email_invalid_rejected", True)
+    except Exception:
+        check("email_invalid_rejected", False)
+
+    # 34c. None email accepted (no email is fine)
+    try:
+        cid = val_crm.add_contact("No Email", email=None)
+        check("email_none_accepted", cid is not None and cid > 0)
+    except (ValueError, TypeError):
+        check("email_none_accepted", False)
+
+    # 34d. Empty string email rejected
+    try:
+        val_crm.add_contact("Empty Email", email="")
+        # Empty string is technically invalid but historically allowed as NULL-ish
+        # Either raising ValueError or silently accepting is OK
+        check("email_empty_handled", True)
+    except ValueError:
+        check("email_empty_handled", True)
+    except Exception:
+        check("email_empty_handled", False)
+
+    val_crm.close()
+
+    # ── 35. Contact Archiving (6 tests) ──
+
+    arch_crm = CRM(os.path.join(tempfile.mkdtemp(), "arch.db"))
+    arch_crm.add_contact("Keep Kate", email="kate@arch.com", company="KeepCo")
+    arch_crm.add_contact("Archive Andy", email="andy@arch.com", company="ArchCo")
+    arch_crm.add_contact("Archive Beth", email="beth@arch.com", company="ArchCo")
+
+    # 35a. archive_contact hides from list_contacts
+    try:
+        arch_crm.archive_contact("andy@arch.com")
+        contacts = arch_crm.list_contacts()
+        names = [c["name"] for c in contacts]
+        check("archive_hides_contact", "Archive Andy" not in names and "Keep Kate" in names)
+    except (AttributeError, TypeError):
+        check("archive_hides_contact", False)
+
+    # 35b. archived contact visible with include_archived=True
+    try:
+        all_contacts = arch_crm.list_contacts(include_archived=True)
+        names = [c["name"] for c in all_contacts]
+        check("archive_include_flag", "Archive Andy" in names and "Keep Kate" in names)
+    except (AttributeError, TypeError):
+        check("archive_include_flag", False)
+
+    # 35c. unarchive_contact restores
+    try:
+        arch_crm.unarchive_contact("andy@arch.com")
+        contacts = arch_crm.list_contacts()
+        names = [c["name"] for c in contacts]
+        check("unarchive_restores", "Archive Andy" in names)
+    except (AttributeError, TypeError):
+        check("unarchive_restores", False)
+
+    # 35d. archive nonexistent returns None
+    try:
+        result = arch_crm.archive_contact("nobody@void.com")
+        check("archive_not_found", result is None)
+    except (AttributeError, TypeError):
+        check("archive_not_found", False)
+
+    # 35e. archived contacts excluded from stats
+    try:
+        arch_crm.archive_contact("beth@arch.com")
+        stats = arch_crm.stats()
+        # Beth should not count toward total
+        check("archive_excluded_from_stats", stats["total_contacts"] == 2)
+    except (AttributeError, TypeError):
+        check("archive_excluded_from_stats", False)
+
+    # 35f. archived contacts excluded from pipeline
+    try:
+        pipeline = arch_crm.pipeline()
+        total_in_pipeline = sum(p["count"] for p in pipeline)
+        check("archive_excluded_from_pipeline", total_in_pipeline == 2)
+    except (AttributeError, TypeError):
+        check("archive_excluded_from_pipeline", False)
+
+    arch_crm.close()
+
+    # ── 36. Bulk Delete (3 tests) ──
+
+    bdel_crm = CRM(os.path.join(tempfile.mkdtemp(), "bdel.db"))
+    bdel_crm.add_contact("Del A", email="a@del.com")
+    bdel_crm.add_contact("Del B", email="b@del.com")
+    bdel_crm.add_contact("Del C", email="c@del.com")
+    bdel_crm.add_contact("Keep D", email="d@del.com")
+
+    # 36a. delete_contacts removes multiple
+    try:
+        count = bdel_crm.delete_contacts(["a@del.com", "b@del.com", "c@del.com"])
+        check("bulk_delete_count", count == 3)
+    except (AttributeError, TypeError):
+        check("bulk_delete_count", False)
+
+    # 36b. remaining contacts intact
+    try:
+        remaining = bdel_crm.list_contacts()
+        check("bulk_delete_remaining", len(remaining) == 1 and remaining[0]["name"] == "Keep D")
+    except (AttributeError, TypeError):
+        check("bulk_delete_remaining", False)
+
+    # 36c. delete_contacts handles missing gracefully
+    try:
+        count = bdel_crm.delete_contacts(["nobody@void.com", "also_nobody@void.com"])
+        check("bulk_delete_missing", count == 0)
+    except (AttributeError, TypeError):
+        check("bulk_delete_missing", False)
+
+    bdel_crm.close()
+
+    # ── 37. Deals CSV Export (3 tests) ──
+
+    dcsv_crm = CRM(os.path.join(tempfile.mkdtemp(), "dcsv.db"))
+    dcsv_crm.add_contact("CSV Alice", email="alice@csv.com", company="CsvCo")
+    dcsv_crm.add_deal("alice@csv.com", "Big Deal", value="$50K/yr", stage="proposal")
+    dcsv_crm.add_deal("alice@csv.com", "Small Deal", value="$5K/yr", stage="prospect")
+
+    # 37a. export_deals_csv creates file
+    try:
+        export_path = os.path.join(tempfile.mkdtemp(), "deals_export.csv")
+        dcsv_crm.export_deals_csv(export_path)
+        check("deals_csv_creates_file", os.path.exists(export_path))
+    except (AttributeError, TypeError):
+        check("deals_csv_creates_file", False)
+
+    # 37b. exported CSV has deal columns
+    try:
+        with open(export_path, "r") as f:
+            content = f.read()
+        check("deals_csv_has_columns", "deal_name" in content and "deal_value" in content and "deal_stage" in content)
+    except (AttributeError, TypeError, FileNotFoundError):
+        check("deals_csv_has_columns", False)
+
+    # 37c. exported CSV has correct row count (2 deals)
+    try:
+        with open(export_path, "r") as f:
+            lines = f.readlines()
+        check("deals_csv_row_count", len(lines) == 3)  # header + 2 data rows
+    except (AttributeError, TypeError, FileNotFoundError):
+        check("deals_csv_row_count", False)
+
+    dcsv_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

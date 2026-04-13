@@ -32,6 +32,9 @@ from pathlib import Path
 
 DEFAULT_DB = os.environ.get("CRM_DB", "crm.db")
 
+# Simple email regex: local@domain.tld — rejects obviously bogus values
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +47,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     source TEXT,
     notes TEXT,
     tags TEXT,
+    archived INTEGER NOT NULL DEFAULT 0,
     last_contacted DATE,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -109,6 +113,12 @@ class CRM:
         self.close()
         return False
 
+    @staticmethod
+    def _validate_email(email):
+        """Validate email format. Raises ValueError if invalid."""
+        if email and not _EMAIL_RE.match(email):
+            raise ValueError(f"Invalid email format: {email}")
+
     def _init_schema(self):
         """Initialize schema, deduplicating existing facts if needed for the unique index."""
         try:
@@ -124,12 +134,19 @@ class CRM:
             )
             self.conn.commit()
             self.conn.executescript(SCHEMA)
+        # Migrate: add archived column if missing (existing DBs)
+        try:
+            self.conn.execute("SELECT archived FROM contacts LIMIT 0")
+        except sqlite3.OperationalError:
+            self.conn.execute("ALTER TABLE contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+            self.conn.commit()
 
     # --- Contacts ---
 
     def add_contact(self, name, email=None, company=None, title=None,
                     deal_size=None, status="prospect", source=None,
                     notes=None, tags=None, warn_duplicate=False):
+        self._validate_email(email)
         if warn_duplicate:
             existing = self.conn.execute(
                 "SELECT * FROM contacts WHERE LOWER(name) = LOWER(?)", (name,)
@@ -172,9 +189,11 @@ class CRM:
         ).fetchone()
         return dict(row) if row else None
 
-    def list_contacts(self, status=None, company=None):
+    def list_contacts(self, status=None, company=None, include_archived=False):
         query = "SELECT * FROM contacts WHERE 1=1"
         params = []
+        if not include_archived:
+            query += " AND archived = 0"
         if status:
             query += " AND status = ?"
             params.append(status)
@@ -325,6 +344,81 @@ class CRM:
         result = self.conn.execute("DELETE FROM activity WHERE id = ?", (activity_id,))
         self.conn.commit()
         return result.rowcount > 0
+
+    def archive_contact(self, identifier):
+        """Soft-delete: hide a contact from list_contacts without destroying data."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+        self.conn.execute(
+            "UPDATE contacts SET archived = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (contact["id"],)
+        )
+        self.conn.commit()
+        return True
+
+    def unarchive_contact(self, identifier):
+        """Restore an archived contact."""
+        # Must search including archived
+        row = self.conn.execute("SELECT * FROM contacts WHERE email = ?", (identifier,)).fetchone()
+        if not row:
+            escaped = self._escape_like(identifier)
+            row = self.conn.execute(
+                "SELECT * FROM contacts WHERE name LIKE ? ESCAPE '\\'", (f"%{escaped}%",)
+            ).fetchone()
+        if not row:
+            return None
+        self.conn.execute(
+            "UPDATE contacts SET archived = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (row["id"],)
+        )
+        self.conn.commit()
+        return True
+
+    def delete_contacts(self, identifiers):
+        """Bulk delete contacts in a single transaction. Returns count deleted."""
+        deleted = 0
+        for identifier in identifiers:
+            contact = self.get_contact(identifier)
+            if not contact:
+                continue
+            self.conn.execute("DELETE FROM activity WHERE contact_id = ?", (contact["id"],))
+            self.conn.execute("DELETE FROM deals WHERE contact_id = ?", (contact["id"],))
+            self.conn.execute("DELETE FROM contacts WHERE id = ?", (contact["id"],))
+            # Cascade delete facts
+            entity_variants = self._contact_entity_keys(contact)
+            placeholders = ",".join("?" * len(entity_variants))
+            self.conn.execute(
+                f"DELETE FROM facts WHERE entity LIKE 'contact:%' AND entity IN ({placeholders})",
+                entity_variants
+            )
+            deleted += 1
+        self.conn.commit()
+        return deleted
+
+    def export_deals_csv(self, path=None):
+        """Export contacts with their deals as a CSV. Each row = one deal."""
+        deals = self.conn.execute(
+            """SELECT c.name, c.email, c.company, c.status as contact_status,
+                      d.name as deal_name, d.value as deal_value, d.stage as deal_stage,
+                      d.notes as deal_notes, d.created_at as deal_created, d.closed_at
+               FROM deals d JOIN contacts c ON d.contact_id = c.id
+               ORDER BY d.updated_at DESC"""
+        ).fetchall()
+        if not deals:
+            return ""
+        rows = [dict(r) for r in deals]
+        output = path or sys.stdout
+        should_close = False
+        if isinstance(output, str):
+            output = open(output, "w", newline="")
+            should_close = True
+        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+        if should_close:
+            output.close()
+        return path or "stdout"
 
     # --- Activity ---
 
@@ -481,20 +575,20 @@ class CRM:
     def pipeline(self):
         rows = self.conn.execute(
             """SELECT status, COUNT(*) as count, GROUP_CONCAT(name, ', ') as names
-               FROM contacts GROUP BY status ORDER BY count DESC"""
+               FROM contacts WHERE archived = 0 GROUP BY status ORDER BY count DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 
     def stats(self):
-        total = self.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        total = self.conn.execute("SELECT COUNT(*) FROM contacts WHERE archived = 0").fetchone()[0]
         by_status = self.conn.execute(
-            "SELECT status, COUNT(*) as n FROM contacts GROUP BY status ORDER BY n DESC"
+            "SELECT status, COUNT(*) as n FROM contacts WHERE archived = 0 GROUP BY status ORDER BY n DESC"
         ).fetchall()
         recent = self.conn.execute(
-            "SELECT COUNT(*) FROM contacts WHERE last_contacted >= date('now', '-7 days')"
+            "SELECT COUNT(*) FROM contacts WHERE archived = 0 AND last_contacted >= date('now', '-7 days')"
         ).fetchone()[0]
         stale = self.conn.execute(
-            "SELECT COUNT(*) FROM contacts WHERE last_contacted < date('now', '-14 days') AND status NOT IN ('active_customer', 'churned', 'lost')"
+            "SELECT COUNT(*) FROM contacts WHERE archived = 0 AND last_contacted < date('now', '-14 days') AND status NOT IN ('active_customer', 'churned', 'lost')"
         ).fetchone()[0]
         return {
             "total_contacts": total,
@@ -4181,6 +4275,17 @@ def main():
     p_del = sub.add_parser("delete", help="Delete a contact")
     p_del.add_argument("identifier")
 
+    p_archive = sub.add_parser("archive", help="Archive a contact (soft-delete)")
+    p_archive.add_argument("identifier")
+
+    p_unarchive = sub.add_parser("unarchive", help="Restore an archived contact")
+    p_unarchive.add_argument("identifier")
+
+    p_archived = sub.add_parser("archived", help="List archived contacts")
+
+    p_export_deals = sub.add_parser("export-deals", help="Export deals as CSV")
+    p_export_deals.add_argument("--output", "-o", help="Output file path")
+
     # log
     p_log = sub.add_parser("log", help="Log activity on a contact")
     p_log.add_argument("identifier")
@@ -4489,6 +4594,31 @@ def main():
             print(f"Deleted: {args.identifier}")
         else:
             print(f"Not found: {args.identifier}")
+
+    elif args.command == "archive":
+        if crm.archive_contact(args.identifier):
+            print(f"Archived: {args.identifier}")
+        else:
+            print(f"Not found: {args.identifier}")
+
+    elif args.command == "unarchive":
+        if crm.unarchive_contact(args.identifier):
+            print(f"Unarchived: {args.identifier}")
+        else:
+            print(f"Not found: {args.identifier}")
+
+    elif args.command == "archived":
+        contacts = crm.list_contacts(include_archived=True)
+        archived = [c for c in contacts if c.get("archived")]
+        if not archived:
+            print("  No archived contacts")
+        else:
+            fmt_table(archived, ["name", "company", "status", "deal_size", "last_contacted"])
+
+    elif args.command == "export-deals":
+        crm.export_deals_csv(args.output)
+        if args.output:
+            print(f"Exported deals to: {args.output}")
 
     elif args.command == "log":
         if crm.log_activity(args.identifier, args.type, args.summary):
