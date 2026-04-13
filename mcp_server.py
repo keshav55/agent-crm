@@ -419,6 +419,79 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_set_reminder",
+        "description": "Schedule a follow-up reminder for a contact",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+                "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)"},
+                "note": {"type": "string", "description": "Reminder note"},
+            },
+            "required": ["identifier", "due_date", "note"],
+        },
+    },
+    {
+        "name": "crm_due_reminders",
+        "description": "Get all reminders due today or overdue",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_future_days": {"type": "integer", "description": "Also show reminders due within N days"},
+            },
+        },
+    },
+    {
+        "name": "crm_set_field",
+        "description": "Set a custom field on a contact (creates or updates)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+                "field_name": {"type": "string", "description": "Field name"},
+                "field_value": {"type": "string", "description": "Field value"},
+            },
+            "required": ["identifier", "field_name", "field_value"],
+        },
+    },
+    {
+        "name": "crm_get_fields",
+        "description": "Get all custom fields for a contact",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "crm_weekly_digest",
+        "description": "Weekly digest: what happened this week, what to do next week",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_source_attribution",
+        "description": "Which lead sources produce the best results — conversion rates by source",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_suggest_merges",
+        "description": "Find duplicate contacts and suggest which to merge, with confidence scores",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_relationship_score",
+        "description": "Comprehensive relationship strength score (0-100) using all data sources",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Contact email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
         "name": "crm_compare_contacts",
         "description": "Side-by-side comparison of two contacts for dedup decisions",
         "inputSchema": {
@@ -616,6 +689,33 @@ def handle_tool_call(name, arguments):
         elif name == "crm_contact_summary":
             result = crm.contact_summary(arguments["identifier"])
             return result if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_set_reminder":
+            rid = crm.set_reminder(arguments["identifier"], arguments["due_date"], arguments["note"])
+            return f"Reminder set (id={rid})" if rid else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_due_reminders":
+            return json.dumps(crm.due_reminders(include_future_days=arguments.get("include_future_days", 0)), default=str, indent=2)
+
+        elif name == "crm_set_field":
+            result = crm.set_field(arguments["identifier"], arguments["field_name"], arguments["field_value"])
+            return f"Set {arguments['field_name']}={arguments['field_value']}" if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_get_fields":
+            return json.dumps(crm.get_fields(arguments["identifier"]), indent=2)
+
+        elif name == "crm_weekly_digest":
+            return json.dumps(crm.weekly_digest(), default=str, indent=2)
+
+        elif name == "crm_source_attribution":
+            return json.dumps(crm.source_attribution(), default=str, indent=2)
+
+        elif name == "crm_suggest_merges":
+            return json.dumps(crm.suggest_merges(), default=str, indent=2)
+
+        elif name == "crm_relationship_score":
+            result = crm.relationship_score(arguments["identifier"])
+            return json.dumps(result, default=str, indent=2) if result else f"Not found: {arguments['identifier']}"
 
         elif name == "crm_compare_contacts":
             result = crm.compare_contacts(arguments["contact_a"], arguments["contact_b"])

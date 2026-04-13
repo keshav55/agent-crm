@@ -5461,6 +5461,30 @@ def main():
 
     sub.add_parser("all-tags", help="List all tags in use")
 
+    # reminders
+    p_remind = sub.add_parser("remind", help="Set a reminder for a contact")
+    p_remind.add_argument("identifier")
+    p_remind.add_argument("date", help="Due date (YYYY-MM-DD or 'tomorrow', '+3d')")
+    p_remind.add_argument("note", help="Reminder note")
+
+    sub.add_parser("reminders", help="Show due and overdue reminders")
+
+    p_remind_done = sub.add_parser("remind-done", help="Complete a reminder")
+    p_remind_done.add_argument("reminder_id", type=int)
+
+    p_snooze = sub.add_parser("snooze", help="Snooze a reminder")
+    p_snooze.add_argument("reminder_id", type=int)
+    p_snooze.add_argument("--days", type=int, default=3)
+
+    # custom fields
+    p_setfield = sub.add_parser("set-field", help="Set a custom field on a contact")
+    p_setfield.add_argument("identifier")
+    p_setfield.add_argument("field_name")
+    p_setfield.add_argument("field_value")
+
+    p_getfields = sub.add_parser("fields", help="Show custom fields for a contact")
+    p_getfields.add_argument("identifier")
+
     # log
     p_log = sub.add_parser("log", help="Log activity on a contact")
     p_log.add_argument("identifier")
@@ -5901,6 +5925,61 @@ def main():
             print("  No tags in use")
         else:
             print(f"  Tags ({len(tags)}): {', '.join(tags)}")
+
+    elif args.command == "remind":
+        # Parse date shortcuts
+        raw_date = args.date
+        if raw_date == "tomorrow":
+            due = (date.today() + timedelta(days=1)).isoformat()
+        elif raw_date.startswith("+") and raw_date.endswith("d"):
+            try:
+                days = int(raw_date[1:-1])
+                due = (date.today() + timedelta(days=days)).isoformat()
+            except ValueError:
+                due = raw_date
+        else:
+            due = raw_date
+        rid = crm.set_reminder(args.identifier, due, args.note)
+        if rid:
+            print(f"  Reminder set for {due}: {args.note} (id={rid})")
+        else:
+            print(f"  Not found: {args.identifier}")
+
+    elif args.command == "reminders":
+        due = crm.due_reminders(include_future_days=7)
+        if not due:
+            print("  No reminders due")
+        else:
+            for r in due:
+                status = "OVERDUE" if r["due_date"] < date.today().isoformat() else r["due_date"]
+                print(f"  [{status}] {r['name']}: {r['note']} (id={r['id']})")
+
+    elif args.command == "remind-done":
+        if crm.complete_reminder(args.reminder_id):
+            print(f"  Completed reminder {args.reminder_id}")
+        else:
+            print(f"  Reminder not found or already completed: {args.reminder_id}")
+
+    elif args.command == "snooze":
+        new_date = crm.snooze_reminder(args.reminder_id, days=args.days)
+        if new_date:
+            print(f"  Snoozed to {new_date}")
+        else:
+            print(f"  Reminder not found: {args.reminder_id}")
+
+    elif args.command == "set-field":
+        if crm.set_field(args.identifier, args.field_name, args.field_value):
+            print(f"  Set {args.field_name} = {args.field_value}")
+        else:
+            print(f"  Not found: {args.identifier}")
+
+    elif args.command == "fields":
+        fields = crm.get_fields(args.identifier)
+        if not fields:
+            print(f"  No custom fields for: {args.identifier}")
+        else:
+            for k, v in fields.items():
+                print(f"  {k}: {v}")
 
     elif args.command == "log":
         if crm.log_activity(args.identifier, args.type, args.summary):
