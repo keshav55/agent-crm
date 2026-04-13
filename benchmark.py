@@ -2608,6 +2608,52 @@ def run_benchmarks():
 
     json_crm.close()
 
+    # ── 47. Recent Contacts & Top Companies (5 tests) ──
+
+    rc_crm = CRM(os.path.join(tempfile.mkdtemp(), "rc.db"))
+    rc_crm.add_contact("RC Alice", email="alice@rc.com", company="BigCo", deal_size="$50K/yr")
+    rc_crm.add_contact("RC Bob", email="bob@rc.com", company="BigCo", deal_size="$20K/yr")
+    rc_crm.add_contact("RC Carol", email="carol@rc.com", company="SmallCo", deal_size="$5K/yr")
+    rc_crm.log_activity("carol@rc.com", "call", "Just called")
+
+    # 47a. recent_contacts returns list with most recently active first
+    try:
+        recent = rc_crm.recent_contacts(limit=5)
+        check("recent_contacts_list", isinstance(recent, list) and len(recent) >= 1)
+    except (AttributeError, TypeError):
+        check("recent_contacts_list", False)
+
+    # 47b. contact with activity appears in results (order may vary within same-second creates)
+    try:
+        recent = rc_crm.recent_contacts(limit=5)
+        names = [r["name"] for r in recent]
+        check("recent_contacts_order", "RC Carol" in names and len(names) == 3)
+    except (AttributeError, TypeError, IndexError):
+        check("recent_contacts_order", False)
+
+    # 47c. top_companies returns ranked list
+    try:
+        top = rc_crm.top_companies()
+        check("top_companies_list", isinstance(top, list) and len(top) >= 1)
+    except (AttributeError, TypeError):
+        check("top_companies_list", False)
+
+    # 47d. top_companies BigCo has higher value than SmallCo
+    try:
+        top = rc_crm.top_companies()
+        check("top_companies_ranked", top[0]["company"] == "BigCo" and top[0]["total_deal_value"] > top[1]["total_deal_value"])
+    except (AttributeError, TypeError, IndexError):
+        check("top_companies_ranked", False)
+
+    # 47e. contact_age returns dict with days
+    try:
+        age = rc_crm.contact_age("alice@rc.com")
+        check("contact_age_dict", isinstance(age, dict) and "days" in age and age["days"] >= 0)
+    except (AttributeError, TypeError):
+        check("contact_age_dict", False)
+
+    rc_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

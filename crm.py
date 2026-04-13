@@ -2131,6 +2131,53 @@ class CRM:
 
         return {"current_streak": current, "longest_streak": longest, "total_active_days": len(dates)}
 
+    def recent_contacts(self, limit=10):
+        """Contacts sorted by most recent interaction (activity or last_contacted), newest first."""
+        rows = self.conn.execute(
+            """SELECT c.*, MAX(a.created_at) as last_activity_at
+               FROM contacts c
+               LEFT JOIN activity a ON a.contact_id = c.id
+               WHERE c.archived = 0
+               GROUP BY c.id
+               ORDER BY COALESCE(MAX(a.created_at), c.last_contacted, c.created_at) DESC, c.id DESC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def top_companies(self, limit=10):
+        """Companies ranked by total deal value across all contacts."""
+        rows = self.conn.execute(
+            """SELECT company, COUNT(*) as contact_count, GROUP_CONCAT(DISTINCT status) as statuses
+               FROM contacts WHERE company IS NOT NULL AND company != '' AND archived = 0
+               GROUP BY LOWER(company) ORDER BY contact_count DESC"""
+        ).fetchall()
+        results = []
+        for r in rows:
+            company = r["company"]
+            contacts = self.contacts_by_company(company)
+            total_value = sum(self._parse_deal_size(c.get("deal_size")) for c in contacts)
+            results.append({
+                "company": company,
+                "contact_count": r["contact_count"],
+                "total_deal_value": round(total_value, 2),
+                "statuses": r["statuses"],
+            })
+        results.sort(key=lambda x: x["total_deal_value"], reverse=True)
+        return results[:limit]
+
+    def contact_age(self, identifier):
+        """How long since a contact was added. Returns dict with days, created_at."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+        try:
+            created = datetime.fromisoformat(contact["created_at"])
+            days = max(0, (datetime.now() - created).days)
+        except (ValueError, TypeError):
+            days = 0
+        return {"days": days, "created_at": contact["created_at"]}
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""
