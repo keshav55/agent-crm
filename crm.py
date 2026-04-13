@@ -2602,6 +2602,129 @@ class CRM:
                 unique.append(s)
         return unique
 
+    def outreach_effectiveness(self):
+        """Which activity types correlate with status advancement?
+
+        Looks at contacts who advanced status and what activities preceded the advance.
+        Returns activity types ranked by correlation with advancement.
+        """
+        # Get all contacts with some activity
+        contacts = self.list_contacts(include_archived=True)
+        advanced_activity_types = {}
+        all_activity_types = {}
+
+        for c in contacts:
+            acts = self.get_activity(c.get("email") or c["name"], limit=50)
+            for a in acts:
+                t = a["type"]
+                all_activity_types[t] = all_activity_types.get(t, 0) + 1
+
+            # Check if contact advanced past prospect
+            if c.get("status") in ("contacted", "met", "proposal_drafted", "verbal_yes", "active_customer"):
+                for a in acts:
+                    t = a["type"]
+                    advanced_activity_types[t] = advanced_activity_types.get(t, 0) + 1
+
+        results = []
+        for t, total in all_activity_types.items():
+            advanced = advanced_activity_types.get(t, 0)
+            rate = round(advanced / total * 100, 1) if total > 0 else 0
+            results.append({
+                "activity_type": t,
+                "total_uses": total,
+                "on_advanced_contacts": advanced,
+                "effectiveness_rate": rate,
+            })
+        results.sort(key=lambda x: x["effectiveness_rate"], reverse=True)
+        return results
+
+    def contact_changelog(self, identifier, limit=20):
+        """Full audit trail for a contact: all changes, activities, facts — chronological."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        changelog = []
+
+        # Creation event
+        changelog.append({
+            "event": "created",
+            "detail": f"Contact created: {contact['name']}",
+            "timestamp": contact["created_at"],
+        })
+
+        # All activities
+        acts = self.get_activity(identifier, limit=limit * 2)
+        for a in acts:
+            changelog.append({
+                "event": "activity",
+                "detail": f"{a['type']}: {a['summary']}",
+                "timestamp": a["created_at"],
+            })
+
+        # All facts
+        entity_keys = self._contact_entity_keys(contact)
+        for ek in entity_keys:
+            history = self.history_of(ek)
+            for h in history:
+                changelog.append({
+                    "event": "fact",
+                    "detail": f"{h['key']} = {h['value']} (via {h['source']})",
+                    "timestamp": h["observed_at"],
+                })
+
+        # Sort chronologically and limit
+        changelog.sort(key=lambda x: x.get("timestamp", ""))
+        return changelog[:limit]
+
+    def pipeline_forecast_detail(self):
+        """Detailed pipeline forecast with expected close dates and risk assessment.
+
+        Combines deal velocity data with pipeline position to estimate when
+        each deal might close and flag risks.
+        """
+        contacts = self.list_contacts()
+        forecast = []
+
+        for c in contacts:
+            if c.get("status") in ("lost", "churned", "active_customer"):
+                continue
+            deal_val = self._parse_deal_size(c.get("deal_size"))
+            if deal_val == 0:
+                continue
+
+            identifier = c.get("email") or c["name"]
+            vel = self.velocity(identifier)
+            status = c.get("status", "prospect")
+            prob = self.STAGE_PROBABILITIES.get(status, 0.1)
+
+            # Risk assessment
+            risk = "low"
+            if vel and vel["trend"] == "decaying":
+                risk = "high"
+            elif vel and vel["trend"] == "dead":
+                risk = "critical"
+            elif vel and vel["trend"] == "stable":
+                risk = "medium"
+
+            # Expected value
+            expected = round(deal_val * prob, 2)
+
+            forecast.append({
+                "name": c["name"],
+                "company": c.get("company"),
+                "deal_size": c.get("deal_size"),
+                "deal_value": deal_val,
+                "stage": status,
+                "probability": prob,
+                "expected_value": expected,
+                "risk": risk,
+                "trend": vel["trend"] if vel else "unknown",
+            })
+
+        forecast.sort(key=lambda x: x["expected_value"], reverse=True)
+        return forecast
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""

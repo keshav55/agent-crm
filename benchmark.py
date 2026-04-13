@@ -2962,6 +2962,106 @@ def run_benchmarks():
 
     lc_crm.close()
 
+    # ── 57. Outreach Effectiveness (3 tests) ──
+
+    oe_crm = CRM(os.path.join(tempfile.mkdtemp(), "oe.db"))
+    oe_crm.add_contact("OE Alice", email="alice@oe.com", status="active_customer")
+    oe_crm.add_contact("OE Bob", email="bob@oe.com", status="prospect")
+    oe_crm.log_activity("alice@oe.com", "meeting", "Demo")
+    oe_crm.log_activity("alice@oe.com", "call", "Close call")
+    oe_crm.log_activity("bob@oe.com", "email", "Cold email")
+
+    # 57a. outreach_effectiveness returns list
+    try:
+        eff = oe_crm.outreach_effectiveness()
+        check("outreach_effectiveness_list", isinstance(eff, list) and len(eff) >= 1)
+    except (AttributeError, TypeError):
+        check("outreach_effectiveness_list", False)
+
+    # 57b. has expected keys
+    try:
+        eff = oe_crm.outreach_effectiveness()
+        has_keys = all(k in eff[0] for k in ("activity_type", "total_uses", "effectiveness_rate"))
+        check("outreach_effectiveness_keys", has_keys)
+    except (AttributeError, TypeError, IndexError):
+        check("outreach_effectiveness_keys", False)
+
+    # 57c. meeting on converted contact has high effectiveness
+    try:
+        eff = oe_crm.outreach_effectiveness()
+        meeting = next((e for e in eff if e["activity_type"] == "meeting"), None)
+        check("outreach_effectiveness_meeting", meeting is not None and meeting["effectiveness_rate"] > 0)
+    except (AttributeError, TypeError):
+        check("outreach_effectiveness_meeting", False)
+
+    oe_crm.close()
+
+    # ── 58. Contact Changelog (3 tests) ──
+
+    cl_crm = CRM(os.path.join(tempfile.mkdtemp(), "cl.db"))
+    cl_crm.add_contact("CL Alice", email="alice@cl.com")
+    cl_crm.log_activity("alice@cl.com", "call", "First call")
+    cl_crm.observe("contact:cl alice", "role", "CTO", source="linkedin")
+
+    # 58a. contact_changelog returns list
+    try:
+        cl = cl_crm.contact_changelog("alice@cl.com")
+        check("contact_changelog_list", isinstance(cl, list) and len(cl) >= 1)
+    except (AttributeError, TypeError):
+        check("contact_changelog_list", False)
+
+    # 58b. changelog entries have expected keys
+    try:
+        cl = cl_crm.contact_changelog("alice@cl.com")
+        has_keys = all(all(k in e for k in ("event", "detail", "timestamp")) for e in cl)
+        check("contact_changelog_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("contact_changelog_keys", False)
+
+    # 58c. changelog not found
+    try:
+        cl = cl_crm.contact_changelog("nobody@void.com")
+        check("contact_changelog_not_found", cl is None)
+    except (AttributeError, TypeError):
+        check("contact_changelog_not_found", False)
+
+    cl_crm.close()
+
+    # ── 59. Pipeline Forecast Detail (3 tests) ──
+
+    pf_crm = CRM(os.path.join(tempfile.mkdtemp(), "pf.db"))
+    pf_crm.add_contact("PF Alice", email="alice@pf.com", status="proposal_drafted", deal_size="$50K/yr")
+    pf_crm.add_contact("PF Bob", email="bob@pf.com", status="prospect", deal_size="$10K/yr")
+    pf_crm.add_contact("PF Won", email="won@pf.com", status="active_customer", deal_size="$20K/yr")  # should be excluded
+
+    # 59a. pipeline_forecast_detail returns list
+    try:
+        fc = pf_crm.pipeline_forecast_detail()
+        check("pipeline_forecast_list", isinstance(fc, list))
+    except (AttributeError, TypeError):
+        check("pipeline_forecast_list", False)
+
+    # 59b. excludes active_customer
+    try:
+        fc = pf_crm.pipeline_forecast_detail()
+        names = [f["name"] for f in fc]
+        check("pipeline_forecast_excludes_won", "PF Won" not in names and "PF Alice" in names)
+    except (AttributeError, TypeError):
+        check("pipeline_forecast_excludes_won", False)
+
+    # 59c. entries have risk and expected_value
+    try:
+        fc = pf_crm.pipeline_forecast_detail()
+        if len(fc) > 0:
+            has_keys = all(k in fc[0] for k in ("risk", "expected_value", "probability"))
+            check("pipeline_forecast_keys", has_keys)
+        else:
+            check("pipeline_forecast_keys", True)
+    except (AttributeError, TypeError):
+        check("pipeline_forecast_keys", False)
+
+    pf_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
