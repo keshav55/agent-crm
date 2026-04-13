@@ -84,8 +84,33 @@ CREATE TABLE IF NOT EXISTS facts (
     observed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER NOT NULL,
+    due_date DATE NOT NULL,
+    note TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY (contact_id) REFERENCES contacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS custom_fields (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER NOT NULL,
+    field_name TEXT NOT NULL,
+    field_value TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (contact_id) REFERENCES contacts(id),
+    UNIQUE(contact_id, field_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_activity_contact ON activity(contact_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_deals_contact ON deals(contact_id);
+CREATE INDEX IF NOT EXISTS idx_reminders_contact ON reminders(contact_id, due_date);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_date, completed);
+CREATE INDEX IF NOT EXISTS idx_custom_fields_contact ON custom_fields(contact_id);
 
 CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(entity, key);
@@ -419,6 +444,165 @@ class CRM:
         if should_close:
             output.close()
         return path or "stdout"
+
+    # --- Reminders ---
+
+    def set_reminder(self, identifier, due_date, note):
+        """Schedule a follow-up reminder for a contact.
+
+        due_date: YYYY-MM-DD string or date object.
+        Returns the reminder id.
+        """
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+        if isinstance(due_date, date):
+            due_date = due_date.isoformat()
+        self.conn.execute(
+            "INSERT INTO reminders (contact_id, due_date, note) VALUES (?, ?, ?)",
+            (contact["id"], due_date, note)
+        )
+        self.conn.commit()
+        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def due_reminders(self, include_future_days=0):
+        """Get all reminders due today or overdue. Optionally include upcoming N days."""
+        cutoff = (date.today() + timedelta(days=include_future_days)).isoformat()
+        rows = self.conn.execute(
+            """SELECT r.*, c.name, c.email, c.company
+               FROM reminders r JOIN contacts c ON r.contact_id = c.id
+               WHERE r.completed = 0 AND r.due_date <= ?
+               ORDER BY r.due_date ASC""",
+            (cutoff,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def complete_reminder(self, reminder_id):
+        """Mark a reminder as completed."""
+        result = self.conn.execute(
+            "UPDATE reminders SET completed = 1, completed_at = CURRENT_TIMESTAMP WHERE id = ? AND completed = 0",
+            (reminder_id,)
+        )
+        self.conn.commit()
+        return result.rowcount > 0
+
+    def reminders_for_contact(self, identifier, include_completed=False):
+        """Get all reminders for a contact."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return []
+        query = "SELECT * FROM reminders WHERE contact_id = ?"
+        if not include_completed:
+            query += " AND completed = 0"
+        query += " ORDER BY due_date ASC"
+        return [dict(r) for r in self.conn.execute(query, (contact["id"],)).fetchall()]
+
+    def snooze_reminder(self, reminder_id, days=3):
+        """Push a reminder forward by N days."""
+        reminder = self.conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        if not reminder:
+            return None
+        try:
+            current_due = date.fromisoformat(reminder["due_date"])
+        except (ValueError, TypeError):
+            current_due = date.today()
+        new_due = (current_due + timedelta(days=days)).isoformat()
+        self.conn.execute("UPDATE reminders SET due_date = ? WHERE id = ?", (new_due, reminder_id))
+        self.conn.commit()
+        return new_due
+
+    # --- Custom Fields ---
+
+    def set_field(self, identifier, field_name, field_value):
+        """Set a custom field on a contact. Creates or updates."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+        self.conn.execute(
+            """INSERT INTO custom_fields (contact_id, field_name, field_value)
+               VALUES (?, ?, ?)
+               ON CONFLICT(contact_id, field_name)
+               DO UPDATE SET field_value = ?, updated_at = CURRENT_TIMESTAMP""",
+            (contact["id"], field_name, field_value, field_value)
+        )
+        self.conn.commit()
+        return True
+
+    def get_field(self, identifier, field_name):
+        """Get a custom field value for a contact."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+        row = self.conn.execute(
+            "SELECT field_value FROM custom_fields WHERE contact_id = ? AND field_name = ?",
+            (contact["id"], field_name)
+        ).fetchone()
+        return row["field_value"] if row else None
+
+    def get_fields(self, identifier):
+        """Get all custom fields for a contact as a dict."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return {}
+        rows = self.conn.execute(
+            "SELECT field_name, field_value FROM custom_fields WHERE contact_id = ? ORDER BY field_name",
+            (contact["id"],)
+        ).fetchall()
+        return {r["field_name"]: r["field_value"] for r in rows}
+
+    def delete_field(self, identifier, field_name):
+        """Delete a custom field from a contact."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return False
+        result = self.conn.execute(
+            "DELETE FROM custom_fields WHERE contact_id = ? AND field_name = ?",
+            (contact["id"], field_name)
+        )
+        self.conn.commit()
+        return result.rowcount > 0
+
+    def contacts_by_field(self, field_name, field_value=None):
+        """Find contacts that have a specific custom field (and optionally a specific value)."""
+        if field_value is not None:
+            rows = self.conn.execute(
+                """SELECT c.* FROM contacts c
+                   JOIN custom_fields cf ON c.id = cf.contact_id
+                   WHERE cf.field_name = ? AND cf.field_value = ? AND c.archived = 0""",
+                (field_name, field_value)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT c.* FROM contacts c
+                   JOIN custom_fields cf ON c.id = cf.contact_id
+                   WHERE cf.field_name = ? AND c.archived = 0""",
+                (field_name,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- View Batch Operations ---
+
+    def view_batch_update(self, view_name, **fields):
+        """Update all contacts in a saved view. Returns count updated."""
+        contacts = self.run_view(view_name)
+        count = 0
+        for c in contacts:
+            identifier = c.get("email") or c["name"]
+            result = self.update_contact(identifier, **fields)
+            if result:
+                count += 1
+        return count
+
+    def view_batch_tag(self, view_name, tag):
+        """Tag all contacts in a saved view. Returns count tagged."""
+        contacts = self.run_view(view_name)
+        count = 0
+        for c in contacts:
+            identifier = c.get("email") or c["name"]
+            result = self.add_tag(identifier, tag)
+            if result:
+                count += 1
+        return count
 
     def export_vcard(self, path=None):
         """Export all contacts as vCard 3.0 (.vcf). Standard format importable everywhere."""

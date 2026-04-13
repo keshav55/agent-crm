@@ -13,6 +13,7 @@ import sys
 import time
 import tempfile
 import traceback
+from datetime import timedelta
 
 # Force a temp DB so we never touch real data
 TEST_DB = os.path.join(tempfile.mkdtemp(), "bench.db")
@@ -3116,6 +3117,174 @@ def run_benchmarks():
         check("deals_summary_value", False)
 
     sq_crm.close()
+
+    # ── 61. Reminders (8 tests) ──
+
+    rem_crm = CRM(os.path.join(tempfile.mkdtemp(), "rem.db"))
+    rem_crm.add_contact("Rem Alice", email="alice@rem.com", company="RemCo")
+    rem_crm.add_contact("Rem Bob", email="bob@rem.com")
+
+    # 61a. set_reminder returns id
+    try:
+        from datetime import date as _date
+        rid = rem_crm.set_reminder("alice@rem.com", _date.today().isoformat(), "Follow up on proposal")
+        check("set_reminder_returns_id", isinstance(rid, int) and rid > 0)
+    except (AttributeError, TypeError):
+        check("set_reminder_returns_id", False)
+
+    # 61b. due_reminders returns today's reminders
+    try:
+        due = rem_crm.due_reminders()
+        check("due_reminders_today", isinstance(due, list) and len(due) >= 1 and "Alice" in due[0]["name"])
+    except (AttributeError, TypeError):
+        check("due_reminders_today", False)
+
+    # 61c. complete_reminder marks as done
+    try:
+        due = rem_crm.due_reminders()
+        rid = due[0]["id"]
+        result = rem_crm.complete_reminder(rid)
+        remaining = rem_crm.due_reminders()
+        check("complete_reminder_works", result is True and len(remaining) == 0)
+    except (AttributeError, TypeError, IndexError):
+        check("complete_reminder_works", False)
+
+    # 61d. reminders_for_contact returns list
+    try:
+        rem_crm.set_reminder("alice@rem.com", _date.today().isoformat(), "Another reminder")
+        rems = rem_crm.reminders_for_contact("alice@rem.com")
+        check("reminders_for_contact", isinstance(rems, list) and len(rems) >= 1)
+    except (AttributeError, TypeError):
+        check("reminders_for_contact", False)
+
+    # 61e. set_reminder not found
+    try:
+        result = rem_crm.set_reminder("nobody@void.com", _date.today().isoformat(), "test")
+        check("set_reminder_not_found", result is None)
+    except (AttributeError, TypeError):
+        check("set_reminder_not_found", False)
+
+    # 61f. snooze_reminder pushes date forward
+    try:
+        rems = rem_crm.reminders_for_contact("alice@rem.com")
+        rid = rems[0]["id"]
+        new_date = rem_crm.snooze_reminder(rid, days=5)
+        check("snooze_reminder", new_date is not None)
+    except (AttributeError, TypeError, IndexError):
+        check("snooze_reminder", False)
+
+    # 61g. snooze not found
+    try:
+        result = rem_crm.snooze_reminder(99999)
+        check("snooze_not_found", result is None)
+    except (AttributeError, TypeError):
+        check("snooze_not_found", False)
+
+    # 61h. due_reminders with future days
+    try:
+        rem_crm.set_reminder("bob@rem.com", (_date.today() + timedelta(days=3)).isoformat(), "Future reminder")
+        due_now = rem_crm.due_reminders(include_future_days=0)
+        due_week = rem_crm.due_reminders(include_future_days=7)
+        check("due_reminders_future", len(due_week) > len(due_now))
+    except (AttributeError, TypeError):
+        check("due_reminders_future", False)
+
+    rem_crm.close()
+
+    # ── 62. Custom Fields (7 tests) ──
+
+    cf_crm = CRM(os.path.join(tempfile.mkdtemp(), "cf.db"))
+    cf_crm.add_contact("CF Alice", email="alice@cf.com", company="CfCo")
+    cf_crm.add_contact("CF Bob", email="bob@cf.com", company="BobCo")
+
+    # 62a. set_field creates a custom field
+    try:
+        result = cf_crm.set_field("alice@cf.com", "industry", "fintech")
+        check("set_field_works", result is True)
+    except (AttributeError, TypeError):
+        check("set_field_works", False)
+
+    # 62b. get_field retrieves value
+    try:
+        val = cf_crm.get_field("alice@cf.com", "industry")
+        check("get_field_value", val == "fintech")
+    except (AttributeError, TypeError):
+        check("get_field_value", False)
+
+    # 62c. set_field updates existing
+    try:
+        cf_crm.set_field("alice@cf.com", "industry", "healthtech")
+        val = cf_crm.get_field("alice@cf.com", "industry")
+        check("set_field_updates", val == "healthtech")
+    except (AttributeError, TypeError):
+        check("set_field_updates", False)
+
+    # 62d. get_fields returns all custom fields
+    try:
+        cf_crm.set_field("alice@cf.com", "budget", "$100K")
+        fields = cf_crm.get_fields("alice@cf.com")
+        check("get_fields_all", isinstance(fields, dict) and "industry" in fields and "budget" in fields)
+    except (AttributeError, TypeError):
+        check("get_fields_all", False)
+
+    # 62e. delete_field removes it
+    try:
+        cf_crm.delete_field("alice@cf.com", "budget")
+        val = cf_crm.get_field("alice@cf.com", "budget")
+        check("delete_field_works", val is None)
+    except (AttributeError, TypeError):
+        check("delete_field_works", False)
+
+    # 62f. contacts_by_field finds matching contacts
+    try:
+        cf_crm.set_field("bob@cf.com", "industry", "healthtech")
+        contacts = cf_crm.contacts_by_field("industry", "healthtech")
+        check("contacts_by_field", len(contacts) == 2)
+    except (AttributeError, TypeError):
+        check("contacts_by_field", False)
+
+    # 62g. contacts_by_field key only (no value filter)
+    try:
+        contacts = cf_crm.contacts_by_field("industry")
+        check("contacts_by_field_key_only", len(contacts) >= 2)
+    except (AttributeError, TypeError):
+        check("contacts_by_field_key_only", False)
+
+    cf_crm.close()
+
+    # ── 63. View Batch Operations (3 tests) ──
+
+    vb_crm = CRM(os.path.join(tempfile.mkdtemp(), "vb.db"))
+    vb_crm.add_contact("VB Alice", email="alice@vb.com", status="prospect")
+    vb_crm.add_contact("VB Bob", email="bob@vb.com", status="prospect")
+    vb_crm.add_contact("VB Carol", email="carol@vb.com", status="contacted")
+    vb_crm.save_view("prospects", status="prospect")
+
+    # 63a. view_batch_tag tags all contacts in view
+    try:
+        count = vb_crm.view_batch_tag("prospects", "outreach-q2")
+        tagged = vb_crm.list_by_tag("outreach-q2")
+        check("view_batch_tag", count == 2 and len(tagged) == 2)
+    except (AttributeError, TypeError):
+        check("view_batch_tag", False)
+
+    # 63b. view_batch_update changes status for all in view
+    try:
+        count = vb_crm.view_batch_update("prospects", status="contacted")
+        contacts = vb_crm.list_contacts(status="contacted")
+        check("view_batch_update", count == 2 and len(contacts) == 3)
+    except (AttributeError, TypeError):
+        check("view_batch_update", False)
+
+    # 63c. batch on empty view returns 0
+    try:
+        vb_crm.save_view("empty_view", status="lost")
+        count = vb_crm.view_batch_tag("empty_view", "test")
+        check("view_batch_empty", count == 0)
+    except (AttributeError, TypeError):
+        check("view_batch_empty", False)
+
+    vb_crm.close()
 
     # Clean up temp files
     try:
