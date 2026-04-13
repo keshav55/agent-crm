@@ -2043,6 +2043,123 @@ class CRM:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def compare_contacts(self, id_a, id_b):
+        """Side-by-side comparison of two contacts. Useful for dedup decisions."""
+        a = self.get_contact(id_a)
+        b = self.get_contact(id_b)
+        if not a or not b:
+            return None
+
+        def _info(c):
+            acts = self.get_activity(c.get("email") or c["name"], limit=50)
+            sc = self.score_contact(c.get("email") or c["name"])
+            deals = self.deals_for_contact(c.get("email") or c["name"])
+            entity_keys = self._contact_entity_keys(c)
+            all_facts = {}
+            for ek in entity_keys:
+                all_facts.update(self.facts_about(ek))
+            return {
+                "name": c["name"], "email": c.get("email"), "company": c.get("company"),
+                "title": c.get("title"), "status": c.get("status"), "deal_size": c.get("deal_size"),
+                "score": sc["score"] if sc else 0,
+                "activity_count": len(acts),
+                "deal_count": len(deals),
+                "fact_count": len(all_facts),
+                "last_contacted": c.get("last_contacted"),
+            }
+
+        info_a = _info(a)
+        info_b = _info(b)
+
+        # Compute overlap
+        overlap = []
+        if a.get("email") and b.get("email") and a["email"].lower() == b["email"].lower():
+            overlap.append("same email")
+        if a.get("company") and b.get("company") and a["company"].lower() == b["company"].lower():
+            overlap.append("same company")
+        a_name = (a.get("name") or "").lower()
+        b_name = (b.get("name") or "").lower()
+        if len(a_name) >= 4 and len(b_name) >= 4 and a_name[:4] == b_name[:4]:
+            overlap.append("similar name")
+
+        return {"contact_a": info_a, "contact_b": info_b, "overlap": overlap}
+
+    def activity_streak(self, identifier):
+        """Calculate current and longest activity streaks (consecutive days with activity)."""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        acts = self.conn.execute(
+            "SELECT DISTINCT date(created_at) as d FROM activity WHERE contact_id = ? ORDER BY d DESC",
+            (contact["id"],)
+        ).fetchall()
+        if not acts:
+            return {"current_streak": 0, "longest_streak": 0, "total_active_days": 0}
+
+        dates = []
+        for a in acts:
+            try:
+                dates.append(date.fromisoformat(a["d"]))
+            except (ValueError, TypeError):
+                pass
+
+        if not dates:
+            return {"current_streak": 0, "longest_streak": 0, "total_active_days": 0}
+
+        dates.sort(reverse=True)
+        today = date.today()
+
+        # Current streak (from today backwards)
+        current = 0
+        for i, d in enumerate(dates):
+            expected = today - timedelta(days=i)
+            if d == expected:
+                current += 1
+            else:
+                break
+
+        # Longest streak
+        longest = 1
+        streak = 1
+        for i in range(1, len(dates)):
+            if (dates[i - 1] - dates[i]).days == 1:
+                streak += 1
+                longest = max(longest, streak)
+            else:
+                streak = 1
+
+        return {"current_streak": current, "longest_streak": longest, "total_active_days": len(dates)}
+
+    def import_json(self, path):
+        """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
+        Returns count imported."""
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("contacts", [])
+        if not isinstance(data, list):
+            return 0
+        count = 0
+        for c in data:
+            if not isinstance(c, dict) or not c.get("name"):
+                continue
+            try:
+                email = c.get("email")
+                self._validate_email(email)
+                self.add_contact(
+                    name=c["name"], email=email, company=c.get("company"),
+                    title=c.get("title"), deal_size=c.get("deal_size"),
+                    status=c.get("status", "prospect"), source=c.get("source"),
+                    notes=c.get("notes"), tags=c.get("tags"),
+                )
+                count += 1
+            except (sqlite3.IntegrityError, ValueError):
+                pass
+        return count
+
     def company_summary(self, company):
         """Roll up all contacts, deals, and activity for a company."""
         contacts = self.contacts_by_company(company)

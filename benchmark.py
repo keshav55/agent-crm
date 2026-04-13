@@ -2504,6 +2504,110 @@ def run_benchmarks():
 
     comp_crm.close()
 
+    # ── 44. Contact Comparison (3 tests) ──
+
+    cmp_crm = CRM(os.path.join(tempfile.mkdtemp(), "cmp.db"))
+    cmp_crm.add_contact("Alice Smith", email="alice@cmp.com", company="TechCo", deal_size="$10K/mo")
+    cmp_crm.add_contact("Alice S.", email="alice2@cmp.com", company="TechCo")
+    cmp_crm.log_activity("alice@cmp.com", "call", "Demo")
+
+    # 44a. compare_contacts returns dict with both contacts
+    try:
+        result = cmp_crm.compare_contacts("alice@cmp.com", "alice2@cmp.com")
+        has_keys = isinstance(result, dict) and all(k in result for k in ("contact_a", "contact_b", "overlap"))
+        check("compare_contacts_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("compare_contacts_keys", False)
+
+    # 44b. compare detects overlap
+    try:
+        result = cmp_crm.compare_contacts("alice@cmp.com", "alice2@cmp.com")
+        check("compare_contacts_overlap", len(result["overlap"]) >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("compare_contacts_overlap", False)
+
+    # 44c. compare not found
+    try:
+        result = cmp_crm.compare_contacts("alice@cmp.com", "nobody@void.com")
+        check("compare_contacts_not_found", result is None)
+    except (AttributeError, TypeError):
+        check("compare_contacts_not_found", False)
+
+    cmp_crm.close()
+
+    # ── 45. Activity Streak (3 tests) ──
+
+    streak_crm = CRM(os.path.join(tempfile.mkdtemp(), "streak.db"))
+    streak_crm.add_contact("Streak Sam", email="sam@streak.com")
+    # Log activity today
+    streak_crm.log_activity("sam@streak.com", "email", "Today's email")
+
+    # 45a. activity_streak returns dict
+    try:
+        s = streak_crm.activity_streak("sam@streak.com")
+        has_keys = isinstance(s, dict) and all(k in s for k in ("current_streak", "longest_streak", "total_active_days"))
+        check("activity_streak_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("activity_streak_keys", False)
+
+    # 45b. streak counts today
+    try:
+        s = streak_crm.activity_streak("sam@streak.com")
+        check("activity_streak_today", s["current_streak"] >= 1 and s["total_active_days"] >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("activity_streak_today", False)
+
+    # 45c. streak not found
+    try:
+        s = streak_crm.activity_streak("nobody@void.com")
+        check("activity_streak_not_found", s is None)
+    except (AttributeError, TypeError):
+        check("activity_streak_not_found", False)
+
+    streak_crm.close()
+
+    # ── 46. JSON Import (3 tests) ──
+
+    json_crm = CRM(os.path.join(tempfile.mkdtemp(), "json_import.db"))
+    json_dir = tempfile.mkdtemp()
+
+    # 46a. import_json from list format
+    try:
+        json_path = os.path.join(json_dir, "contacts.json")
+        import json as _json3
+        with open(json_path, "w") as f:
+            _json3.dump([
+                {"name": "JSON Alice", "email": "alice@json.com", "company": "JsonCo"},
+                {"name": "JSON Bob", "email": "bob@json.com"},
+            ], f)
+        count = json_crm.import_json(json_path)
+        check("import_json_list", count == 2)
+    except (AttributeError, TypeError):
+        check("import_json_list", False)
+
+    # 46b. import_json from dict format
+    try:
+        json_path2 = os.path.join(json_dir, "contacts2.json")
+        with open(json_path2, "w") as f:
+            _json3.dump({"contacts": [
+                {"name": "JSON Carol", "email": "carol@json.com"},
+            ]}, f)
+        json_crm2 = CRM(os.path.join(tempfile.mkdtemp(), "json_import2.db"))
+        count = json_crm2.import_json(json_path2)
+        check("import_json_dict", count == 1)
+        json_crm2.close()
+    except (AttributeError, TypeError):
+        check("import_json_dict", False)
+
+    # 46c. import_json missing file
+    try:
+        count = json_crm.import_json("/nonexistent/path.json")
+        check("import_json_missing", count == 0)
+    except (AttributeError, TypeError):
+        check("import_json_missing", False)
+
+    json_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
