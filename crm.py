@@ -2178,6 +2178,176 @@ class CRM:
             days = 0
         return {"days": days, "created_at": contact["created_at"]}
 
+    def detect_churning(self, decay_days=14):
+        """Find contacts whose engagement is actively decaying — need intervention now.
+
+        Returns contacts with decaying velocity, sorted by deal value (biggest risk first).
+        Unlike stale_contacts, this catches contacts who ARE being contacted but less
+        frequently — the relationship is cooling, not dead.
+        """
+        contacts = self.list_contacts()
+        churning = []
+        for c in contacts:
+            if c.get("status") in ("lost", "churned"):
+                continue
+            identifier = c.get("email") or c["name"]
+            vel = self.velocity(identifier, window_days=decay_days)
+            if not vel:
+                continue
+            if vel["trend"] == "decaying":
+                deal_val = self._parse_deal_size(c.get("deal_size"))
+                churning.append({
+                    "name": c["name"],
+                    "email": c.get("email"),
+                    "company": c.get("company"),
+                    "status": c.get("status"),
+                    "deal_size": c.get("deal_size"),
+                    "deal_value": deal_val,
+                    "velocity": vel["velocity"],
+                    "days_until_cold": vel["days_until_cold"],
+                    "current_activities": vel["current_period"]["activities"],
+                    "previous_activities": vel["previous_period"]["activities"],
+                })
+        churning.sort(key=lambda x: (-x["deal_value"], x.get("days_until_cold") or 999))
+        return churning
+
+    def untouched_contacts(self, days=30):
+        """Contacts with ZERO activity (not just stale last_contacted). Truly forgotten."""
+        contacts = self.list_contacts()
+        untouched = []
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        for c in contacts:
+            if c.get("status") in ("lost", "churned"):
+                continue
+            act_count = self.conn.execute(
+                "SELECT COUNT(*) FROM activity WHERE contact_id = ?",
+                (c["id"],)
+            ).fetchone()[0]
+            if act_count == 0:
+                untouched.append(c)
+        return untouched
+
+    def bulk_tag(self, identifiers, tag):
+        """Tag multiple contacts at once. Returns count tagged."""
+        count = 0
+        for identifier in identifiers:
+            result = self.add_tag(identifier, tag)
+            if result:
+                count += 1
+        return count
+
+    def bulk_untag(self, identifiers, tag):
+        """Remove a tag from multiple contacts at once. Returns count untagged."""
+        count = 0
+        for identifier in identifiers:
+            result = self.remove_tag(identifier, tag)
+            if result:
+                count += 1
+        return count
+
+    def touch_plan(self, identifier, cadence_days=7):
+        """Auto-generate a follow-up schedule based on contact status and deal value.
+
+        Returns a dict with suggested next_touch date, frequency, and channel.
+        """
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        status = contact.get("status", "prospect")
+        deal_val = self._parse_deal_size(c.get("deal_size")) if (c := contact) else 0
+        lc = contact.get("last_contacted")
+        today = date.today()
+
+        # Determine cadence based on status and deal value
+        if status in ("verbal_yes", "proposal_drafted"):
+            freq = 3  # high urgency
+            channel = "call"
+        elif status == "active_customer":
+            freq = 30  # monthly check-in
+            channel = "email"
+        elif deal_val > 50000:
+            freq = 5  # high value = frequent
+            channel = "call"
+        elif deal_val > 10000:
+            freq = 7
+            channel = "email"
+        elif status == "met":
+            freq = 7
+            channel = "email"
+        elif status == "contacted":
+            freq = 10
+            channel = "email"
+        else:
+            freq = cadence_days
+            channel = "email"
+
+        # Calculate next touch
+        if lc:
+            try:
+                last = date.fromisoformat(str(lc)[:10])
+                next_touch = last + timedelta(days=freq)
+                if next_touch < today:
+                    next_touch = today  # overdue
+            except (ValueError, TypeError):
+                next_touch = today
+        else:
+            next_touch = today
+
+        overdue = next_touch <= today
+        days_until = max(0, (next_touch - today).days)
+
+        return {
+            "contact": contact["name"],
+            "status": status,
+            "frequency_days": freq,
+            "channel": channel,
+            "next_touch": next_touch.isoformat(),
+            "overdue": overdue,
+            "days_until_next": days_until,
+        }
+
+    def deal_velocity_report(self):
+        """How fast deals move through stages. Average days per stage transition."""
+        deals = self.conn.execute(
+            "SELECT d.*, c.name as contact_name FROM deals d JOIN contacts c ON d.contact_id = c.id"
+        ).fetchall()
+        if not deals:
+            return {"total_deals": 0, "avg_days_in_pipeline": 0, "by_stage": {}}
+
+        stage_days = {}
+        total_pipeline_days = 0
+        count_with_dates = 0
+
+        for d in deals:
+            try:
+                created = datetime.fromisoformat(d["created_at"])
+                updated = datetime.fromisoformat(d["updated_at"])
+                days = max(0, (updated - created).days)
+                stage = d["stage"]
+                if stage not in stage_days:
+                    stage_days[stage] = []
+                stage_days[stage].append(days)
+                total_pipeline_days += days
+                count_with_dates += 1
+            except (ValueError, TypeError):
+                pass
+
+        avg_by_stage = {}
+        for stage, days_list in stage_days.items():
+            avg_by_stage[stage] = {
+                "count": len(days_list),
+                "avg_days": round(sum(days_list) / len(days_list), 1) if days_list else 0,
+                "min_days": min(days_list) if days_list else 0,
+                "max_days": max(days_list) if days_list else 0,
+            }
+
+        return {
+            "total_deals": len(deals),
+            "avg_days_in_pipeline": round(total_pipeline_days / count_with_dates, 1) if count_with_dates else 0,
+            "by_stage": avg_by_stage,
+        }
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""

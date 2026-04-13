@@ -2654,6 +2654,137 @@ def run_benchmarks():
 
     rc_crm.close()
 
+    # ── 48. Churn Detection (3 tests) ──
+
+    churn_crm = CRM(os.path.join(tempfile.mkdtemp(), "churn.db"))
+    churn_crm.add_contact("Churn Alice", email="alice@churn.com", company="ChurnCo", deal_size="$50K/yr")
+    churn_crm.add_contact("Stable Bob", email="bob@churn.com", company="StableCo")
+    # Alice has activity but it's all recent (no decay)
+    churn_crm.log_activity("alice@churn.com", "call", "Call 1")
+
+    # 48a. detect_churning returns list
+    try:
+        churning = churn_crm.detect_churning()
+        check("detect_churning_list", isinstance(churning, list))
+    except (AttributeError, TypeError):
+        check("detect_churning_list", False)
+
+    # 48b. detect_churning has expected keys when non-empty
+    try:
+        churning = churn_crm.detect_churning()
+        if len(churning) > 0:
+            has_keys = all(k in churning[0] for k in ("name", "velocity", "days_until_cold"))
+            check("detect_churning_keys", has_keys)
+        else:
+            check("detect_churning_keys", True)  # no decaying contacts is valid
+    except (AttributeError, TypeError):
+        check("detect_churning_keys", False)
+
+    # 48c. untouched_contacts finds contacts with zero activity
+    try:
+        untouched = churn_crm.untouched_contacts(days=30)
+        names = [c["name"] for c in untouched]
+        check("untouched_contacts", "Stable Bob" in names)
+    except (AttributeError, TypeError):
+        check("untouched_contacts", False)
+
+    churn_crm.close()
+
+    # ── 49. Bulk Tag (3 tests) ──
+
+    btag_crm = CRM(os.path.join(tempfile.mkdtemp(), "btag.db"))
+    btag_crm.add_contact("BTag A", email="a@btag.com")
+    btag_crm.add_contact("BTag B", email="b@btag.com")
+    btag_crm.add_contact("BTag C", email="c@btag.com")
+
+    # 49a. bulk_tag tags multiple contacts
+    try:
+        count = btag_crm.bulk_tag(["a@btag.com", "b@btag.com", "c@btag.com"], "priority")
+        check("bulk_tag_count", count == 3)
+    except (AttributeError, TypeError):
+        check("bulk_tag_count", False)
+
+    # 49b. bulk_tag applied correctly
+    try:
+        tagged = btag_crm.list_by_tag("priority")
+        check("bulk_tag_applied", len(tagged) == 3)
+    except (AttributeError, TypeError):
+        check("bulk_tag_applied", False)
+
+    # 49c. bulk_untag removes from multiple
+    try:
+        count = btag_crm.bulk_untag(["a@btag.com", "c@btag.com"], "priority")
+        tagged = btag_crm.list_by_tag("priority")
+        check("bulk_untag_works", count == 2 and len(tagged) == 1)
+    except (AttributeError, TypeError):
+        check("bulk_untag_works", False)
+
+    btag_crm.close()
+
+    # ── 50. Touch Plan (3 tests) ──
+
+    plan_crm = CRM(os.path.join(tempfile.mkdtemp(), "plan.db"))
+    plan_crm.add_contact("Plan Alice", email="alice@plan.com", status="proposal_drafted", deal_size="$20K/mo")
+    plan_crm.add_contact("Plan Bob", email="bob@plan.com", status="prospect")
+
+    # 50a. touch_plan returns dict with schedule
+    try:
+        plan = plan_crm.touch_plan("alice@plan.com")
+        has_keys = isinstance(plan, dict) and all(k in plan for k in (
+            "contact", "frequency_days", "channel", "next_touch", "overdue"))
+        check("touch_plan_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("touch_plan_keys", False)
+
+    # 50b. proposal_drafted gets higher frequency
+    try:
+        plan_a = plan_crm.touch_plan("alice@plan.com")
+        plan_b = plan_crm.touch_plan("bob@plan.com")
+        check("touch_plan_urgency", plan_a["frequency_days"] < plan_b["frequency_days"])
+    except (AttributeError, TypeError, KeyError):
+        check("touch_plan_urgency", False)
+
+    # 50c. touch_plan not found
+    try:
+        plan = plan_crm.touch_plan("nobody@void.com")
+        check("touch_plan_not_found", plan is None)
+    except (AttributeError, TypeError):
+        check("touch_plan_not_found", False)
+
+    plan_crm.close()
+
+    # ── 51. Deal Velocity Report (3 tests) ──
+
+    dvel_crm = CRM(os.path.join(tempfile.mkdtemp(), "dvel.db"))
+    dvel_crm.add_contact("DVel Alice", email="alice@dvel.com")
+    dvel_crm.add_deal("alice@dvel.com", "Enterprise", value="$50K", stage="proposal")
+    dvel_crm.add_deal("alice@dvel.com", "Addon", value="$10K", stage="prospect")
+
+    # 51a. deal_velocity_report returns dict
+    try:
+        report = dvel_crm.deal_velocity_report()
+        has_keys = isinstance(report, dict) and all(k in report for k in (
+            "total_deals", "avg_days_in_pipeline", "by_stage"))
+        check("deal_velocity_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("deal_velocity_keys", False)
+
+    # 51b. deal count is correct
+    try:
+        report = dvel_crm.deal_velocity_report()
+        check("deal_velocity_count", report["total_deals"] == 2)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_velocity_count", False)
+
+    # 51c. by_stage has deal stages
+    try:
+        report = dvel_crm.deal_velocity_report()
+        check("deal_velocity_stages", len(report["by_stage"]) >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_velocity_stages", False)
+
+    dvel_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
