@@ -3480,6 +3480,71 @@ def run_benchmarks():
 
     if_crm.close()
 
+    # ── 71. Contact 360 (3 tests) ──
+
+    c360_crm = CRM(os.path.join(tempfile.mkdtemp(), "c360.db"))
+    c360_crm.add_contact("360 Alice", email="alice@360.com", company="Co360", deal_size="$10K/mo")
+    c360_crm.log_activity("alice@360.com", "call", "Demo")
+    c360_crm.set_field("alice@360.com", "industry", "fintech")
+
+    # 71a. contact_360 returns comprehensive dict
+    try:
+        view = c360_crm.contact_360("alice@360.com")
+        has_keys = isinstance(view, dict) and all(k in view for k in (
+            "profile", "relationship_score", "velocity", "streak", "custom_fields"))
+        check("contact_360_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("contact_360_keys", False)
+
+    # 71b. includes custom fields
+    try:
+        view = c360_crm.contact_360("alice@360.com")
+        check("contact_360_custom_fields", "industry" in view["custom_fields"])
+    except (AttributeError, TypeError, KeyError):
+        check("contact_360_custom_fields", False)
+
+    # 71c. not found
+    try:
+        view = c360_crm.contact_360("nobody@void.com")
+        check("contact_360_not_found", view is None)
+    except (AttributeError, TypeError):
+        check("contact_360_not_found", False)
+
+    c360_crm.close()
+
+    # ── 72. Pipeline Health Score (3 tests) ──
+
+    phs_crm = CRM(os.path.join(tempfile.mkdtemp(), "phs.db"))
+    phs_crm.add_contact("PHS Alice", email="alice@phs.com", status="active_customer", deal_size="$10K/mo")
+    phs_crm.add_contact("PHS Bob", email="bob@phs.com", status="prospect")
+    phs_crm.add_contact("PHS Carol", email="carol@phs.com", status="contacted")
+    phs_crm.log_activity("alice@phs.com", "call", "Check-in")
+    phs_crm.add_deal("carol@phs.com", "New Deal", value="$5K", stage="proposal")
+
+    # 72a. pipeline_health_score returns dict
+    try:
+        phs = phs_crm.pipeline_health_score()
+        has_keys = isinstance(phs, dict) and "score" in phs and "factors" in phs
+        check("pipeline_health_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("pipeline_health_keys", False)
+
+    # 72b. score is 0-100
+    try:
+        phs = phs_crm.pipeline_health_score()
+        check("pipeline_health_range", 0 <= phs["score"] <= 100)
+    except (AttributeError, TypeError, KeyError):
+        check("pipeline_health_range", False)
+
+    # 72c. factors list is non-empty
+    try:
+        phs = phs_crm.pipeline_health_score()
+        check("pipeline_health_factors", isinstance(phs["factors"], list) and len(phs["factors"]) >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("pipeline_health_factors", False)
+
+    phs_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

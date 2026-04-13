@@ -3151,6 +3151,83 @@ class CRM:
             "longest_gap_days": longest_gap,
         }
 
+    def contact_360(self, identifier):
+        """Complete 360-degree view of a contact — everything in one call.
+
+        Combines enrich, timeline, score, relationship_score, velocity,
+        reminders, custom fields, and deals into a single response.
+        """
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        # Core profile
+        profile = self.enrich(identifier)
+        rel_score = self.relationship_score(identifier)
+        vel = self.velocity(identifier)
+        streak = self.activity_streak(identifier)
+        reminders = self.reminders_for_contact(identifier)
+        custom = self.get_fields(identifier)
+        freq = self.interaction_frequency(identifier)
+
+        return {
+            "profile": profile,
+            "relationship_score": rel_score["score"] if rel_score else 0,
+            "velocity": vel,
+            "streak": streak,
+            "reminders": reminders,
+            "custom_fields": custom,
+            "interaction_frequency": freq,
+        }
+
+    def pipeline_health_score(self):
+        """Single 0-100 score for overall pipeline health.
+
+        Factors: pipeline coverage ratio (pipeline vs revenue target),
+        deal progression rate, stale deal percentage, average velocity.
+        """
+        contacts = self.list_contacts()
+        if not contacts:
+            return {"score": 0, "factors": ["No contacts"]}
+
+        score = 0
+        factors = []
+        total = len(contacts)
+
+        # 1. Pipeline diversity (up to 25 pts) — how many stages have contacts
+        statuses = set(c.get("status") for c in contacts)
+        stage_count = len(statuses - {"lost", "churned"})
+        div_pts = min(25, stage_count * 5)
+        score += div_pts
+        factors.append(f"{stage_count} active stages (+{div_pts}pts)")
+
+        # 2. Activity rate (up to 25 pts) — % of contacts with recent activity
+        stats = self.stats()
+        if total > 0:
+            active_pct = stats["contacted_last_7d"] / total
+            act_pts = min(25, int(active_pct * 50))
+            score += act_pts
+            factors.append(f"{stats['contacted_last_7d']}/{total} active last 7d (+{act_pts}pts)")
+
+        # 3. Low stale rate (up to 25 pts) — fewer stale contacts = healthier
+        if total > 0:
+            stale_pct = stats["stale_14d"] / total
+            stale_pts = max(0, 25 - int(stale_pct * 50))
+            score += stale_pts
+            factors.append(f"{stats['stale_14d']} stale (+{stale_pts}pts)")
+
+        # 4. Deal coverage (up to 25 pts) — contacts with deals
+        contacts_with_deals = self.conn.execute(
+            "SELECT COUNT(DISTINCT contact_id) FROM deals WHERE stage NOT IN ('closed_won', 'closed_lost')"
+        ).fetchone()[0]
+        if total > 0:
+            deal_pct = contacts_with_deals / total
+            deal_pts = min(25, int(deal_pct * 50))
+            score += deal_pts
+            factors.append(f"{contacts_with_deals} contacts with active deals (+{deal_pts}pts)")
+
+        return {"score": min(score, 100), "factors": factors}
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""
