@@ -2951,6 +2951,110 @@ class CRM:
             })
         return {"total_deals": sum(d["n"] for d in deals), "total_value": round(total_value, 2), "by_stage": stages}
 
+    def period_comparison(self, days=30):
+        """Compare this period vs previous period: new contacts, activities, deals, revenue.
+
+        Returns side-by-side metrics for quick trend spotting.
+        """
+        now = datetime.now()
+        current_start = (now - timedelta(days=days)).isoformat()
+        prev_start = (now - timedelta(days=days * 2)).isoformat()
+
+        # Current period
+        current_contacts = self.conn.execute(
+            "SELECT COUNT(*) FROM contacts WHERE created_at >= ? AND archived = 0", (current_start,)
+        ).fetchone()[0]
+        current_activities = self.conn.execute(
+            "SELECT COUNT(*) FROM activity WHERE created_at >= ?", (current_start,)
+        ).fetchone()[0]
+        current_deals = self.conn.execute(
+            "SELECT COUNT(*) FROM deals WHERE created_at >= ?", (current_start,)
+        ).fetchone()[0]
+
+        # Previous period
+        prev_contacts = self.conn.execute(
+            "SELECT COUNT(*) FROM contacts WHERE created_at >= ? AND created_at < ? AND archived = 0",
+            (prev_start, current_start)
+        ).fetchone()[0]
+        prev_activities = self.conn.execute(
+            "SELECT COUNT(*) FROM activity WHERE created_at >= ? AND created_at < ?",
+            (prev_start, current_start)
+        ).fetchone()[0]
+        prev_deals = self.conn.execute(
+            "SELECT COUNT(*) FROM deals WHERE created_at >= ? AND created_at < ?",
+            (prev_start, current_start)
+        ).fetchone()[0]
+
+        def _change(current, prev):
+            if prev == 0:
+                return "+∞" if current > 0 else "0%"
+            pct = round((current - prev) / prev * 100, 1)
+            return f"+{pct}%" if pct > 0 else f"{pct}%"
+
+        return {
+            "period_days": days,
+            "current_period": {
+                "new_contacts": current_contacts,
+                "activities": current_activities,
+                "new_deals": current_deals,
+            },
+            "previous_period": {
+                "new_contacts": prev_contacts,
+                "activities": prev_activities,
+                "new_deals": prev_deals,
+            },
+            "changes": {
+                "contacts": _change(current_contacts, prev_contacts),
+                "activities": _change(current_activities, prev_activities),
+                "deals": _change(current_deals, prev_deals),
+            },
+        }
+
+    def stale_deals(self, days=30):
+        """Deals that haven't been updated in N days — need attention."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = self.conn.execute(
+            """SELECT d.*, c.name as contact_name, c.email, c.company
+               FROM deals d JOIN contacts c ON d.contact_id = c.id
+               WHERE d.stage NOT IN ('closed_won', 'closed_lost')
+               AND d.updated_at < ?
+               ORDER BY d.updated_at ASC""",
+            (cutoff,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def contacts_needing_email(self):
+        """Contacts with deals but no email — high-value data cleanup targets."""
+        rows = self.conn.execute(
+            """SELECT DISTINCT c.* FROM contacts c
+               JOIN deals d ON c.id = d.contact_id
+               WHERE (c.email IS NULL OR c.email = '') AND c.archived = 0
+               ORDER BY c.name"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def activity_heatmap(self, days=90):
+        """Activity counts by day of week and type. Shows when you're most active."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = self.conn.execute(
+            """SELECT strftime('%w', created_at) as dow, type, COUNT(*) as n
+               FROM activity WHERE created_at >= ?
+               GROUP BY dow, type ORDER BY dow, type""",
+            (cutoff,)
+        ).fetchall()
+        day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        heatmap = {d: {} for d in day_names}
+        for r in rows:
+            try:
+                day = day_names[int(r["dow"])]
+                heatmap[day][r["type"]] = r["n"]
+            except (ValueError, IndexError):
+                pass
+        # Add totals
+        for day in day_names:
+            heatmap[day]["_total"] = sum(heatmap[day].values())
+        return heatmap
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""

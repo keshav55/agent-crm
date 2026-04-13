@@ -3286,6 +3286,108 @@ def run_benchmarks():
 
     vb_crm.close()
 
+    # ── 64. Period Comparison (3 tests) ──
+
+    pc_crm = CRM(os.path.join(tempfile.mkdtemp(), "pc.db"))
+    pc_crm.add_contact("PC Alice", email="alice@pc.com", company="PcCo")
+    pc_crm.log_activity("alice@pc.com", "call", "Demo")
+    pc_crm.add_deal("alice@pc.com", "Deal", value="$10K", stage="proposal")
+
+    # 64a. period_comparison returns dict
+    try:
+        pc = pc_crm.period_comparison(days=30)
+        has_keys = isinstance(pc, dict) and all(k in pc for k in ("current_period", "previous_period", "changes"))
+        check("period_comparison_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("period_comparison_keys", False)
+
+    # 64b. current period has counts
+    try:
+        pc = pc_crm.period_comparison(days=30)
+        cp = pc["current_period"]
+        check("period_comparison_current", cp["new_contacts"] >= 1 and cp["activities"] >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("period_comparison_current", False)
+
+    # 64c. changes are strings
+    try:
+        pc = pc_crm.period_comparison(days=30)
+        check("period_comparison_changes", isinstance(pc["changes"]["contacts"], str))
+    except (AttributeError, TypeError, KeyError):
+        check("period_comparison_changes", False)
+
+    pc_crm.close()
+
+    # ── 65. Stale Deals (2 tests) ──
+
+    sd_crm = CRM(os.path.join(tempfile.mkdtemp(), "sd.db"))
+    sd_crm.add_contact("SD Alice", email="alice@sd.com")
+    sd_crm.add_deal("alice@sd.com", "Fresh Deal", stage="proposal")
+
+    # 65a. stale_deals returns list
+    try:
+        stale = sd_crm.stale_deals(days=0)  # 0 days = everything is stale
+        check("stale_deals_list", isinstance(stale, list))
+    except (AttributeError, TypeError):
+        check("stale_deals_list", False)
+
+    # 65b. stale_deals with long window returns empty for fresh deals
+    try:
+        stale = sd_crm.stale_deals(days=365)
+        check("stale_deals_fresh", len(stale) == 0)
+    except (AttributeError, TypeError):
+        check("stale_deals_fresh", False)
+
+    sd_crm.close()
+
+    # ── 66. Activity Heatmap (2 tests) ──
+
+    hm_crm = CRM(os.path.join(tempfile.mkdtemp(), "hm.db"))
+    hm_crm.add_contact("HM Alice", email="alice@hm.com")
+    hm_crm.log_activity("alice@hm.com", "call", "Monday call")
+    hm_crm.log_activity("alice@hm.com", "email", "Tuesday email")
+
+    # 66a. activity_heatmap returns dict with day names
+    try:
+        hm = hm_crm.activity_heatmap()
+        has_days = isinstance(hm, dict) and "Mon" in hm and "Sun" in hm
+        check("heatmap_days", has_days)
+    except (AttributeError, TypeError):
+        check("heatmap_days", False)
+
+    # 66b. heatmap has totals
+    try:
+        hm = hm_crm.activity_heatmap()
+        has_total = any(hm[d].get("_total", 0) > 0 for d in hm)
+        check("heatmap_totals", has_total)
+    except (AttributeError, TypeError):
+        check("heatmap_totals", False)
+
+    hm_crm.close()
+
+    # ── 67. Contacts Needing Email (2 tests) ──
+
+    cne_crm = CRM(os.path.join(tempfile.mkdtemp(), "cne.db"))
+    cne_crm.add_contact("With Email", email="we@cne.com")
+    cne_crm.add_contact("No Email", company="NoCo")
+    cne_crm.add_deal("No Email", "Important Deal", value="$50K", stage="proposal")
+
+    # 67a. contacts_needing_email finds contacts with deals but no email
+    try:
+        needing = cne_crm.contacts_needing_email()
+        check("contacts_needing_email", len(needing) >= 1 and any(c["name"] == "No Email" for c in needing))
+    except (AttributeError, TypeError):
+        check("contacts_needing_email", False)
+
+    # 67b. contact with email not included
+    try:
+        needing = cne_crm.contacts_needing_email()
+        check("contacts_needing_email_excludes", not any(c["name"] == "With Email" for c in needing))
+    except (AttributeError, TypeError):
+        check("contacts_needing_email_excludes", False)
+
+    cne_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
