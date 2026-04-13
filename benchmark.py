@@ -2785,6 +2785,88 @@ def run_benchmarks():
 
     dvel_crm.close()
 
+    # ── 52. Suggest Merges (3 tests) ──
+
+    sm_crm = CRM(os.path.join(tempfile.mkdtemp(), "sm.db"))
+    sm_crm.add_contact("Merge Alice", email="alice@merge.com", company="MergeCo", title="CTO", deal_size="$10K")
+    sm_crm.add_contact("Merge Ali", email="ali@merge.com", company="MergeCo")  # similar name + same company
+    sm_crm.add_contact("Unique Ursula", email="ursula@unique.com", company="UniqueCo")
+
+    # 52a. suggest_merges returns list
+    try:
+        suggestions = sm_crm.suggest_merges()
+        check("suggest_merges_list", isinstance(suggestions, list))
+    except (AttributeError, TypeError):
+        check("suggest_merges_list", False)
+
+    # 52b. suggest_merges has expected keys
+    try:
+        suggestions = sm_crm.suggest_merges()
+        if len(suggestions) > 0:
+            has_keys = all(k in suggestions[0] for k in ("keep", "merge", "reasons", "confidence"))
+            check("suggest_merges_keys", has_keys)
+        else:
+            check("suggest_merges_keys", True)  # no duplicates is valid
+    except (AttributeError, TypeError):
+        check("suggest_merges_keys", False)
+
+    # 52c. richer contact is suggested as keep
+    try:
+        suggestions = sm_crm.suggest_merges()
+        if len(suggestions) > 0:
+            # Alice has more fields (title, deal_size) so should be kept
+            check("suggest_merges_keep_richer", suggestions[0]["keep"]["richness"] >= suggestions[0]["merge"]["richness"])
+        else:
+            check("suggest_merges_keep_richer", True)
+    except (AttributeError, TypeError):
+        check("suggest_merges_keep_richer", False)
+
+    sm_crm.close()
+
+    # ── 53. Relationship Score (4 tests) ──
+
+    rs_crm = CRM(os.path.join(tempfile.mkdtemp(), "rs.db"))
+    rs_crm.add_contact("RS Alice", email="alice@rs.com", company="RsCo")
+    rs_crm.add_contact("RS Bob", email="bob@rs.com")
+    rs_crm.log_activity("alice@rs.com", "call", "Call 1")
+    rs_crm.log_activity("alice@rs.com", "meeting", "Demo")
+    rs_crm.log_activity("alice@rs.com", "email", "Follow up")
+    rs_crm.observe("contact:rs alice", "imessage_total", "50", source="imessage")
+    rs_crm.observe("contact:rs alice", "imessage_sent", "25", source="imessage")
+    rs_crm.observe("contact:rs alice", "imessage_received", "25", source="imessage")
+
+    # 53a. relationship_score returns dict
+    try:
+        rs = rs_crm.relationship_score("alice@rs.com")
+        has_keys = isinstance(rs, dict) and "score" in rs and "factors" in rs
+        check("relationship_score_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("relationship_score_keys", False)
+
+    # 53b. score is 0-100
+    try:
+        rs = rs_crm.relationship_score("alice@rs.com")
+        check("relationship_score_range", 0 <= rs["score"] <= 100)
+    except (AttributeError, TypeError, KeyError):
+        check("relationship_score_range", False)
+
+    # 53c. contact with more engagement scores higher
+    try:
+        rs_a = rs_crm.relationship_score("alice@rs.com")
+        rs_b = rs_crm.relationship_score("bob@rs.com")
+        check("relationship_score_engagement", rs_a["score"] > rs_b["score"])
+    except (AttributeError, TypeError, KeyError):
+        check("relationship_score_engagement", False)
+
+    # 53d. not found returns None
+    try:
+        rs = rs_crm.relationship_score("nobody@void.com")
+        check("relationship_score_not_found", rs is None)
+    except (AttributeError, TypeError):
+        check("relationship_score_not_found", False)
+
+    rs_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

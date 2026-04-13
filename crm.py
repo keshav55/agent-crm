@@ -2348,6 +2348,150 @@ class CRM:
             "by_stage": avg_by_stage,
         }
 
+    def suggest_merges(self):
+        """Find duplicate contacts and suggest which to merge, with confidence scores.
+
+        Goes beyond find_duplicates by scoring each pair and recommending
+        which contact to keep (the one with more data).
+        """
+        dupes = self.find_duplicates()
+        suggestions = []
+        for d in dupes:
+            a_id = d["contact_a"]["id"]
+            b_id = d["contact_b"]["id"]
+            a = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (a_id,)).fetchone()
+            b = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (b_id,)).fetchone()
+            if not a or not b:
+                continue
+            a, b = dict(a), dict(b)
+
+            # Score which has more data
+            def _richness(c):
+                score = 0
+                for field in ("email", "company", "title", "deal_size", "notes", "tags"):
+                    if c.get(field):
+                        score += 1
+                act_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (c["id"],)
+                ).fetchone()[0]
+                score += min(act_count, 5)
+                return score
+
+            a_score = _richness(a)
+            b_score = _richness(b)
+            keep = a if a_score >= b_score else b
+            merge = b if a_score >= b_score else a
+
+            confidence = len(d["reasons"]) * 30  # 30% per reason
+            confidence = min(confidence, 90)
+
+            suggestions.append({
+                "keep": {"name": keep["name"], "email": keep.get("email"), "richness": max(a_score, b_score)},
+                "merge": {"name": merge["name"], "email": merge.get("email"), "richness": min(a_score, b_score)},
+                "reasons": d["reasons"],
+                "confidence": confidence,
+            })
+
+        suggestions.sort(key=lambda x: x["confidence"], reverse=True)
+        return suggestions
+
+    def relationship_score(self, identifier):
+        """Comprehensive relationship strength score (0-100) using ALL data sources.
+
+        Unlike score_contact (which focuses on pipeline progression),
+        this measures the actual relationship: communication frequency,
+        reciprocity, meeting history, response patterns.
+        """
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        score = 0
+        factors = []
+
+        # 1. iMessage engagement (up to 30 pts)
+        entity_keys = self._contact_entity_keys(contact)
+        imsg_total = 0
+        imsg_sent = 0
+        imsg_received = 0
+        for ek in entity_keys:
+            facts = self.facts_about(ek)
+            if "imessage_total" in facts:
+                try:
+                    t = int(facts["imessage_total"]["value"])
+                    if t > imsg_total:
+                        imsg_total = t
+                        imsg_sent = int(facts.get("imessage_sent", {}).get("value", 0))
+                        imsg_received = int(facts.get("imessage_received", {}).get("value", 0))
+                except (ValueError, TypeError):
+                    pass
+        if imsg_total > 200:
+            pts = 30
+        elif imsg_total > 100:
+            pts = 25
+        elif imsg_total > 50:
+            pts = 20
+        elif imsg_total > 20:
+            pts = 15
+        elif imsg_total > 5:
+            pts = 8
+        elif imsg_total > 0:
+            pts = 3
+        else:
+            pts = 0
+        score += pts
+        if pts > 0:
+            factors.append(f"iMessage: {imsg_total} messages (+{pts}pts)")
+
+        # 2. Reciprocity bonus (up to 15 pts)
+        if imsg_sent > 0 and imsg_received > 0:
+            ratio = min(imsg_sent, imsg_received) / max(imsg_sent, imsg_received)
+            recip_pts = int(ratio * 15)
+            score += recip_pts
+            factors.append(f"Reciprocity: {ratio:.1%} balanced (+{recip_pts}pts)")
+
+        # 3. Activity depth (up to 20 pts)
+        acts = self.get_activity(identifier, limit=50)
+        act_types = set(a["type"] for a in acts)
+        act_pts = min(20, len(acts) * 2 + len(act_types) * 3)
+        score += act_pts
+        factors.append(f"{len(acts)} activities, {len(act_types)} types (+{act_pts}pts)")
+
+        # 4. Meeting history (up to 15 pts)
+        meetings = [a for a in acts if a["type"] == "meeting"]
+        meet_pts = min(15, len(meetings) * 5)
+        score += meet_pts
+        if meetings:
+            factors.append(f"{len(meetings)} meetings (+{meet_pts}pts)")
+
+        # 5. Recency (up to 10 pts)
+        lc = contact.get("last_contacted")
+        if lc:
+            try:
+                days_ago = (date.today() - date.fromisoformat(str(lc)[:10])).days
+                if days_ago <= 3:
+                    rec_pts = 10
+                elif days_ago <= 7:
+                    rec_pts = 8
+                elif days_ago <= 14:
+                    rec_pts = 5
+                elif days_ago <= 30:
+                    rec_pts = 2
+                else:
+                    rec_pts = 0
+                score += rec_pts
+                factors.append(f"Last contact {days_ago}d ago (+{rec_pts}pts)")
+            except (ValueError, TypeError):
+                pass
+
+        # 6. Graph richness (up to 10 pts)
+        total_facts = sum(len(self.facts_about(ek)) for ek in entity_keys)
+        fact_pts = min(10, total_facts)
+        score += fact_pts
+        factors.append(f"{total_facts} graph facts (+{fact_pts}pts)")
+
+        return {"score": min(score, 100), "factors": factors}
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""
