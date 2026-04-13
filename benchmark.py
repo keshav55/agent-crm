@@ -2867,6 +2867,101 @@ def run_benchmarks():
 
     rs_crm.close()
 
+    # ── 54. Weekly Digest (3 tests) ──
+
+    wd_crm = CRM(os.path.join(tempfile.mkdtemp(), "wd.db"))
+    wd_crm.add_contact("Digest Alice", email="alice@wd.com", company="WdCo")
+    wd_crm.log_activity("alice@wd.com", "call", "Weekly call")
+    wd_crm.add_deal("alice@wd.com", "Weekly Deal", value="$10K", stage="proposal")
+
+    # 54a. weekly_digest returns dict
+    try:
+        digest = wd_crm.weekly_digest()
+        has_keys = isinstance(digest, dict) and all(k in digest for k in (
+            "period", "new_contacts", "activities_this_week", "next_week_actions"))
+        check("weekly_digest_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("weekly_digest_keys", False)
+
+    # 54b. digest includes this week's contacts
+    try:
+        digest = wd_crm.weekly_digest()
+        check("weekly_digest_contacts", digest["new_contact_count"] >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("weekly_digest_contacts", False)
+
+    # 54c. digest includes activity count
+    try:
+        digest = wd_crm.weekly_digest()
+        check("weekly_digest_activities", digest["activities_this_week"] >= 1)
+    except (AttributeError, TypeError, KeyError):
+        check("weekly_digest_activities", False)
+
+    wd_crm.close()
+
+    # ── 55. Source Attribution (3 tests) ──
+
+    sa_crm = CRM(os.path.join(tempfile.mkdtemp(), "sa.db"))
+    sa_crm.add_contact("SA Alice", email="alice@sa.com", source="referral", status="active_customer", deal_size="$10K/mo")
+    sa_crm.add_contact("SA Bob", email="bob@sa.com", source="referral", status="prospect")
+    sa_crm.add_contact("SA Carol", email="carol@sa.com", source="cold_email", status="prospect")
+
+    # 55a. source_attribution returns list
+    try:
+        attr = sa_crm.source_attribution()
+        check("source_attribution_list", isinstance(attr, list) and len(attr) >= 1)
+    except (AttributeError, TypeError):
+        check("source_attribution_list", False)
+
+    # 55b. source with conversion has higher rate
+    try:
+        attr = sa_crm.source_attribution()
+        referral = next((a for a in attr if a["source"] == "referral"), None)
+        check("source_attribution_rate", referral is not None and referral["conversion_rate"] > 0)
+    except (AttributeError, TypeError):
+        check("source_attribution_rate", False)
+
+    # 55c. attribution has expected keys
+    try:
+        attr = sa_crm.source_attribution()
+        has_keys = all(k in attr[0] for k in ("source", "total_contacts", "converted", "conversion_rate"))
+        check("source_attribution_keys", has_keys)
+    except (AttributeError, TypeError, IndexError):
+        check("source_attribution_keys", False)
+
+    sa_crm.close()
+
+    # ── 56. Lifecycle Stages (3 tests) ──
+
+    lc_crm = CRM(os.path.join(tempfile.mkdtemp(), "lc.db"))
+    lc_crm.add_contact("LC Alice", email="alice@lc.com", status="prospect")
+    lc_crm.observe("contact:lc alice", "status", "contacted", source="auto")
+    lc_crm.update_contact("alice@lc.com", status="met")
+
+    # 56a. lifecycle_stages returns list
+    try:
+        stages = lc_crm.lifecycle_stages("alice@lc.com")
+        check("lifecycle_stages_list", isinstance(stages, list) and len(stages) >= 1)
+    except (AttributeError, TypeError):
+        check("lifecycle_stages_list", False)
+
+    # 56b. stages have expected keys
+    try:
+        stages = lc_crm.lifecycle_stages("alice@lc.com")
+        has_keys = all("stage" in s and "timestamp" in s for s in stages)
+        check("lifecycle_stages_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("lifecycle_stages_keys", False)
+
+    # 56c. not found returns None
+    try:
+        stages = lc_crm.lifecycle_stages("nobody@void.com")
+        check("lifecycle_stages_not_found", stages is None)
+    except (AttributeError, TypeError):
+        check("lifecycle_stages_not_found", False)
+
+    lc_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

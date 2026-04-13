@@ -2492,6 +2492,116 @@ class CRM:
 
         return {"score": min(score, 100), "factors": factors}
 
+    def weekly_digest(self):
+        """Generate a weekly digest: what happened this week, what to do next week.
+
+        Returns a dict with new_contacts, activities_this_week, deals_progressed,
+        stale_alerts, and recommended_actions for next week.
+        """
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+
+        # New contacts this week
+        new_contacts = self.conn.execute(
+            "SELECT name, company, status FROM contacts WHERE created_at >= ? AND archived = 0 ORDER BY created_at DESC",
+            (week_ago,)
+        ).fetchall()
+
+        # Activities this week
+        activities = self.conn.execute(
+            """SELECT a.type, a.summary, a.created_at, c.name
+               FROM activity a JOIN contacts c ON a.contact_id = c.id
+               WHERE a.created_at >= ? ORDER BY a.created_at DESC""",
+            (week_ago,)
+        ).fetchall()
+
+        # Activity breakdown
+        by_type = {}
+        by_contact = {}
+        for a in activities:
+            t = a["type"]
+            by_type[t] = by_type.get(t, 0) + 1
+            name = a["name"]
+            by_contact[name] = by_contact.get(name, 0) + 1
+
+        # Deals that changed stage this week
+        deals_progressed = self.conn.execute(
+            "SELECT d.name, d.stage, d.value, c.name as contact_name FROM deals d JOIN contacts c ON d.contact_id = c.id WHERE d.updated_at >= ?",
+            (week_ago,)
+        ).fetchall()
+
+        # Next week actions
+        actions = self.next_actions(limit=5)
+
+        return {
+            "period": f"{(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}",
+            "new_contacts": [dict(r) for r in new_contacts],
+            "new_contact_count": len(new_contacts),
+            "activities_this_week": len(activities),
+            "activity_breakdown": by_type,
+            "most_active_contacts": sorted(by_contact.items(), key=lambda x: x[1], reverse=True)[:5],
+            "deals_progressed": [dict(r) for r in deals_progressed],
+            "next_week_actions": actions,
+        }
+
+    def source_attribution(self):
+        """Which lead sources produce the best results? Analyze conversion by source."""
+        all_contacts = self.list_contacts(include_archived=True)
+        by_source = {}
+        for c in all_contacts:
+            src = c.get("source") or "unknown"
+            if src not in by_source:
+                by_source[src] = {"total": 0, "converted": 0, "total_deal_value": 0, "contacts": []}
+            by_source[src]["total"] += 1
+            if c.get("status") in ("active_customer", "verbal_yes"):
+                by_source[src]["converted"] += 1
+            by_source[src]["total_deal_value"] += self._parse_deal_size(c.get("deal_size"))
+            by_source[src]["contacts"].append(c["name"])
+
+        results = []
+        for src, data in by_source.items():
+            conv_rate = round(data["converted"] / data["total"] * 100, 1) if data["total"] else 0
+            results.append({
+                "source": src,
+                "total_contacts": data["total"],
+                "converted": data["converted"],
+                "conversion_rate": conv_rate,
+                "total_deal_value": round(data["total_deal_value"], 2),
+            })
+        results.sort(key=lambda x: x["conversion_rate"], reverse=True)
+        return results
+
+    def lifecycle_stages(self, identifier):
+        """Track a contact's journey through status changes via activity log.
+
+        Returns a list of stage transitions with timestamps.
+        """
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+
+        # Build timeline from activity + current status
+        stages = [{"stage": "created", "timestamp": contact["created_at"]}]
+
+        # Look for status-related activity entries and facts
+        entity_keys = self._contact_entity_keys(contact)
+        for ek in entity_keys:
+            history = self.history_of(ek, key="status")
+            for h in history:
+                stages.append({"stage": h["value"], "timestamp": h["observed_at"]})
+
+        # Current status
+        stages.append({"stage": contact.get("status", "prospect"), "timestamp": contact["updated_at"]})
+
+        # Deduplicate and sort
+        seen = set()
+        unique = []
+        for s in sorted(stages, key=lambda x: x["timestamp"]):
+            key = f"{s['stage']}_{s['timestamp'][:10]}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(s)
+        return unique
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""
