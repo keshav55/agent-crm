@@ -3228,6 +3228,306 @@ class CRM:
 
         return {"score": min(score, 100), "factors": factors}
 
+    # --- Self-Improvement Engine ---
+
+    def evolve(self):
+        """Run one self-improvement cycle. Analyzes CRM data, identifies the
+        biggest opportunity, and proposes a specific experiment.
+
+        Returns dict with analysis, proposal, and tracking info.
+        Stores the experiment in the facts table for persistence.
+        """
+        stats = self.stats()
+        pipeline = self.pipeline()
+        wl = self.win_loss_analysis()
+        hc = self.health_check()
+        eff = self.outreach_effectiveness()
+        attr = self.source_attribution()
+        stale = self.stale_contacts()
+
+        # Identify the biggest bottleneck
+        bottleneck = None
+        proposal = None
+
+        # Check 1: Too many stale contacts
+        stale_pct = stats["stale_14d"] / max(stats["total_contacts"], 1) * 100
+        if stale_pct > 30:
+            bottleneck = "stale_contacts"
+            proposal = {
+                "experiment": "re-engagement-blast",
+                "change": f"{len(stale)} contacts stale (>{stale_pct:.0f}%). Re-engage top 10 by deal value with personalized check-ins.",
+                "measure": "Reply rate > 20% within 7 days",
+                "batch_size": min(10, len(stale)),
+            }
+
+        # Check 2: Low win rate
+        if not bottleneck and wl["win_rate"] < 30 and (len(wl["wins"]) + len(wl["losses"])) >= 3:
+            bottleneck = "low_win_rate"
+            top_source = wl["top_source"] or "unknown"
+            proposal = {
+                "experiment": "source-focus",
+                "change": f"Win rate is {wl['win_rate']:.0f}%. Focus outreach on '{top_source}' source which produces most wins.",
+                "measure": "Win rate > 40% over next 10 deals",
+                "batch_size": 10,
+            }
+
+        # Check 3: No activity diversity
+        if not bottleneck and eff:
+            types_used = len(eff)
+            if types_used < 3:
+                bottleneck = "low_activity_diversity"
+                missing = [t for t in ("call", "meeting", "email") if t not in [e["activity_type"] for e in eff]]
+                proposal = {
+                    "experiment": "channel-mix",
+                    "change": f"Only {types_used} activity types used. Add {', '.join(missing)} to the mix.",
+                    "measure": "Contacts with 3+ activity types advance 50% faster",
+                    "batch_size": 5,
+                }
+
+        # Check 4: Pipeline imbalance (too many prospects, too few advanced)
+        if not bottleneck:
+            status_counts = {p["status"]: p["count"] for p in pipeline}
+            prospect_count = status_counts.get("prospect", 0)
+            advanced = sum(status_counts.get(s, 0) for s in ("met", "proposal_drafted", "verbal_yes"))
+            if prospect_count > 10 and advanced == 0:
+                bottleneck = "pipeline_stuck"
+                proposal = {
+                    "experiment": "pipeline-push",
+                    "change": f"{prospect_count} prospects but 0 advanced. Focus on converting top 5 prospects to 'contacted' this week.",
+                    "measure": "5 prospects advance to contacted within 7 days",
+                    "batch_size": 5,
+                }
+
+        # Default: pipeline is healthy
+        if not bottleneck:
+            bottleneck = "none"
+            proposal = {
+                "experiment": "maintain",
+                "change": "Pipeline looks healthy. Focus on closing existing advanced deals.",
+                "measure": "Close 1 deal this week",
+                "batch_size": 0,
+            }
+
+        # Store experiment in facts table
+        experiment_id = f"experiment:{date.today().isoformat()}_{proposal['experiment']}"
+        self.observe(experiment_id, "bottleneck", bottleneck, source="evolve")
+        self.observe(experiment_id, "proposal", proposal["change"], source="evolve")
+        self.observe(experiment_id, "measure", proposal["measure"], source="evolve")
+        self.observe(experiment_id, "status", "proposed", source="evolve")
+
+        return {
+            "bottleneck": bottleneck,
+            "analysis": {
+                "total_contacts": stats["total_contacts"],
+                "stale_pct": round(stale_pct, 1),
+                "win_rate": wl["win_rate"],
+                "activity_types": len(eff),
+                "health": {
+                    "healthy": len(hc["healthy"]),
+                    "at_risk": len(hc["at_risk"]),
+                    "cold": len(hc["cold"]),
+                },
+            },
+            "proposal": proposal,
+            "experiment_id": experiment_id,
+        }
+
+    def experiments(self, status=None):
+        """List all experiments tracked in the facts table."""
+        rows = self.conn.execute(
+            """SELECT DISTINCT entity FROM facts
+               WHERE entity LIKE 'experiment:%'
+               ORDER BY observed_at DESC"""
+        ).fetchall()
+        results = []
+        for r in rows:
+            entity = r["entity"]
+            facts = self.facts_about(entity)
+            exp = {
+                "id": entity,
+                "bottleneck": facts.get("bottleneck", {}).get("value"),
+                "proposal": facts.get("proposal", {}).get("value"),
+                "measure": facts.get("measure", {}).get("value"),
+                "status": facts.get("status", {}).get("value", "unknown"),
+                "result": facts.get("result", {}).get("value"),
+                "conclusion": facts.get("conclusion", {}).get("value"),
+            }
+            if status and exp["status"] != status:
+                continue
+            results.append(exp)
+        return results
+
+    def win_patterns(self):
+        """Analyze what closed deals have in common: sources, activity types,
+        time to close, activity count. Returns patterns that correlate with winning."""
+        wins = self.conn.execute(
+            "SELECT * FROM contacts WHERE status = 'active_customer'"
+        ).fetchall()
+        if not wins:
+            return {"patterns": [], "win_count": 0}
+
+        sources = {}
+        activity_types = {}
+        avg_activities = 0
+        total_activities = 0
+        companies = {}
+
+        for w in wins:
+            w = dict(w)
+            src = w.get("source") or "unknown"
+            sources[src] = sources.get(src, 0) + 1
+            comp = w.get("company") or "unknown"
+            companies[comp] = companies.get(comp, 0) + 1
+            acts = self.get_activity(w.get("email") or w["name"], limit=100)
+            total_activities += len(acts)
+            for a in acts:
+                t = a["type"]
+                activity_types[t] = activity_types.get(t, 0) + 1
+
+        win_count = len(wins)
+        avg_activities = round(total_activities / win_count, 1) if win_count else 0
+
+        patterns = []
+        # Top source
+        if sources:
+            top_src = max(sources, key=sources.get)
+            patterns.append(f"Top source: {top_src} ({sources[top_src]}/{win_count} wins)")
+        # Activity mix
+        if activity_types:
+            top_type = max(activity_types, key=activity_types.get)
+            patterns.append(f"Most common activity: {top_type} ({activity_types[top_type]} total)")
+        patterns.append(f"Avg activities before close: {avg_activities}")
+
+        return {
+            "win_count": win_count,
+            "avg_activities_to_close": avg_activities,
+            "sources": sources,
+            "activity_types": activity_types,
+            "patterns": patterns,
+        }
+
+    def loss_patterns(self):
+        """Analyze what lost deals have in common."""
+        losses = self.conn.execute(
+            "SELECT * FROM contacts WHERE status IN ('lost', 'churned')"
+        ).fetchall()
+        if not losses:
+            return {"patterns": [], "loss_count": 0}
+
+        sources = {}
+        avg_activities = 0
+        total_activities = 0
+
+        for l in losses:
+            l = dict(l)
+            src = l.get("source") or "unknown"
+            sources[src] = sources.get(src, 0) + 1
+            acts = self.get_activity(l.get("email") or l["name"], limit=100)
+            total_activities += len(acts)
+
+        loss_count = len(losses)
+        avg_activities = round(total_activities / loss_count, 1) if loss_count else 0
+
+        patterns = []
+        if sources:
+            top_src = max(sources, key=sources.get)
+            patterns.append(f"Top loss source: {top_src} ({sources[top_src]}/{loss_count} losses)")
+        patterns.append(f"Avg activities before loss: {avg_activities}")
+        # Compare to wins
+        wl = self.win_loss_analysis()
+        if wl["avg_days_to_close"] > 0:
+            patterns.append(f"Avg days to close (wins): {wl['avg_days_to_close']}")
+
+        return {
+            "loss_count": loss_count,
+            "avg_activities_before_loss": avg_activities,
+            "sources": sources,
+            "patterns": patterns,
+        }
+
+    def dead_pipeline(self, stale_days=60):
+        """Contacts and deals that should probably be marked as lost.
+
+        Finds pipeline contacts with no activity in stale_days AND decaying/dead velocity.
+        """
+        contacts = self.list_contacts()
+        dead = []
+        cutoff = (date.today() - timedelta(days=stale_days)).isoformat()
+
+        for c in contacts:
+            if c.get("status") in ("active_customer", "lost", "churned"):
+                continue
+            lc = c.get("last_contacted")
+            if lc and lc >= cutoff:
+                continue
+            # Check velocity
+            identifier = c.get("email") or c["name"]
+            vel = self.velocity(identifier)
+            if vel and vel["trend"] in ("dead", "decaying"):
+                dead.append({
+                    "name": c["name"],
+                    "email": c.get("email"),
+                    "company": c.get("company"),
+                    "status": c.get("status"),
+                    "deal_size": c.get("deal_size"),
+                    "last_contacted": lc,
+                    "trend": vel["trend"],
+                    "recommendation": "Mark as lost" if vel["trend"] == "dead" else "Last chance re-engage",
+                })
+
+        dead.sort(key=lambda x: self._parse_deal_size(x.get("deal_size")), reverse=True)
+        return dead
+
+    def optimal_cadence(self):
+        """Data-driven follow-up timing from actual conversion data.
+
+        Analyzes time gaps between activities for won vs lost deals
+        to find what cadence correlates with winning.
+        """
+        won_gaps = []
+        lost_gaps = []
+
+        for status, gap_list in [("active_customer", won_gaps), ("lost", lost_gaps)]:
+            contacts = self.conn.execute(
+                "SELECT * FROM contacts WHERE status = ?", (status,)
+            ).fetchall()
+            for c in contacts:
+                acts = self.conn.execute(
+                    "SELECT created_at FROM activity WHERE contact_id = ? ORDER BY created_at",
+                    (c["id"],)
+                ).fetchall()
+                for i in range(1, len(acts)):
+                    try:
+                        t1 = datetime.fromisoformat(acts[i-1]["created_at"])
+                        t2 = datetime.fromisoformat(acts[i]["created_at"])
+                        gap = (t2 - t1).days
+                        if gap > 0:
+                            gap_list.append(gap)
+                    except (ValueError, TypeError):
+                        pass
+
+        result = {
+            "won_deals": {
+                "sample_size": len(won_gaps),
+                "avg_gap_days": round(sum(won_gaps) / len(won_gaps), 1) if won_gaps else 0,
+                "median_gap_days": sorted(won_gaps)[len(won_gaps)//2] if won_gaps else 0,
+            },
+            "lost_deals": {
+                "sample_size": len(lost_gaps),
+                "avg_gap_days": round(sum(lost_gaps) / len(lost_gaps), 1) if lost_gaps else 0,
+                "median_gap_days": sorted(lost_gaps)[len(lost_gaps)//2] if lost_gaps else 0,
+            },
+            "recommendation": "",
+        }
+
+        if won_gaps:
+            avg = result["won_deals"]["avg_gap_days"]
+            result["recommendation"] = f"Follow up every {max(1, int(avg))} days — that's the winning cadence."
+        else:
+            result["recommendation"] = "Not enough data yet. Close more deals to calibrate."
+
+        return result
+
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
         Returns count imported."""

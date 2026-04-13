@@ -3545,6 +3545,96 @@ def run_benchmarks():
 
     phs_crm.close()
 
+    # ── 73. Self-Improvement Engine (5 tests) ──
+
+    evo_crm = CRM(os.path.join(tempfile.mkdtemp(), "evo.db"))
+    evo_crm.add_contact("Evo Alice", email="alice@evo.com", status="prospect")
+    evo_crm.add_contact("Evo Bob", email="bob@evo.com", status="prospect")
+    evo_crm.add_contact("Evo Carol", email="carol@evo.com", status="active_customer", source="referral")
+
+    # 73a. evolve returns dict with proposal
+    try:
+        result = evo_crm.evolve()
+        has_keys = isinstance(result, dict) and all(k in result for k in (
+            "bottleneck", "analysis", "proposal", "experiment_id"))
+        check("evolve_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("evolve_keys", False)
+
+    # 73b. evolve stores experiment in facts
+    try:
+        result = evo_crm.evolve()
+        exp_facts = evo_crm.facts_about(result["experiment_id"])
+        check("evolve_stores_experiment", len(exp_facts) >= 1 and "status" in exp_facts)
+    except (AttributeError, TypeError, KeyError):
+        check("evolve_stores_experiment", False)
+
+    # 73c. experiments lists past experiments
+    try:
+        exps = evo_crm.experiments()
+        check("experiments_list", isinstance(exps, list) and len(exps) >= 1)
+    except (AttributeError, TypeError):
+        check("experiments_list", False)
+
+    # 73d. win_patterns returns analysis
+    try:
+        wp = evo_crm.win_patterns()
+        has_keys = isinstance(wp, dict) and "win_count" in wp and "patterns" in wp
+        check("win_patterns_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("win_patterns_keys", False)
+
+    # 73e. loss_patterns returns analysis
+    try:
+        lp = evo_crm.loss_patterns()
+        has_keys = isinstance(lp, dict) and "loss_count" in lp and "patterns" in lp
+        check("loss_patterns_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("loss_patterns_keys", False)
+
+    evo_crm.close()
+
+    # ── 74. Dead Pipeline & Optimal Cadence (4 tests) ──
+
+    dp_crm = CRM(os.path.join(tempfile.mkdtemp(), "dp.db"))
+    dp_crm.add_contact("DP Active", email="active@dp.com", status="active_customer")
+    dp_crm.add_contact("DP Dead", email="dead@dp.com", status="contacted")
+    dp_crm.add_contact("DP Won", email="won@dp.com", status="active_customer")
+    dp_crm.log_activity("won@dp.com", "call", "Close call")
+    dp_crm.log_activity("won@dp.com", "meeting", "Sign")
+
+    # 74a. dead_pipeline returns list
+    try:
+        dead = dp_crm.dead_pipeline(stale_days=0)
+        check("dead_pipeline_list", isinstance(dead, list))
+    except (AttributeError, TypeError):
+        check("dead_pipeline_list", False)
+
+    # 74b. dead_pipeline excludes active customers
+    try:
+        dead = dp_crm.dead_pipeline(stale_days=0)
+        names = [d["name"] for d in dead]
+        check("dead_pipeline_excludes_won", "DP Active" not in names and "DP Won" not in names)
+    except (AttributeError, TypeError):
+        check("dead_pipeline_excludes_won", False)
+
+    # 74c. optimal_cadence returns dict
+    try:
+        oc = dp_crm.optimal_cadence()
+        has_keys = isinstance(oc, dict) and all(k in oc for k in ("won_deals", "lost_deals", "recommendation"))
+        check("optimal_cadence_keys", has_keys)
+    except (AttributeError, TypeError):
+        check("optimal_cadence_keys", False)
+
+    # 74d. optimal_cadence has recommendation string
+    try:
+        oc = dp_crm.optimal_cadence()
+        check("optimal_cadence_recommendation", isinstance(oc["recommendation"], str) and len(oc["recommendation"]) > 0)
+    except (AttributeError, TypeError, KeyError):
+        check("optimal_cadence_recommendation", False)
+
+    dp_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
