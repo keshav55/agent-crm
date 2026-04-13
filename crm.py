@@ -1913,6 +1913,50 @@ class CRM:
                 results.append(dict(r))
         return results
 
+    def all_tags(self):
+        """Return all unique tags in use across contacts, sorted alphabetically."""
+        rows = self.conn.execute(
+            "SELECT tags FROM contacts WHERE tags IS NOT NULL AND tags != '' AND archived = 0"
+        ).fetchall()
+        tag_set = set()
+        for r in rows:
+            for t in (r["tags"] or "").split(","):
+                t = t.strip()
+                if t:
+                    tag_set.add(t)
+        return sorted(tag_set)
+
+    def rename_tag(self, old_tag, new_tag):
+        """Rename a tag across all contacts. Returns count of contacts updated."""
+        contacts = self.list_by_tag(old_tag)
+        count = 0
+        for c in contacts:
+            self.remove_tag(c.get("email") or c["name"], old_tag)
+            self.add_tag(c.get("email") or c["name"], new_tag)
+            count += 1
+        return count
+
+    def contact_summary(self, identifier):
+        """One-line summary for quick scanning: 'Alice (Acme) — prospect, $5K/mo, score 72, 3 activities'"""
+        contact = self.get_contact(identifier)
+        if not contact:
+            return None
+        parts = [contact["name"]]
+        if contact.get("company"):
+            parts[0] = f"{contact['name']} ({contact['company']})"
+        parts.append(contact.get("status", "prospect"))
+        if contact.get("deal_size"):
+            parts.append(contact["deal_size"])
+        sc = self.score_contact(identifier)
+        if sc:
+            parts.append(f"score {sc['score']}")
+        act_count = self.conn.execute(
+            "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (contact["id"],)
+        ).fetchone()[0]
+        if act_count:
+            parts.append(f"{act_count} activities")
+        return " — ".join(parts)
+
     # --- Pipeline Analytics (Wave 2) ---
 
     def win_loss_analysis(self):

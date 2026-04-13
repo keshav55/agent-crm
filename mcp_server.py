@@ -327,6 +327,39 @@ TOOLS = [
             "required": ["term"],
         },
     },
+    {
+        "name": "crm_archive_contact",
+        "description": "Soft-delete a contact. Hides from lists/stats without destroying data.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "crm_unarchive_contact",
+        "description": "Restore an archived contact",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "Email or name"},
+            },
+            "required": ["identifier"],
+        },
+    },
+    {
+        "name": "crm_delete_contacts",
+        "description": "Bulk delete multiple contacts by email/name in a single transaction",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "identifiers": {"type": "array", "items": {"type": "string"}, "description": "List of emails or names"},
+            },
+            "required": ["identifiers"],
+        },
+    },
 ]
 
 
@@ -477,6 +510,18 @@ def handle_tool_call(name, arguments):
         elif name == "crm_unified_search":
             results = crm.unified_search(arguments["term"])
             return json.dumps(results, default=str, indent=2)
+
+        elif name == "crm_archive_contact":
+            result = crm.archive_contact(arguments["identifier"])
+            return f"Archived {arguments['identifier']}" if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_unarchive_contact":
+            result = crm.unarchive_contact(arguments["identifier"])
+            return f"Unarchived {arguments['identifier']}" if result else f"Not found: {arguments['identifier']}"
+
+        elif name == "crm_delete_contacts":
+            count = crm.delete_contacts(arguments["identifiers"])
+            return f"Deleted {count} contacts"
 
         else:
             return f"Unknown tool: {name}"

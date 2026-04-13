@@ -2264,6 +2264,81 @@ def run_benchmarks():
 
     dcsv_crm.close()
 
+    # ── 38. Tag Management (5 tests) ──
+
+    tag_crm = CRM(os.path.join(tempfile.mkdtemp(), "tag.db"))
+    tag_crm.add_contact("Tag Alice", email="alice@tag.com", tags="enterprise,vip")
+    tag_crm.add_contact("Tag Bob", email="bob@tag.com", tags="startup,saas")
+    tag_crm.add_contact("Tag Carol", email="carol@tag.com", tags="enterprise,saas")
+
+    # 38a. all_tags returns sorted list
+    try:
+        tags = tag_crm.all_tags()
+        check("all_tags_returns_sorted", isinstance(tags, list) and tags == sorted(tags) and len(tags) >= 3)
+    except (AttributeError, TypeError):
+        check("all_tags_returns_sorted", False)
+
+    # 38b. all_tags includes expected tags
+    try:
+        tags = tag_crm.all_tags()
+        check("all_tags_content", "enterprise" in tags and "startup" in tags and "saas" in tags and "vip" in tags)
+    except (AttributeError, TypeError):
+        check("all_tags_content", False)
+
+    # 38c. rename_tag changes across contacts
+    try:
+        count = tag_crm.rename_tag("enterprise", "corporate")
+        tags = tag_crm.all_tags()
+        check("rename_tag_works", count == 2 and "corporate" in tags and "enterprise" not in tags)
+    except (AttributeError, TypeError):
+        check("rename_tag_works", False)
+
+    # 38d. rename_tag returns correct count
+    try:
+        count = tag_crm.rename_tag("nonexistent_tag", "whatever")
+        check("rename_tag_zero_count", count == 0)
+    except (AttributeError, TypeError):
+        check("rename_tag_zero_count", False)
+
+    # 38e. contact_summary returns one-liner string
+    try:
+        summary = tag_crm.contact_summary("alice@tag.com")
+        check("contact_summary_string", isinstance(summary, str) and "Alice" in summary and "score" in summary)
+    except (AttributeError, TypeError):
+        check("contact_summary_string", False)
+
+    tag_crm.close()
+
+    # ── 39. Contact Summary (3 tests) ──
+
+    sum_crm = CRM(os.path.join(tempfile.mkdtemp(), "sum.db"))
+    sum_crm.add_contact("Sum Alice", email="alice@sum.com", company="SumCo", status="active_customer", deal_size="$10K/mo")
+    sum_crm.log_activity("alice@sum.com", "call", "Check-in")
+    sum_crm.log_activity("alice@sum.com", "email", "Follow up")
+
+    # 39a. summary includes company
+    try:
+        s = sum_crm.contact_summary("alice@sum.com")
+        check("summary_has_company", "SumCo" in s)
+    except (AttributeError, TypeError):
+        check("summary_has_company", False)
+
+    # 39b. summary includes deal
+    try:
+        s = sum_crm.contact_summary("alice@sum.com")
+        check("summary_has_deal", "$10K/mo" in s)
+    except (AttributeError, TypeError):
+        check("summary_has_deal", False)
+
+    # 39c. summary returns None for nonexistent
+    try:
+        s = sum_crm.contact_summary("nobody@void.com")
+        check("summary_not_found", s is None)
+    except (AttributeError, TypeError):
+        check("summary_not_found", False)
+
+    sum_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
