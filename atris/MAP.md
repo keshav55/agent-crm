@@ -7,6 +7,10 @@
 | `benchmark.py` | 377 tests. Correctness, edge cases, performance |
 | `mcp_server.py` | 52 tools for any AI agent via MCP |
 
+## Product boundary
+
+`agent-crm` is the reusable/open-source CRM engine. Company-specific instances, customer data, and private relationship records belong in separate repos/databases that use this engine pattern.
+
 ## Schema
 | Table | Purpose |
 |-------|---------|
