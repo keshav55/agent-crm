@@ -146,6 +146,16 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "crm_forecast",
+        "description": "Rank open-pipeline contacts by close probability and weighted value",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum contacts to return"},
+            },
+        },
+    },
+    {
         "name": "crm_stats",
         "description": "Get CRM statistics — total contacts, by status, recent activity",
         "inputSchema": {"type": "object", "properties": {}},
@@ -625,6 +635,9 @@ def handle_tool_call(name, arguments):
 
         elif name == "crm_pipeline":
             return crm.markdown()
+
+        elif name == "crm_forecast":
+            return json.dumps(crm.forecast(limit=arguments.get("limit")), default=str, indent=2)
 
         elif name == "crm_stats":
             return json.dumps(crm.stats(), default=str, indent=2)

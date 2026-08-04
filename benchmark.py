@@ -3635,6 +3635,198 @@ def run_benchmarks():
 
     dp_crm.close()
 
+    # ── 75. Deal Close Probability (15 tests) ──
+
+    prob_dir = tempfile.mkdtemp()
+    prob_db = os.path.join(prob_dir, "probability.db")
+    prob_crm = CRM(prob_db)
+
+    # Closed history calibrates both the overall win rate and source quality.
+    prob_crm.add_contact("Won Referral One", email="won1@prob.com", status="active_customer",
+                         source="referral", deal_size="$20K/yr")
+    prob_crm.add_contact("Won Referral Two", email="won2@prob.com", status="active_customer",
+                         source="referral", deal_size="$30K/yr")
+    prob_crm.add_contact("Lost Outbound One", email="lost1@prob.com", status="lost",
+                         source="outbound", deal_size="$10K/yr")
+    prob_crm.add_contact("Lost Outbound Two", email="lost2@prob.com", status="churned",
+                         source="outbound", deal_size="$10K/yr")
+    won_id = prob_crm.get_contact("won1@prob.com")["id"]
+    prob_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'call', 'First touch', datetime('now', '-14 days'))",
+        (won_id,)
+    )
+    prob_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'call', 'Second touch', datetime('now', '-7 days'))",
+        (won_id,)
+    )
+
+    prob_crm.add_contact("Early Stage", email="early@prob.com", status="prospect",
+                         source="referral", deal_size="$10K/yr")
+    prob_crm.add_contact("Late Stage", email="late@prob.com", status="verbal_yes",
+                         source="referral", deal_size="$20K/yr")
+    prob_crm.add_contact("Recent Contact", email="recent@prob.com", status="contacted",
+                         source="referral", deal_size="$12K/yr")
+    prob_crm.add_contact("Stale Contact", email="stale@prob.com", status="contacted",
+                         source="referral", deal_size="$12K/yr")
+    prob_crm.add_contact("Frequent Contact", email="frequent@prob.com", status="contacted",
+                         source="referral", deal_size="$15K/yr")
+    prob_crm.add_contact("Sparse Contact", email="sparse@prob.com", status="contacted",
+                         source="referral", deal_size="$15K/yr")
+    prob_crm.add_contact("Good Source", email="good@prob.com", status="met",
+                         source="referral", deal_size="$8K/yr")
+    prob_crm.add_contact("Bad Source", email="bad@prob.com", status="met",
+                         source="outbound", deal_size="$8K/yr")
+
+    for email, days in (("recent@prob.com", 1), ("stale@prob.com", 90),
+                        ("sparse@prob.com", 1)):
+        contact_id = prob_crm.get_contact(email)["id"]
+        prob_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'email', 'Pipeline touch', datetime('now', ?))",
+            (contact_id, f"-{days} days")
+        )
+    frequent_id = prob_crm.get_contact("frequent@prob.com")["id"]
+    for days in (1, 4, 7, 10):
+        prob_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'email', 'Pipeline touch', datetime('now', ?))",
+            (frequent_id, f"-{days} days")
+        )
+    prob_crm.conn.commit()
+
+    # 75a. deal_probability returns the documented top-level shape
+    try:
+        probability = prob_crm.deal_probability("early@prob.com")
+        check("deal_probability_keys", isinstance(probability, dict) and
+              set(probability) == {"probability", "signals", "contact", "status"})
+    except (AttributeError, TypeError):
+        check("deal_probability_keys", False)
+
+    # 75b. probability is always bounded to [0, 1]
+    try:
+        probabilities = [prob_crm.deal_probability(email)["probability"] for email in
+                         ("early@prob.com", "late@prob.com", "recent@prob.com", "stale@prob.com")]
+        check("deal_probability_range", all(0.0 <= value <= 1.0 for value in probabilities))
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_range", False)
+
+    # 75c. signals expose name, raw value, weight, and numerical effect
+    try:
+        signals = prob_crm.deal_probability("early@prob.com")["signals"]
+        names = {signal["name"] for signal in signals}
+        expected = {"stage", "activity_recency", "activity_frequency", "source", "historical_win_rate"}
+        shape_ok = all(set(signal) == {"name", "value", "weight", "effect"} for signal in signals)
+        check("deal_probability_signal_shape", shape_ok and names == expected)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_signal_shape", False)
+
+    # 75d. a deeper pipeline stage raises probability with other signals equal
+    try:
+        early = prob_crm.deal_probability("early@prob.com")["probability"]
+        late = prob_crm.deal_probability("late@prob.com")["probability"]
+        check("deal_probability_stage_depth", late > early)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_stage_depth", False)
+
+    # 75e. recent activity beats otherwise-identical stale activity
+    try:
+        recent = prob_crm.deal_probability("recent@prob.com")["probability"]
+        stale = prob_crm.deal_probability("stale@prob.com")["probability"]
+        check("deal_probability_recency", recent > stale)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_recency", False)
+
+    # 75f. activity frequency is compared with the learned winning cadence
+    try:
+        frequent = prob_crm.deal_probability("frequent@prob.com")["probability"]
+        sparse = prob_crm.deal_probability("sparse@prob.com")["probability"]
+        check("deal_probability_frequency", frequent > sparse)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_frequency", False)
+
+    # 75g. a historically winning source beats a historically losing source
+    try:
+        good_source = prob_crm.deal_probability("good@prob.com")["probability"]
+        bad_source = prob_crm.deal_probability("bad@prob.com")["probability"]
+        check("deal_probability_source_history", good_source > bad_source)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_source_history", False)
+
+    # 75h. repeated calls over unchanged data are deterministic
+    try:
+        first = prob_crm.deal_probability("frequent@prob.com")
+        second = prob_crm.deal_probability("frequent@prob.com")
+        check("deal_probability_deterministic", first == second)
+    except (AttributeError, TypeError):
+        check("deal_probability_deterministic", False)
+
+    # 75i. an unknown contact returns None
+    try:
+        check("deal_probability_unknown", prob_crm.deal_probability("missing@prob.com") is None)
+    except (AttributeError, TypeError):
+        check("deal_probability_unknown", False)
+
+    # 75j. an empty CRM has a zero-valued empty forecast
+    try:
+        empty_crm = CRM(os.path.join(tempfile.mkdtemp(), "empty-forecast.db"))
+        empty_forecast = empty_crm.forecast()
+        empty_crm.close()
+        check("forecast_empty_crm", empty_forecast["contacts"] == [] and
+              empty_forecast["weighted_pipeline"] == 0 and empty_forecast["count"] == 0)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_empty_crm", False)
+
+    # 75k. forecast contains open contacts and excludes won/lost contacts
+    try:
+        probability_forecast = prob_crm.forecast()
+        names = [row["name"] for row in probability_forecast["contacts"]]
+        check("forecast_open_only", "Early Stage" in names and "Won Referral One" not in names and
+              "Lost Outbound One" not in names)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_open_only", False)
+
+    # 75l. forecast ranks contacts by probability descending
+    try:
+        values = [row["probability"] for row in prob_crm.forecast()["contacts"]]
+        check("forecast_probability_order", values == sorted(values, reverse=True))
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_probability_order", False)
+
+    # 75m. row and aggregate weighted values use deal value * probability
+    try:
+        probability_forecast = prob_crm.forecast()
+        rows = probability_forecast["contacts"]
+        rows_correct = all(row["weighted_value"] == round(row["deal_value"] * row["probability"], 2)
+                           for row in rows)
+        total_correct = probability_forecast["weighted_pipeline"] == round(
+            sum(row["weighted_value"] for row in rows), 2
+        )
+        check("forecast_weighted_value_math", rows_correct and total_correct)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_weighted_value_math", False)
+
+    # 75n. forecast limit truncates rows without changing their rank
+    try:
+        full_forecast = prob_crm.forecast()
+        limited_forecast = prob_crm.forecast(limit=2)
+        check("forecast_limit", len(limited_forecast["contacts"]) == 2 and
+              limited_forecast["contacts"] == full_forecast["contacts"][:2])
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_limit", False)
+
+    # 75o. MCP registers and serves the forecast tool
+    try:
+        import mcp_server
+        original_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = prob_db
+        mcp_names = {tool["name"] for tool in mcp_server.TOOLS}
+        mcp_output = mcp_server.handle_tool_call("crm_forecast", {"limit": 1})
+        mcp_server.DB_PATH = original_mcp_db
+        check("forecast_mcp_tool", "crm_forecast" in mcp_names and
+              '"weighted_pipeline"' in mcp_output and '"contacts"' in mcp_output)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_mcp_tool", False)
+
+    prob_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

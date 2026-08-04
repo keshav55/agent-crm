@@ -1454,7 +1454,18 @@ class CRM:
 
     STATUS_ORDER = ["prospect", "contacted", "met", "proposal_drafted", "verbal_yes", "active_customer"]
     STATUS_SCORES = {"prospect": 0, "contacted": 5, "met": 8, "proposal_drafted": 12, "verbal_yes": 16, "active_customer": 20}
-    STAGE_PROBABILITIES = {"prospect": 0.10, "contacted": 0.20, "met": 0.30, "proposal_drafted": 0.50, "verbal_yes": 0.75, "active_customer": 1.0}
+    STAGE_PROBABILITIES = {
+        "prospect": 0.10,
+        "contacted": 0.20,
+        "qualification": 0.25,
+        "met": 0.30,
+        "proposal": 0.45,
+        "proposal_drafted": 0.50,
+        "negotiating": 0.65,
+        "negotiation": 0.65,
+        "verbal_yes": 0.75,
+        "active_customer": 1.0,
+    }
 
     @staticmethod
     def _escape_like(s):
@@ -1719,41 +1730,174 @@ class CRM:
             }
         return funnel
 
-    def forecast(self):
-        """Weighted pipeline forecast based on stage probabilities and deal sizes.
+    def _deal_probability_for_contact(self, contact, cadence, history, activity_rows=None):
+        """Score one open contact using precomputed CRM-wide patterns."""
+        status = contact.get("status") or "prospect"
+        stage_score = self.STAGE_PROBABILITIES.get(status, 0.10)
 
-        ``weighted_pipeline`` only includes deals still in the pipeline
-        (stages before ``active_customer``).  Already-closed revenue is
-        reported separately as ``closed_revenue`` so callers get the full
-        picture without double-counting with ``revenue_report()``.
-        """
-        by_stage = []
-        weighted_total = 0
-        closed_revenue = 0
-
-        for status in self.STATUS_ORDER:
-            rows = self.conn.execute(
-                "SELECT deal_size FROM contacts WHERE status = ?", (status,)
+        if activity_rows is None:
+            activity_rows = self.conn.execute(
+                "SELECT created_at FROM activity WHERE contact_id = ? ORDER BY created_at DESC",
+                (contact["id"],)
             ).fetchall()
-            prob = self.STAGE_PROBABILITIES.get(status, 0)
-            count = len(rows)
-            total_value = sum(self._parse_deal_size(r["deal_size"]) for r in rows)
-            weighted = total_value * prob
+        activity_dates = []
+        for row in activity_rows:
+            try:
+                activity_dates.append(datetime.fromisoformat(row["created_at"]).date())
+            except (ValueError, TypeError):
+                pass
+
+        latest_activity = activity_dates[0] if activity_dates else None
+        if latest_activity is None and contact.get("last_contacted"):
+            try:
+                latest_activity = date.fromisoformat(str(contact["last_contacted"])[:10])
+            except (ValueError, TypeError):
+                pass
+
+        winning_cadence = cadence.get("won_deals", {})
+        cadence_days = (winning_cadence.get("avg_gap_days")
+                        or winning_cadence.get("median_gap_days") or 7)
+        try:
+            cadence_days = max(float(cadence_days), 1.0)
+        except (ValueError, TypeError):
+            cadence_days = 7.0
+
+        days_since_activity = None
+        recency_score = 0.0
+        if latest_activity:
+            days_since_activity = max((date.today() - latest_activity).days, 0)
+            if days_since_activity <= cadence_days:
+                recency_score = 1.0
+            elif days_since_activity <= cadence_days * 2:
+                recency_score = 0.65
+            elif days_since_activity <= cadence_days * 4:
+                recency_score = 0.30
+
+        frequency_window = max(30, int(round(cadence_days * 4)))
+        activity_cutoff = date.today() - timedelta(days=frequency_window)
+        recent_activity_count = sum(1 for activity_date in activity_dates
+                                    if activity_date >= activity_cutoff)
+        expected_touches = max(frequency_window / cadence_days, 1.0)
+        frequency_score = min(recent_activity_count / expected_touches, 1.0)
+
+        wins = history.get("wins", [])
+        losses = history.get("losses", [])
+        total_closed = len(wins) + len(losses)
+        historical_score = len(wins) / total_closed if total_closed else 0.5
+
+        source = contact.get("source") or "unknown"
+        source_wins = sum(1 for win in wins if (win.get("source") or "unknown") == source)
+        source_losses = sum(1 for loss in losses if (loss.get("source") or "unknown") == source)
+        source_sample = source_wins + source_losses
+        source_score = ((source_wins + 1) / (source_sample + 2)
+                        if source_sample else historical_score)
+
+        signal_values = [
+            ("stage", status, 0.45, stage_score),
+            ("activity_recency", days_since_activity, 0.20, recency_score),
+            ("activity_frequency", recent_activity_count, 0.15, frequency_score),
+            ("source", source, 0.10, source_score),
+            ("historical_win_rate", round(historical_score, 4), 0.10, historical_score),
+        ]
+        signals = [{
+            "name": name,
+            "value": value,
+            "weight": weight,
+            "effect": round(weight * score, 4),
+        } for name, value, weight, score in signal_values]
+        probability = round(min(max(sum(s["effect"] for s in signals), 0.0), 1.0), 4)
+
+        return {
+            "probability": probability,
+            "signals": signals,
+            "contact": contact,
+            "status": status,
+        }
+
+    def deal_probability(self, identifier):
+        """Estimate the likelihood that a contact's open deal will close."""
+        contact = self.get_contact(identifier)
+        if (not contact or contact.get("archived")
+                or contact.get("status") in ("active_customer", "lost", "churned")):
+            return None
+        return self._deal_probability_for_contact(
+            contact, self.optimal_cadence(), self.win_loss_analysis()
+        )
+
+    def forecast(self, limit=None):
+        """Rank open-pipeline contacts by close probability.
+
+        The aggregate keys from the original stage forecast remain available
+        for callers that use ``weighted_pipeline`` and ``by_stage``.
+        """
+        contacts = self.list_contacts()
+        cadence = self.optimal_cadence()
+        history = self.win_loss_analysis()
+        activity_by_contact = {}
+        for row in self.conn.execute(
+            "SELECT contact_id, created_at FROM activity ORDER BY contact_id, created_at DESC"
+        ).fetchall():
+            activity_by_contact.setdefault(row["contact_id"], []).append(row)
+        ranked = []
+
+        for contact in contacts:
+            if contact.get("status") in ("active_customer", "lost", "churned"):
+                continue
+            scored = self._deal_probability_for_contact(
+                contact, cadence, history, activity_by_contact.get(contact["id"], [])
+            )
+            deal_value = self._parse_deal_size(contact.get("deal_size"))
+            ranked.append({
+                "name": contact["name"],
+                "email": contact.get("email"),
+                "company": contact.get("company"),
+                "status": scored["status"],
+                "deal_size": contact.get("deal_size"),
+                "deal_value": deal_value,
+                "probability": scored["probability"],
+                "weighted_value": round(deal_value * scored["probability"], 2),
+                "signals": scored["signals"],
+                "contact": contact,
+            })
+
+        ranked.sort(key=lambda row: (-row["probability"], -row["deal_value"], row["name"].lower()))
+        weighted_total = round(sum(row["weighted_value"] for row in ranked), 2)
+        closed_revenue = round(sum(
+            self._parse_deal_size(contact.get("deal_size"))
+            for contact in contacts if contact.get("status") == "active_customer"
+        ), 2)
+
+        stages = list(self.STATUS_ORDER)
+        stages.extend(sorted({row["status"] for row in ranked if row["status"] not in stages}))
+        by_stage = []
+        for status in stages:
+            stage_contacts = [contact for contact in contacts if contact.get("status") == status]
+            stage_rows = [row for row in ranked if row["status"] == status]
+            total_value = sum(self._parse_deal_size(contact.get("deal_size"))
+                              for contact in stage_contacts)
             if status == "active_customer":
-                closed_revenue += total_value
+                weighted = total_value
+                probability = 1.0
             else:
-                weighted_total += weighted
+                weighted = sum(row["weighted_value"] for row in stage_rows)
+                probability = weighted / total_value if total_value else self.STAGE_PROBABILITIES.get(status, 0)
             by_stage.append({
                 "stage": status,
-                "count": count,
+                "count": len(stage_contacts),
                 "total_value": round(total_value, 2),
-                "probability": prob,
+                "probability": round(probability, 4),
                 "weighted_value": round(weighted, 2),
             })
 
+        visible = ranked
+        if limit is not None:
+            visible = ranked[:max(limit, 0)]
+
         return {
-            "weighted_pipeline": round(weighted_total, 2),
-            "closed_revenue": round(closed_revenue, 2),
+            "contacts": visible,
+            "count": len(ranked),
+            "weighted_pipeline": weighted_total,
+            "closed_revenue": closed_revenue,
             "by_stage": by_stage,
         }
 
@@ -6166,7 +6310,8 @@ def main():
 
     sub.add_parser("funnel", help="Conversion funnel analysis")
 
-    sub.add_parser("forecast", help="Weighted pipeline forecast")
+    p_forecast = sub.add_parser("forecast", help="Rank open deals by close probability")
+    p_forecast.add_argument("--limit", "-n", type=int, help="Maximum contacts to show")
 
     sub.add_parser("duplicates", help="Find potential duplicate contacts")
 
@@ -6862,12 +7007,20 @@ def main():
                 print(f"  {stage:<20} {f['count']:>6} {f['avg_days']:>9} {f['conversion_rate']:>6.1f}%")
 
     elif args.command == "forecast":
-        fc = crm.forecast()
-        print(f"  Weighted Pipeline: ${fc['weighted_pipeline']:,.0f}\n")
-        print(f"  {'Stage':<20} {'Count':>6} {'Total Value':>12} {'Prob':>6} {'Weighted':>12}")
-        print(f"  {'-'*20} {'-'*6} {'-'*12} {'-'*6} {'-'*12}")
-        for s in fc["by_stage"]:
-            print(f"  {s['stage']:<20} {s['count']:>6} ${s['total_value']:>10,.0f} {s['probability']:>5.0%} ${s['weighted_value']:>10,.0f}")
+        fc = crm.forecast(limit=args.limit)
+        rows = [{
+            "name": row["name"],
+            "company": row.get("company") or "-",
+            "status": row["status"],
+            "probability": f"{row['probability']:.1%}",
+            "deal_value": f"${row['deal_value']:,.0f}",
+            "weighted_value": f"${row['weighted_value']:,.0f}",
+        } for row in fc["contacts"]]
+        if not rows:
+            print("  No open pipeline contacts")
+        else:
+            fmt_table(rows, ["name", "company", "status", "probability", "deal_value", "weighted_value"])
+        print(f"\n  Weighted Pipeline: ${fc['weighted_pipeline']:,.0f}")
 
     elif args.command == "duplicates":
         dupes = crm.find_duplicates()
