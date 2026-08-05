@@ -9,11 +9,12 @@ Each test = 1 point. Bonus points for performance thresholds.
 """
 
 import os
+import sqlite3
 import sys
 import time
 import tempfile
 import traceback
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 # Force a temp DB so we never touch real data
 TEST_DB = os.path.join(tempfile.mkdtemp(), "bench.db")
@@ -33,6 +34,139 @@ def check(name, condition):
     else:
         FAIL += 1
         ERRORS.append(name)
+
+
+def make_imessage_fixture_db(handle_counts=()):
+    """Create a minimal chat.db fixture from (handle, sent, received) tuples."""
+    db_path = os.path.join(tempfile.mkdtemp(), "chat.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE handle (
+            ROWID INTEGER PRIMARY KEY,
+            id TEXT
+        );
+        CREATE TABLE message (
+            ROWID INTEGER PRIMARY KEY,
+            handle_id INTEGER,
+            is_from_me INTEGER,
+            date INTEGER
+        );
+        CREATE TABLE chat (
+            ROWID INTEGER PRIMARY KEY
+        );
+    """)
+    apple_now = int((datetime.now().timestamp() - 978307200) * 1_000_000_000)
+    message_id = 1
+    for handle_id, (handle, sent, received) in enumerate(handle_counts, start=1):
+        conn.execute("INSERT INTO handle (ROWID, id) VALUES (?, ?)", (handle_id, handle))
+        for is_from_me, count in ((1, sent), (0, received)):
+            for _ in range(count):
+                conn.execute(
+                    "INSERT INTO message (ROWID, handle_id, is_from_me, date) VALUES (?, ?, ?, ?)",
+                    (message_id, handle_id, is_from_me, apple_now + message_id),
+                )
+                message_id += 1
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def make_addressbook_fixture_db(records=()):
+    """Create a minimal AddressBook-v22.abcddb fixture from contact mappings."""
+    db_path = os.path.join(tempfile.mkdtemp(), "AddressBook-v22.abcddb")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE ZABCDRECORD (
+            Z_PK INTEGER PRIMARY KEY,
+            ZFIRSTNAME TEXT,
+            ZLASTNAME TEXT,
+            ZORGANIZATION TEXT,
+            ZJOBTITLE TEXT,
+            ZNOTE TEXT
+        );
+        CREATE TABLE ZABCDEMAILADDRESS (
+            ZOWNER INTEGER,
+            ZADDRESSNORMALIZED TEXT
+        );
+        CREATE TABLE ZABCDPHONENUMBER (
+            ZOWNER INTEGER,
+            ZFULLNUMBER TEXT
+        );
+    """)
+    for record_id, record in enumerate(records, start=1):
+        conn.execute(
+            """INSERT INTO ZABCDRECORD
+               (Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZJOBTITLE, ZNOTE)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                record_id,
+                record.get("first"),
+                record.get("last"),
+                record.get("company"),
+                record.get("title"),
+                record.get("notes"),
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO ZABCDEMAILADDRESS (ZOWNER, ZADDRESSNORMALIZED) VALUES (?, ?)",
+            [(record_id, email) for email in record.get("emails", [])],
+        )
+        conn.executemany(
+            "INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (?, ?)",
+            [(record_id, phone) for phone in record.get("phones", [])],
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def make_calendar_fixture_records():
+    """Return fake Calendar event and attendee records at the current time."""
+    apple_now = datetime.now().timestamp() - 978307200
+    records = [{
+        "title": "Fixture Person Planning",
+        "location": "Fixture Room",
+        "start_date": apple_now,
+        "end_date": apple_now + 1800,
+        "notes": "Quarterly fixture review",
+    }]
+    attendees = [
+        {
+            "name": "Guest One",
+            "address": "mailto:guest@example.com",
+            "event_title": "Fixture Person Planning",
+            "event_date": apple_now,
+        },
+        {
+            "name": "Named Guest",
+            "address": "",
+            "event_title": "Fixture Person Planning",
+            "event_date": apple_now,
+        },
+    ]
+    return records, attendees
+
+
+def make_mail_fixture_records():
+    """Return fake Envelope Index query rows for sent/received aggregation."""
+    now = int(datetime.now().timestamp())
+    return [
+        {
+            "subject": "Fixture one", "date_sent": now,
+            "from_addr": "FIXTURE@EXAMPLE.COM", "to_addr": "guest@example.com",
+            "is_read": 1,
+        },
+        {
+            "subject": "Fixture two", "date_sent": now + 1,
+            "from_addr": "guest@example.com", "to_addr": "fixture@example.com",
+            "is_read": 1,
+        },
+        {
+            "subject": "Fixture three", "date_sent": now + 2,
+            "from_addr": "fixture@example.com", "to_addr": "other@example.com",
+            "is_read": 0,
+        },
+    ]
 
 
 def run_benchmarks():
@@ -1129,53 +1263,61 @@ def run_benchmarks():
 
     # ── 16. Local Data Connectors (8 tests) ──
     # Test that ingest methods exist, accept correct args, return correct types.
-    # These run on any machine (gracefully return (0,0) when macOS DBs not found).
+    # Every call is fixture-injected so this suite never probes live macOS data.
 
     ingest_crm = CRM(os.path.join(tempfile.mkdtemp(), "ingest.db"))
+    contract_addressbook_db = make_addressbook_fixture_db()
+    contract_imessage_db = make_imessage_fixture_db()
 
     # 16a. ingest_macos_contacts exists and returns tuple
     try:
-        result = ingest_crm.ingest_macos_contacts()
+        result = ingest_crm.ingest_macos_contacts(db_paths=[contract_addressbook_db])
         check("ingest_contacts_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_contacts_returns_tuple", False)
 
     # 16b. ingest_macos_contacts returns ints
     try:
-        added, facts = ingest_crm.ingest_macos_contacts()
+        added, facts = ingest_crm.ingest_macos_contacts(db_paths=[contract_addressbook_db])
         check("ingest_contacts_returns_ints", isinstance(added, int) and isinstance(facts, int))
     except (AttributeError, TypeError, ValueError):
         check("ingest_contacts_returns_ints", False)
 
     # 16c. ingest_macos_imessage exists and returns tuple
     try:
-        result = ingest_crm.ingest_macos_imessage(days=30)
+        result = ingest_crm.ingest_macos_imessage(days=30, db_path=contract_imessage_db)
         check("ingest_imessage_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_imessage_returns_tuple", False)
 
     # 16d. ingest_macos_imessage accepts days parameter
     try:
-        result = ingest_crm.ingest_macos_imessage(days=7)
+        result = ingest_crm.ingest_macos_imessage(days=7, db_path=contract_imessage_db)
         check("ingest_imessage_days_param", isinstance(result, tuple))
     except (AttributeError, TypeError):
         check("ingest_imessage_days_param", False)
 
     # 16e. ingest_macos_calendar exists and returns tuple
     try:
-        result = ingest_crm.ingest_macos_calendar()
+        result = ingest_crm.ingest_macos_calendar(records=[], attendees=[])
         check("ingest_calendar_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_calendar_returns_tuple", False)
 
     # 16f. ingest_macos_calendar accepts days_back/days_forward
     try:
-        result = ingest_crm.ingest_macos_calendar(days_back=7, days_forward=7)
+        result = ingest_crm.ingest_macos_calendar(
+            days_back=7, days_forward=7, records=[], attendees=[]
+        )
         check("ingest_calendar_days_params", isinstance(result, tuple))
     except (AttributeError, TypeError):
         check("ingest_calendar_days_params", False)
 
     # 16g. ingest_all exists and returns dict
+    ingest_crm.ingest_macos_contacts = lambda: (0, 0)
+    ingest_crm.ingest_macos_imessage = lambda days=90: (0, 0)
+    ingest_crm.ingest_macos_calendar = lambda days_back=30, days_forward=30: (0, 0)
+    ingest_crm.ingest_macos_mail = lambda days=90: (0, 0)
     try:
         result = ingest_crm.ingest_all()
         check("ingest_all_returns_dict", isinstance(result, dict) and "total_facts" in result)
@@ -1573,7 +1715,7 @@ def run_benchmarks():
 
     # 21a. ingest_macos_mail exists and returns tuple
     try:
-        result = email_crm.ingest_macos_mail(days=30)
+        result = email_crm.ingest_macos_mail(days=30, rows=[])
         check("ingest_mail_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_mail_returns_tuple", False)
@@ -1594,7 +1736,7 @@ def run_benchmarks():
 
     # 21d. ingest_macos_mail accepts days param
     try:
-        result = email_crm.ingest_macos_mail(days=7)
+        result = email_crm.ingest_macos_mail(days=7, rows=[])
         check("ingest_mail_days_param", isinstance(result, tuple))
     except (AttributeError, TypeError):
         check("ingest_mail_days_param", False)
@@ -4549,6 +4691,212 @@ def run_benchmarks():
         check("intro_paths_mcp_tool", False)
 
     intro_crm.close()
+
+    # ── 80. macOS ingest fixtures and transform hardening (16 tests) ──
+    ingest_dir = tempfile.mkdtemp()
+    ingest_crm = CRM(os.path.join(ingest_dir, "ingest.db"))
+
+    addressbook_db = make_addressbook_fixture_db([{
+        "first": "Fixture",
+        "last": "Person",
+        "company": "Fixture Co",
+        "title": "CTO",
+        "notes": "Imported from the fixture",
+        "emails": ["fixture@example.com", "fixture.alt@example.com"],
+        "phones": ["(415) 555-0100"],
+    }])
+    contacts_added, contact_facts_added = ingest_crm.ingest_macos_contacts(
+        db_paths=[addressbook_db]
+    )
+    fixture_contact = ingest_crm.get_contact("fixture@example.com")
+
+    # 80a. the actual AddressBook SQLite query feeds the contact transform
+    check(
+        "ingest_addressbook_contact_mapping",
+        contacts_added == 1 and contact_facts_added > 0
+        and fixture_contact["name"] == "Fixture Person"
+        and fixture_contact["company"] == "Fixture Co"
+        and fixture_contact["title"] == "CTO",
+    )
+
+    # 80b. all AddressBook emails, phones, company, and notes reach the graph
+    addressbook_history = ingest_crm.history_of("contact:fixture person")
+    check(
+        "ingest_addressbook_fact_mapping",
+        {fact["value"] for fact in addressbook_history if fact["key"] == "email"}
+        == {"fixture@example.com", "fixture.alt@example.com"}
+        and ingest_crm.facts_about("contact:fixture person")["company"]["value"] == "Fixture Co"
+        and ingest_crm.facts_about("contact:fixture person")["notes"]["value"]
+        == "Imported from the fixture"
+        and ingest_crm.facts_about("phone:+14155550100")["name"]["value"]
+        == "Fixture Person",
+    )
+
+    imessage_db = make_imessage_fixture_db([
+        ("(415) 555-0100", 8, 12),       # threshold: 20 is low
+        ("FIXTURE@EXAMPLE.COM", 9, 12),  # threshold: 21 is medium
+        ("medium@example.com", 50, 50),  # threshold: 100 is medium
+        ("high@example.com", 51, 50),    # threshold: 101 is high
+    ])
+    handles_found, imessage_facts_added = ingest_crm.ingest_macos_imessage(
+        days=2, db_path=imessage_db
+    )
+    phone_message_facts = ingest_crm.facts_about("phone:+14155550100")
+
+    # 80c. the actual chat.db aggregate query returns every fixture handle
+    check(
+        "ingest_imessage_fixture_query",
+        handles_found == 4 and imessage_facts_added > 0,
+    )
+
+    # 80d. sent, received, and total counts survive aggregation exactly
+    check(
+        "ingest_imessage_counts",
+        phone_message_facts["imessage_total"]["value"] == "20"
+        and phone_message_facts["imessage_sent"]["value"] == "8"
+        and phone_message_facts["imessage_received"]["value"] == "12",
+    )
+
+    # 80e. intensity boundaries stay low <=20, medium <=100, high >100
+    check(
+        "ingest_imessage_intensity_thresholds",
+        phone_message_facts["message_intensity"]["value"] == "low"
+        and ingest_crm.facts_about("contact:fixture@example.com")["message_intensity"]["value"] == "medium"
+        and ingest_crm.facts_about("contact:medium@example.com")["message_intensity"]["value"] == "medium"
+        and ingest_crm.facts_about("contact:high@example.com")["message_intensity"]["value"] == "high",
+    )
+
+    # 80f. reciprocity retains both directions rather than collapsing to total
+    check(
+        "ingest_imessage_reciprocity",
+        phone_message_facts["imessage_ratio"]["value"] == "8:12",
+    )
+
+    # 80g. formatted phones and case-varied emails both resolve to the contact
+    matched_handles = {
+        fact["value"] for fact in ingest_crm.history_of(
+            "contact:fixture person", key="imessage_handle"
+        )
+    }
+    check(
+        "ingest_imessage_contact_variants",
+        matched_handles == {"(415) 555-0100", "FIXTURE@EXAMPLE.COM"},
+    )
+
+    calendar_records, calendar_attendees = make_calendar_fixture_records()
+    events_found, calendar_facts_added = ingest_crm.ingest_macos_calendar(
+        records=calendar_records, attendees=calendar_attendees
+    )
+
+    # 80h. fake Calendar records exercise the real meeting transform
+    check(
+        "ingest_calendar_event_mapping",
+        events_found == 1 and calendar_facts_added > 0
+        and ingest_crm.facts_about("meeting:fixture person planning")["location"]["value"]
+        == "Fixture Room",
+    )
+
+    # 80i. email and named attendees aggregate onto their contact entities
+    check(
+        "ingest_calendar_attendees",
+        ingest_crm.facts_about("contact:guest@example.com")["meeting"]["value"]
+        == "Fixture Person Planning"
+        and ingest_crm.facts_about("contact:named guest")["meeting"]["value"]
+        == "Fixture Person Planning"
+        and ingest_crm.facts_about("contact:fixture person")["meeting"]["value"]
+        == "Fixture Person Planning",
+    )
+
+    mail_records = make_mail_fixture_records()
+    threads_found, mail_facts_added = ingest_crm.ingest_macos_mail(rows=mail_records)
+    fixture_mail_facts = ingest_crm.facts_about("email:fixture@example.com")
+
+    # 80j. one returned Envelope Index row counts as one thread
+    check(
+        "ingest_mail_thread_count",
+        threads_found == 3 and mail_facts_added > 0,
+    )
+
+    # 80k. per-address direction counts and case-insensitive contact linking work
+    check(
+        "ingest_mail_address_aggregation",
+        fixture_mail_facts["email_total"]["value"] == "3"
+        and fixture_mail_facts["email_sent"]["value"] == "2"
+        and fixture_mail_facts["email_received"]["value"] == "1"
+        and ingest_crm.facts_about("contact:fixture person")["email_total"]["value"] == "3",
+    )
+
+    fact_count_before_empty = ingest_crm.conn.execute(
+        "SELECT COUNT(*) FROM facts"
+    ).fetchone()[0]
+    empty_addressbook_db = make_addressbook_fixture_db()
+
+    # 80l. an empty AddressBook fixture produces no contacts or facts
+    check(
+        "ingest_empty_addressbook",
+        ingest_crm.ingest_macos_contacts(db_paths=[empty_addressbook_db]) == (0, 0)
+        and ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        == fact_count_before_empty,
+    )
+
+    empty_imessage_db = make_imessage_fixture_db()
+
+    # 80m. an empty chat.db fixture produces no handles or facts
+    check(
+        "ingest_empty_imessage",
+        ingest_crm.ingest_macos_imessage(days=2, db_path=empty_imessage_db) == (0, 0)
+        and ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        == fact_count_before_empty,
+    )
+
+    # 80n. empty injected Calendar and Mail sources also stay at zero
+    check(
+        "ingest_empty_record_sources",
+        ingest_crm.ingest_macos_calendar(records=[], attendees=[]) == (0, 0)
+        and ingest_crm.ingest_macos_mail(rows=[]) == (0, 0)
+        and ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        == fact_count_before_empty,
+    )
+
+    # 80o. malformed rows are skipped while later valid rows are still ingested
+    malformed_contacts = ingest_crm.ingest_macos_contacts(records=[
+        None,
+        {"first": "Valid", "last": "Contact", "emails": [], "phones": []},
+    ])
+    malformed_messages = ingest_crm.ingest_macos_imessage(rows=[
+        {"handle": "broken@example.com", "msg_count": "not-a-number"},
+        {"handle": "valid@example.com", "msg_count": 1, "sent": 1, "received": 0},
+    ])
+    malformed_calendar = ingest_crm.ingest_macos_calendar(
+        records=[None, {"title": "Valid Fixture Event", "start_date": None}],
+        attendees=[None],
+    )
+    malformed_mail = ingest_crm.ingest_macos_mail(rows=[
+        {"from_addr": 42, "to_addr": None},
+        {"from_addr": "valid@example.com", "to_addr": "other@example.com", "date_sent": 1},
+    ])
+    check(
+        "ingest_malformed_rows_skipped",
+        malformed_contacts[1] > 0 and malformed_messages[0] == 1
+        and malformed_calendar[0] == 1 and malformed_mail[0] == 1,
+    )
+
+    # 80p. re-running the same fixtures refreshes facts without duplicating rows
+    counts_before_reingest = (
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+    )
+    ingest_crm.ingest_macos_contacts(db_paths=[addressbook_db])
+    ingest_crm.ingest_macos_imessage(days=2, db_path=imessage_db)
+    ingest_crm.ingest_macos_calendar(records=calendar_records, attendees=calendar_attendees)
+    ingest_crm.ingest_macos_mail(rows=mail_records)
+    counts_after_reingest = (
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+    )
+    check("ingest_reingest_idempotent", counts_after_reingest == counts_before_reingest)
+
+    ingest_crm.close()
 
     for roundtrip_crm in (
         roundtrip_source, roundtrip_target, merge_crm, csv_roundtrip_crm,

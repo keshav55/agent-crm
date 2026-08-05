@@ -40,7 +40,7 @@ backups real. ~15 tests.
 (`introduced_by`, `knows`, shared company/domain) with path scoring by
 relationship strength. ~10 tests.
 
-### Five. Ingest hardening
+### [x] Five. Ingest hardening
 The macOS connectors (Contacts, iMessage, Calendar, Mail) have no benchmark
 coverage because they touch live system data. Add a fixture layer (fake
 chat.db / AddressBook snapshots) so ingest logic gets scored too. ~15 tests.

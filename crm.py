@@ -5633,23 +5633,17 @@ class CRM:
 
     # --- Local Data Connectors (macOS) ---
 
-    def ingest_macos_contacts(self):
-        """Import contacts from macOS AddressBook into CRM + context graph.
+    @staticmethod
+    def _record_value(record, key, default=None):
+        """Read a field from a sqlite Row or mapping without failing the ingest."""
+        try:
+            return record[key]
+        except (KeyError, IndexError, TypeError):
+            return default
 
-        Reads ~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb
-        Returns (contacts_added, facts_added) tuple.
-        """
-        import glob as globmod
-        ab_pattern = os.path.expanduser(
-            "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
-        )
-        db_paths = globmod.glob(ab_pattern)
-        if not db_paths:
-            return (0, 0)
-
-        contacts_added = 0
-        facts = []
-
+    def _read_macos_contact_records(self, db_paths):
+        """Read AddressBook databases into source-independent contact records."""
+        records = []
         for db_path in db_paths:
             try:
                 ab = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -5659,7 +5653,6 @@ class CRM:
                 continue
 
             try:
-                # Get people with names (Z_PK is CoreData's ROWID)
                 rows = ab.execute("""
                     SELECT
                         r.Z_PK as rowid,
@@ -5673,115 +5666,139 @@ class CRM:
                 """).fetchall()
 
                 for row in rows:
-                    first = (row["first"] or "").strip()
-                    last = (row["last"] or "").strip()
-                    name = f"{first} {last}".strip()
-                    if not name:
-                        continue
-
-                    company = (row["company"] or "").strip() or None
-                    title = (row["title"] or "").strip() or None
                     rowid = row["rowid"]
-                    entity = f"contact:{name.lower()}"
-
-                    # Get emails for this record
                     emails = ab.execute("""
                         SELECT ZADDRESSNORMALIZED as email
                         FROM ZABCDEMAILADDRESS
                         WHERE ZOWNER = ?
                     """, (rowid,)).fetchall()
-
-                    email = emails[0]["email"] if emails else None
-
-                    # Get phone numbers
                     phones = ab.execute("""
                         SELECT ZFULLNUMBER as phone
                         FROM ZABCDPHONENUMBER
                         WHERE ZOWNER = ?
                     """, (rowid,)).fetchall()
-
-                    # Add as contact if they have an email AND a company
-                    # (personal contacts without a company stay in the knowledge graph only)
-                    if email and company:
-                        try:
-                            self.add_contact(
-                                name=name,
-                                email=email,
-                                company=company,
-                                title=title,
-                                source="macos_contacts",
-                                status="prospect"
-                            )
-                            contacts_added += 1
-                        except sqlite3.IntegrityError:
-                            pass  # email already exists
-
-                    # Build facts — always add to knowledge graph
-                    facts.append((entity, "source", "macos_contacts", "macos_contacts"))
-                    # Map phone numbers to this contact name for iMessage resolution
-                    for p in phones:
-                        phone = str(p["phone"] or "").strip()
-                        if phone:
-                            normalized = self._normalize_phone(phone)
-                            if normalized:
-                                facts.append((f"phone:{normalized}", "name", name, "macos_contacts"))
-                                if company:
-                                    facts.append((f"phone:{normalized}", "company", company, "macos_contacts"))
-
-                    # Build facts
-                    if company:
-                        facts.append((entity, "company", company, "macos_contacts"))
-                    if title:
-                        facts.append((entity, "title", title, "macos_contacts"))
-                    for e in emails:
-                        if e["email"]:
-                            facts.append((entity, "email", e["email"], "macos_contacts"))
-                    for p in phones:
-                        if p["phone"]:
-                            facts.append((entity, "phone", p["phone"], "macos_contacts"))
-                    raw_notes = row["notes"]
-                    if isinstance(raw_notes, str) and raw_notes.strip():
-                        facts.append((entity, "notes", raw_notes.strip()[:500], "macos_contacts"))
-
+                    records.append({
+                        "first": row["first"],
+                        "last": row["last"],
+                        "company": row["company"],
+                        "title": row["title"],
+                        "notes": row["notes"],
+                        "emails": [email["email"] for email in emails],
+                        "phones": [phone["phone"] for phone in phones],
+                    })
             except Exception as e:
                 print(f"Warning: AddressBook read error: {e}", file=sys.stderr)
             finally:
                 ab.close()
+        return records
 
-        facts_added = 0
-        if facts:
-            facts_added = self.observe_many(facts, source="macos_contacts")
+    def _ingest_macos_contact_records(self, records):
+        """Transform AddressBook-shaped records and store contacts and facts."""
+        contacts_added = 0
+        facts = []
 
+        for record in records:
+            try:
+                first = (self._record_value(record, "first") or "").strip()
+                last = (self._record_value(record, "last") or "").strip()
+                name = f"{first} {last}".strip()
+                if not name:
+                    continue
+
+                company = (self._record_value(record, "company") or "").strip() or None
+                title = (self._record_value(record, "title") or "").strip() or None
+                emails = self._record_value(record, "emails", []) or []
+                phones = self._record_value(record, "phones", []) or []
+                if not isinstance(emails, (list, tuple)) or not isinstance(phones, (list, tuple)):
+                    continue
+
+                email = emails[0] if emails else None
+                entity = f"contact:{name.lower()}"
+
+                # Add as contact if they have an email AND a company
+                # (personal contacts without a company stay in the knowledge graph only)
+                if email and company:
+                    try:
+                        self.add_contact(
+                            name=name,
+                            email=email,
+                            company=company,
+                            title=title,
+                            source="macos_contacts",
+                            status="prospect"
+                        )
+                        contacts_added += 1
+                    except sqlite3.IntegrityError:
+                        pass  # email already exists
+
+                # Build facts — always add to knowledge graph
+                facts.append((entity, "source", "macos_contacts", "macos_contacts"))
+                # Map phone numbers to this contact name for iMessage resolution
+                for raw_phone in phones:
+                    phone = str(raw_phone or "").strip()
+                    if phone:
+                        normalized = self._normalize_phone(phone)
+                        if normalized:
+                            facts.append((f"phone:{normalized}", "name", name, "macos_contacts"))
+                            if company:
+                                facts.append((f"phone:{normalized}", "company", company, "macos_contacts"))
+
+                if company:
+                    facts.append((entity, "company", company, "macos_contacts"))
+                if title:
+                    facts.append((entity, "title", title, "macos_contacts"))
+                for address in emails:
+                    if address:
+                        facts.append((entity, "email", address, "macos_contacts"))
+                for raw_phone in phones:
+                    if raw_phone:
+                        facts.append((entity, "phone", raw_phone, "macos_contacts"))
+                raw_notes = self._record_value(record, "notes")
+                if isinstance(raw_notes, str) and raw_notes.strip():
+                    facts.append((entity, "notes", raw_notes.strip()[:500], "macos_contacts"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+        facts_added = self.observe_many(facts, source="macos_contacts") if facts else 0
         return (contacts_added, facts_added)
 
-    def ingest_macos_imessage(self, days=90):
-        """Import iMessage conversation partners and message counts into context graph.
+    def ingest_macos_contacts(self, db_paths=None, records=None):
+        """Import contacts from macOS AddressBook into CRM + context graph.
 
-        Reads ~/Library/Messages/chat.db (requires Full Disk Access).
-        Returns (contacts_found, facts_added) tuple.
+        Reads ~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb
+        Pass db_paths or pre-read records to ingest fixtures without reading live data.
+        Returns (contacts_added, facts_added) tuple.
         """
-        chat_db = os.path.expanduser("~/Library/Messages/chat.db")
-        if not os.path.exists(chat_db):
-            return (0, 0)
+        if records is None:
+            if db_paths is None:
+                import glob as globmod
+                ab_pattern = os.path.expanduser(
+                    "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
+                )
+                db_paths = globmod.glob(ab_pattern)
+            elif isinstance(db_paths, (str, os.PathLike)):
+                db_paths = [db_paths]
+            records = self._read_macos_contact_records(db_paths)
+        return self._ingest_macos_contact_records(records)
 
+    def _read_macos_imessage_rows(self, db_path, days):
+        """Query the iMessage source database and return aggregate rows."""
+        if not os.path.exists(db_path):
+            return []
         try:
-            mdb = sqlite3.connect(f"file:{chat_db}?mode=ro", uri=True)
+            mdb = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             mdb.row_factory = sqlite3.Row
         except Exception as e:
             print(f"Warning: iMessage DB open error: {e}", file=sys.stderr)
-            return (0, 0)
+            return []
 
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        facts = []
-        contacts_found = set()
-
+        apple_epoch_offset = 978307200
+        cutoff_apple = (
+            datetime.strptime(cutoff, "%Y-%m-%d").timestamp() - apple_epoch_offset
+        ) * 1_000_000_000
         try:
-            # Get message counts per handle (phone/email) in recent period
-            # chat.db stores dates as Apple epoch (seconds since 2001-01-01) * 10^9
-            apple_epoch_offset = 978307200  # seconds between Unix epoch and Apple epoch
-            cutoff_apple = (datetime.strptime(cutoff, "%Y-%m-%d").timestamp() - apple_epoch_offset) * 1_000_000_000
-
-            rows = mdb.execute("""
+            return mdb.execute("""
                 SELECT
                     h.id as handle,
                     COUNT(*) as msg_count,
@@ -5794,33 +5811,41 @@ class CRM:
                 GROUP BY h.id
                 ORDER BY msg_count DESC
             """, (int(cutoff_apple),)).fetchall()
+        except Exception as e:
+            print(f"Warning: iMessage read error: {e}", file=sys.stderr)
+            return []
+        finally:
+            mdb.close()
 
-            for row in rows:
-                handle = row["handle"]
-                if not handle:
+    def _ingest_macos_imessage_rows(self, rows):
+        """Transform iMessage aggregate rows and store relationship facts."""
+        facts = []
+        contacts_found = set()
+
+        for row in rows:
+            try:
+                handle = self._record_value(row, "handle")
+                if not isinstance(handle, str) or not handle.strip():
+                    continue
+                handle = handle.strip()
+                msg_count = int(self._record_value(row, "msg_count"))
+                sent = int(self._record_value(row, "sent"))
+                received = int(self._record_value(row, "received"))
+                if min(msg_count, sent, received) < 0:
                     continue
 
-                # Normalize: +1234567890 → phone entity, email → email entity
                 if "@" in handle:
                     entity = f"contact:{handle.lower()}"
                 else:
-                    # Apply same normalization as ingest_macos_contacts so
-                    # phone: entities match up for name resolution.
                     normalized_phone = self._normalize_phone(handle)
                     entity = f"phone:{normalized_phone}" if normalized_phone else f"phone:{handle}"
 
                 contacts_found.add(handle)
-
-                msg_count = row["msg_count"]
-                sent = row["sent"]
-                received = row["received"]
-
                 facts.append((entity, "imessage_total", str(msg_count), "imessage"))
                 facts.append((entity, "imessage_sent", str(sent), "imessage"))
                 facts.append((entity, "imessage_received", str(received), "imessage"))
                 facts.append((entity, "imessage_ratio", f"{sent}:{received}", "imessage"))
 
-                # Classify relationship intensity
                 if msg_count > 100:
                     intensity = "high"
                 elif msg_count > 20:
@@ -5829,9 +5854,12 @@ class CRM:
                     intensity = "low"
                 facts.append((entity, "message_intensity", intensity, "imessage"))
 
-                # Try to match to existing CRM contact by email or phone
                 if "@" in handle:
-                    existing = self.get_contact(handle)
+                    existing_row = self.conn.execute(
+                        "SELECT * FROM contacts WHERE LOWER(email) = LOWER(?) LIMIT 1",
+                        (handle,)
+                    ).fetchone()
+                    existing = dict(existing_row) if existing_row else None
                     if existing:
                         crm_entity = f"contact:{existing['name'].lower()}"
                         facts.append((crm_entity, "imessage_handle", handle, "imessage"))
@@ -5840,7 +5868,6 @@ class CRM:
                         facts.append((crm_entity, "imessage_received", str(received), "imessage"))
                         facts.append((crm_entity, "message_intensity", intensity, "imessage"))
                 else:
-                    # Check if this phone was resolved to a name via contacts ingest
                     name_fact = self.conn.execute(
                         "SELECT value FROM facts WHERE entity = ? AND key = 'name' AND source = 'macos_contacts' LIMIT 1",
                         (entity,)
@@ -5852,48 +5879,37 @@ class CRM:
                         facts.append((crm_entity, "imessage_sent", str(sent), "imessage"))
                         facts.append((crm_entity, "imessage_received", str(received), "imessage"))
                         facts.append((crm_entity, "message_intensity", intensity, "imessage"))
+            except (AttributeError, TypeError, ValueError):
+                continue
 
-        except Exception as e:
-            print(f"Warning: iMessage read error: {e}", file=sys.stderr)
-        finally:
-            mdb.close()
-
-        facts_added = 0
-        if facts:
-            facts_added = self.observe_many(facts, source="imessage")
-
+        facts_added = self.observe_many(facts, source="imessage") if facts else 0
         return (len(contacts_found), facts_added)
 
-    def ingest_macos_calendar(self, days_back=30, days_forward=30):
-        """Import calendar events into context graph as meeting facts.
+    def ingest_macos_imessage(self, days=90, db_path=None, rows=None):
+        """Import iMessage conversation partners and message counts into context graph.
 
-        Reads ~/Library/Calendars/Calendar Cache (requires calendar access).
-        Returns (events_found, facts_added) tuple.
+        Reads ~/Library/Messages/chat.db (requires Full Disk Access).
+        Pass db_path or pre-aggregated rows to ingest fixtures without reading live data.
+        Returns (contacts_found, facts_added) tuple.
         """
-        cal_db = os.path.expanduser("~/Library/Calendars/Calendar Cache")
-        if not os.path.exists(cal_db):
-            return (0, 0)
+        if rows is None:
+            db_path = db_path or os.path.expanduser("~/Library/Messages/chat.db")
+            rows = self._read_macos_imessage_rows(db_path, days)
+        return self._ingest_macos_imessage_rows(rows)
 
+    def _read_macos_calendar_records(self, db_path, start_apple, end_apple):
+        """Query Calendar Cache and return event and attendee records."""
+        if not os.path.exists(db_path):
+            return ([], [])
         try:
-            cdb = sqlite3.connect(f"file:{cal_db}?mode=ro", uri=True)
+            cdb = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             cdb.row_factory = sqlite3.Row
         except Exception as e:
             print(f"Warning: Calendar DB open error: {e}", file=sys.stderr)
-            return (0, 0)
-
-        now = datetime.now()
-        start = (now - timedelta(days=days_back)).timestamp()
-        end = (now + timedelta(days=days_forward)).timestamp()
-        # CoreData stores dates as seconds since 2001-01-01
-        apple_epoch = 978307200
-        start_apple = start - apple_epoch
-        end_apple = end - apple_epoch
-
-        facts = []
-        events_found = 0
+            return ([], [])
 
         try:
-            rows = cdb.execute("""
+            records = cdb.execute("""
                 SELECT
                     ZSUMMARY as title,
                     ZLOCATION as location,
@@ -5905,80 +5921,114 @@ class CRM:
                   AND ZSUMMARY IS NOT NULL
                 ORDER BY ZSTARTDATE
             """, (start_apple, end_apple)).fetchall()
+        except Exception as e:
+            print(f"Warning: Calendar read error: {e}", file=sys.stderr)
+            cdb.close()
+            return ([], [])
 
-            for row in rows:
-                title = (row["title"] or "").strip()
+        try:
+            attendees = cdb.execute("""
+                SELECT
+                    a.ZCOMMONNAME as name,
+                    a.ZADDRESS as address,
+                    i.ZSUMMARY as event_title,
+                    i.ZSTARTDATE as event_date
+                FROM ZATTENDEE a
+                JOIN ZCALENDARITEM i ON a.ZEVENT = i.Z_PK
+                WHERE i.ZSTARTDATE BETWEEN ? AND ?
+            """, (start_apple, end_apple)).fetchall()
+        except Exception:
+            attendees = []  # Attendee table may not exist in all versions
+        finally:
+            cdb.close()
+        return (records, attendees)
+
+    def _ingest_macos_calendar_records(self, records, attendees=None):
+        """Transform Calendar records and store meeting facts."""
+        apple_epoch = 978307200
+        facts = []
+        events_found = 0
+
+        for record in records:
+            try:
+                record_facts = []
+                title = (self._record_value(record, "title") or "").strip()
                 if not title:
                     continue
-
-                events_found += 1
-                # Convert Apple date to datetime
-                ts = row["start_date"] + apple_epoch if row["start_date"] else None
+                start_date = self._record_value(record, "start_date")
+                ts = start_date + apple_epoch if start_date else None
                 date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "unknown"
                 entity = f"meeting:{title.lower()[:80]}"
 
-                facts.append((entity, "title", title, "macos_calendar"))
-                facts.append((entity, "date", date_str, "macos_calendar"))
-                if row["location"]:
-                    facts.append((entity, "location", row["location"].strip(), "macos_calendar"))
-
-                # Extract attendee names/emails from notes or title
-                # Try to link to CRM contacts
-                notes = (row["notes"] or "").strip()
+                record_facts.append((entity, "title", title, "macos_calendar"))
+                record_facts.append((entity, "date", date_str, "macos_calendar"))
+                location = self._record_value(record, "location")
+                if location:
+                    record_facts.append((entity, "location", location.strip(), "macos_calendar"))
+                notes = (self._record_value(record, "notes") or "").strip()
                 if notes:
-                    facts.append((entity, "notes", notes[:500], "macos_calendar"))
+                    record_facts.append((entity, "notes", notes[:500], "macos_calendar"))
 
-                # Try matching title words to existing contacts
                 for word in title.split():
                     if len(word) > 2 and word[0].isupper():
                         match = self.get_contact(word)
                         if match:
                             crm_entity = f"contact:{match['name'].lower()}"
-                            facts.append((crm_entity, "meeting", title, "macos_calendar"))
-                            facts.append((crm_entity, "last_meeting_date", date_str, "macos_calendar"))
+                            record_facts.append((crm_entity, "meeting", title, "macos_calendar"))
+                            record_facts.append((crm_entity, "last_meeting_date", date_str, "macos_calendar"))
+                facts.extend(record_facts)
+                events_found += 1
+            except (AttributeError, TypeError, ValueError, OSError, OverflowError):
+                continue
 
-            # Also try to get attendees from the attendee table
+        for attendee in attendees or []:
             try:
-                attendees = cdb.execute("""
-                    SELECT
-                        a.ZCOMMONNAME as name,
-                        a.ZADDRESS as address,
-                        i.ZSUMMARY as event_title,
-                        i.ZSTARTDATE as event_date
-                    FROM ZATTENDEE a
-                    JOIN ZCALENDARITEM i ON a.ZEVENT = i.Z_PK
-                    WHERE i.ZSTARTDATE BETWEEN ? AND ?
-                """, (start_apple, end_apple)).fetchall()
+                attendee_facts = []
+                att_name = (self._record_value(attendee, "name") or "").strip()
+                att_addr = (self._record_value(attendee, "address") or "").replace("mailto:", "").strip()
+                event_title = (self._record_value(attendee, "event_title") or "").strip()
+                if not event_title:
+                    continue
 
-                for att in attendees:
-                    att_name = (att["name"] or "").strip()
-                    att_addr = (att["address"] or "").replace("mailto:", "").strip()
-                    event_title = (att["event_title"] or "").strip()
+                if att_addr and "@" in att_addr:
+                    att_entity = f"contact:{att_addr.lower()}"
+                    attendee_facts.append((att_entity, "meeting", event_title, "macos_calendar"))
+                    event_date = self._record_value(attendee, "event_date")
+                    ts = event_date + apple_epoch if event_date else None
+                    if ts:
+                        attendee_facts.append((att_entity, "last_meeting_date",
+                                               datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+                                               "macos_calendar"))
+                elif att_name:
+                    att_entity = f"contact:{att_name.lower()}"
+                    attendee_facts.append((att_entity, "meeting", event_title, "macos_calendar"))
+                facts.extend(attendee_facts)
+            except (AttributeError, TypeError, ValueError, OSError, OverflowError):
+                continue
 
-                    if att_addr and "@" in att_addr:
-                        att_entity = f"contact:{att_addr.lower()}"
-                        facts.append((att_entity, "meeting", event_title, "macos_calendar"))
-                        ts2 = att["event_date"] + apple_epoch if att["event_date"] else None
-                        if ts2:
-                            facts.append((att_entity, "last_meeting_date",
-                                         datetime.fromtimestamp(ts2).strftime("%Y-%m-%d"), "macos_calendar"))
-                    elif att_name:
-                        att_entity = f"contact:{att_name.lower()}"
-                        facts.append((att_entity, "meeting", event_title, "macos_calendar"))
-
-            except Exception:
-                pass  # Attendee table may not exist in all versions
-
-        except Exception as e:
-            print(f"Warning: Calendar read error: {e}", file=sys.stderr)
-        finally:
-            cdb.close()
-
-        facts_added = 0
-        if facts:
-            facts_added = self.observe_many(facts, source="macos_calendar")
-
+        facts_added = self.observe_many(facts, source="macos_calendar") if facts else 0
         return (events_found, facts_added)
+
+    def ingest_macos_calendar(self, days_back=30, days_forward=30, db_path=None,
+                              records=None, attendees=None):
+        """Import calendar events into context graph as meeting facts.
+
+        Reads ~/Library/Calendars/Calendar Cache (requires calendar access).
+        Pass records and attendees to ingest fixtures without reading live data.
+        Returns (events_found, facts_added) tuple.
+        """
+        now = datetime.now()
+        start = (now - timedelta(days=days_back)).timestamp()
+        end = (now + timedelta(days=days_forward)).timestamp()
+        apple_epoch = 978307200
+        start_apple = start - apple_epoch
+        end_apple = end - apple_epoch
+        if records is None:
+            db_path = db_path or os.path.expanduser("~/Library/Calendars/Calendar Cache")
+            records, attendees = self._read_macos_calendar_records(
+                db_path, start_apple, end_apple
+            )
+        return self._ingest_macos_calendar_records(records, attendees)
 
     def ingest_all(self, imessage_days=90, cal_days_back=30, cal_days_forward=30):
         """Run all local data connectors. Returns summary dict."""
@@ -6185,38 +6235,20 @@ class CRM:
 
     # --- Email Thread Ingestion ---
 
-    def ingest_macos_mail(self, days=90):
-        """Import email threads from Mail.app into activity log + context graph.
-
-        Reads ~/Library/Mail/V10/MailData/Envelope Index (SQLite).
-        Returns (threads_found, facts_added) tuple.
-        """
-        envelope_db = os.path.expanduser("~/Library/Mail/V10/MailData/Envelope Index")
-        if not os.path.exists(envelope_db):
-            # Try older path
-            envelope_db = os.path.expanduser("~/Library/Mail/V9/MailData/Envelope Index")
-            if not os.path.exists(envelope_db):
-                return (0, 0)
-
+    def _read_macos_mail_rows(self, db_path, days):
+        """Query Mail's Envelope Index and return message/recipient rows."""
+        if not os.path.exists(db_path):
+            return []
         try:
-            mdb = sqlite3.connect(f"file:{envelope_db}?mode=ro", uri=True)
+            mdb = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             mdb.row_factory = sqlite3.Row
         except Exception as e:
             print(f"Warning: Mail DB open error: {e}", file=sys.stderr)
-            return (0, 0)
+            return []
 
         cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
-        facts = []
-        threads_found = 0
-        email_counts = {}  # address -> {sent: int, received: int, last: str}
-
         try:
-            # Query messages joined to sender address and recipient addresses.
-            # messages.sender -> addresses.ROWID (sender email)
-            # recipients.message -> messages.ROWID, recipients.address -> addresses.ROWID
-            # messages.subject -> subjects.ROWID (subject text)
-            # recipients.type: 0 = To, 1 = Cc, 2 = Bcc
-            rows = mdb.execute("""
+            return mdb.execute("""
                 SELECT
                     s.subject,
                     m.date_sent,
@@ -6231,54 +6263,83 @@ class CRM:
                 WHERE m.date_sent > ?
                 ORDER BY m.date_sent DESC
             """, (cutoff,)).fetchall()
+        except Exception as e:
+            print(f"Warning: Mail read error: {e}", file=sys.stderr)
+            return []
+        finally:
+            mdb.close()
 
-            for row in rows:
-                from_addr = (row["from_addr"] or "").strip().lower()
-                to_addr = (row["to_addr"] or "").strip().lower()
-                subject = (row["subject"] or "").strip()
+    def _ingest_macos_mail_rows(self, rows):
+        """Aggregate Mail rows by address and store email relationship facts."""
+        facts = []
+        threads_found = 0
+        email_counts = {}
 
+        for row in rows:
+            try:
+                from_addr = (self._record_value(row, "from_addr") or "").strip().lower()
+                to_addr = (self._record_value(row, "to_addr") or "").strip().lower()
                 if not from_addr and not to_addr:
                     continue
-                threads_found += 1
 
-                # Determine if sent or received (heuristic: check if from_addr matches known emails)
-                # We'll track both directions
-                for addr in (from_addr, to_addr):
-                    if addr and "@" in addr:
-                        if addr not in email_counts:
-                            email_counts[addr] = {"sent": 0, "received": 0, "last": ""}
-                        email_counts[addr]["last"] = str(row["date_sent"] or "")
+                valid_addresses = [
+                    address for address in (from_addr, to_addr)
+                    if address and "@" in address
+                ]
+                if not valid_addresses:
+                    continue
+
+                threads_found += 1
+                for address in valid_addresses:
+                    if address not in email_counts:
+                        email_counts[address] = {"sent": 0, "received": 0, "last": ""}
+                    email_counts[address]["last"] = str(
+                        self._record_value(row, "date_sent") or ""
+                    )
 
                 if from_addr and "@" in from_addr:
                     email_counts[from_addr]["sent"] += 1
                 if to_addr and "@" in to_addr:
                     email_counts[to_addr]["received"] += 1
+            except (AttributeError, TypeError, ValueError):
+                continue
 
-        except Exception as e:
-            print(f"Warning: Mail read error: {e}", file=sys.stderr)
-        finally:
-            mdb.close()
-
-        # Build facts and link to CRM contacts
-        for addr, counts in email_counts.items():
-            entity = f"email:{addr}"
+        for address, counts in email_counts.items():
+            entity = f"email:{address}"
             total = counts["sent"] + counts["received"]
             facts.append((entity, "email_total", str(total), "macos_mail"))
             facts.append((entity, "email_sent", str(counts["sent"]), "macos_mail"))
             facts.append((entity, "email_received", str(counts["received"]), "macos_mail"))
 
-            # Try to match to CRM contact
-            existing = self.get_contact(addr)
-            if existing:
+            existing_row = self.conn.execute(
+                "SELECT * FROM contacts WHERE LOWER(email) = LOWER(?) LIMIT 1",
+                (address,)
+            ).fetchone()
+            if existing_row:
+                existing = dict(existing_row)
                 crm_entity = f"contact:{existing['name'].lower()}"
                 facts.append((crm_entity, "email_total", str(total), "macos_mail"))
-                facts.append((crm_entity, "email_frequency", "high" if total > 50 else "medium" if total > 10 else "low", "macos_mail"))
+                facts.append((crm_entity, "email_frequency",
+                              "high" if total > 50 else "medium" if total > 10 else "low",
+                              "macos_mail"))
 
-        facts_added = 0
-        if facts:
-            facts_added = self.observe_many(facts, source="macos_mail")
-
+        facts_added = self.observe_many(facts, source="macos_mail") if facts else 0
         return (threads_found, facts_added)
+
+    def ingest_macos_mail(self, days=90, db_path=None, rows=None):
+        """Import email threads from Mail.app into activity log + context graph.
+
+        Reads ~/Library/Mail/V10/MailData/Envelope Index (SQLite).
+        Pass db_path or pre-read rows to ingest fixtures without reading live data.
+        Returns (threads_found, facts_added) tuple.
+        """
+        if rows is None:
+            if db_path is None:
+                db_path = os.path.expanduser("~/Library/Mail/V10/MailData/Envelope Index")
+                if not os.path.exists(db_path):
+                    db_path = os.path.expanduser("~/Library/Mail/V9/MailData/Envelope Index")
+            rows = self._read_macos_mail_rows(db_path, days)
+        return self._ingest_macos_mail_rows(rows)
 
     def ingest_mbox(self, mbox_path, days=90):
         """Import from any mbox file (Gmail Takeout, Thunderbird, etc).
