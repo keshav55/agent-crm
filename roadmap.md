@@ -59,7 +59,7 @@ system's own analysis changes its own behavior.
 
 ## Meta
 
-### Eight. Benchmark integrity
+### [x] Eight. Benchmark integrity
 As the benchmark grows past ~400 tests, add a perf-regression gate (fail if any
 op exceeds threshold) and a property-based pass over CRUD so score inflation
 stays honest. The benchmark is the fitness function — it must be harder to game

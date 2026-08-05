@@ -10,6 +10,7 @@ Each test = 1 point. Bonus points for performance thresholds.
 
 import os
 import json
+import random
 import sqlite3
 import sys
 import time
@@ -26,6 +27,20 @@ from crm import CRM
 PASS = 0
 FAIL = 0
 ERRORS = []
+PERFORMANCE_TIMINGS = []
+
+PERFORMANCE_SEED = 20260805
+PROPERTY_SEED = 8675309
+PERFORMANCE_THRESHOLDS_MS = {
+    "list_contacts": 15.0,
+    "get_contact_email": 1.0,
+    "get_contact_partial_name": 1.0,
+    "pipeline": 2.0,
+    "next_actions_10": 3000.0,
+    "forecast": 600.0,
+    "intro_paths": 5000.0,
+    "export_full": 40.0,
+}
 
 
 def check(name, condition):
@@ -35,6 +50,121 @@ def check(name, condition):
     else:
         FAIL += 1
         ERRORS.append(name)
+
+
+def make_performance_fixture():
+    """Build the deterministic 500-contact/2000-activity regression fixture."""
+    rng = random.Random(PERFORMANCE_SEED)
+    db_path = os.path.join(tempfile.mkdtemp(), "integrity-perf.db")
+    crm = CRM(db_path)
+    statuses = (
+        "prospect", "contacted", "met", "proposal_drafted",
+        "verbal_yes", "active_customer", "lost",
+    )
+    contacts = []
+    for index in range(500):
+        contacts.append((
+            f"Benchmark Contact {index:03d}",
+            f"perf+{index}@tenant-{index % 100}.benchmark.test",
+            f"Benchmark Co {rng.randrange(100):03d}",
+            f"Role {rng.randrange(20)}",
+            f"${rng.randrange(1, 250)}K",
+            statuses[rng.randrange(len(statuses))],
+            "seeded-benchmark",
+            f"Fixture note {rng.randrange(10000)}",
+            f"group-{rng.randrange(25)}",
+            f"2026-01-{1 + rng.randrange(28):02d}",
+        ))
+
+    with crm.conn:
+        crm.conn.executemany(
+            """INSERT INTO contacts
+               (name, email, company, title, deal_size, status, source, notes,
+                tags, last_contacted)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            contacts,
+        )
+
+    contact_ids = [
+        row["id"] for row in crm.conn.execute(
+            "SELECT id FROM contacts ORDER BY id"
+        ).fetchall()
+    ]
+    activity_types = ("email", "call", "meeting", "note")
+    activity_start = datetime(2026, 1, 1)
+    activities = []
+    for index in range(2000):
+        # Leave the target without activity so intro_paths has to traverse to it.
+        contact_id = contact_ids[rng.randrange(499)]
+        activities.append((
+            contact_id,
+            activity_types[rng.randrange(len(activity_types))],
+            f"Seeded activity {index}",
+            (activity_start + timedelta(minutes=index)).isoformat(sep=" "),
+        ))
+
+    with crm.conn:
+        crm.conn.executemany(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, ?, ?, ?)""",
+            activities,
+        )
+        crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source)
+               VALUES (?, ?, ?, ?)""",
+            (
+                (
+                    "contact:benchmark contact 000", "knows",
+                    "contact:benchmark contact 498", "seeded-benchmark",
+                ),
+                (
+                    "contact:benchmark contact 498", "knows",
+                    "contact:benchmark contact 499", "seeded-benchmark",
+                ),
+            ),
+        )
+
+    fixture_counts = (
+        crm.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+        crm.conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0],
+    )
+    if fixture_counts != (500, 2000):
+        crm.close()
+        raise AssertionError(
+            f"performance fixture has {fixture_counts}, expected (500, 2000)"
+        )
+    return crm
+
+
+def benchmark_exit_code(fail_count):
+    """Return a failing process status whenever any benchmark check failed."""
+    return 1 if fail_count > 0 else 0
+
+
+def result_lines(pass_count, fail_count):
+    """Create the two machine-readable score lines from the same counter."""
+    total = pass_count + fail_count
+    return (
+        f"RESULTS: {pass_count}/{total} tests passed",
+        f"score: {pass_count}",
+    )
+
+
+def score_integrity_errors(pass_count, fail_count, results_line, score_line):
+    """Validate score output and exit semantics before publishing results."""
+    errors = []
+    try:
+        results_pass = int(results_line.split(": ", 1)[1].split("/", 1)[0])
+        score_pass = int(score_line.rsplit(" ", 1)[1])
+    except (IndexError, ValueError):
+        return ["score_integrity_unparseable_output"]
+    if results_pass != pass_count or score_pass != pass_count:
+        errors.append("score_integrity_pass_count_mismatch")
+    if benchmark_exit_code(0) != 0 or benchmark_exit_code(1) == 0:
+        errors.append("score_integrity_exit_semantics")
+    if (fail_count > 0) != (benchmark_exit_code(fail_count) != 0):
+        errors.append("score_integrity_current_exit_code")
+    return errors
 
 
 def make_imessage_fixture_db(handle_counts=()):
@@ -5022,6 +5152,237 @@ def run_benchmarks():
           "crm_tuned_cadence" in cadence_mcp_names
           and cadence_mcp_value == learned_cadence["verbal_yes"])
 
+    # ── 82. Benchmark Integrity — hot-operation regression gate (8 tests) ──
+
+    integrity_perf_crm = make_performance_fixture()
+    performance_operations = (
+        ("list_contacts", integrity_perf_crm.list_contacts),
+        (
+            "get_contact_email",
+            lambda: integrity_perf_crm.get_contact(
+                "perf+250@tenant-50.benchmark.test"
+            ),
+        ),
+        (
+            "get_contact_partial_name",
+            lambda: integrity_perf_crm.get_contact("Contact 250"),
+        ),
+        ("pipeline", integrity_perf_crm.pipeline),
+        ("next_actions_10", lambda: integrity_perf_crm.next_actions(10)),
+        ("forecast", integrity_perf_crm.forecast),
+        (
+            "intro_paths",
+            lambda: integrity_perf_crm.intro_paths(
+                "perf+499@tenant-99.benchmark.test"
+            ),
+        ),
+        ("export_full", integrity_perf_crm.export_full),
+    )
+    for operation_name, operation in performance_operations:
+        threshold_ms = PERFORMANCE_THRESHOLDS_MS[operation_name]
+        elapsed_ms = None
+        operation_error = None
+        try:
+            operation()  # Warm caches so this gate measures the hot path.
+            started = time.perf_counter()
+            operation()
+            elapsed_ms = (time.perf_counter() - started) * 1000
+        except Exception as exc:
+            operation_error = f"{type(exc).__name__}: {exc}"
+        PERFORMANCE_TIMINGS.append({
+            "name": operation_name,
+            "elapsed_ms": elapsed_ms,
+            "threshold_ms": threshold_ms,
+            "error": operation_error,
+        })
+        check(
+            f"perf_regression_{operation_name}",
+            operation_error is None and elapsed_ms <= threshold_ms,
+        )
+    integrity_perf_crm.close()
+
+    # ── 83. Benchmark Integrity — seeded CRUD properties (8 tests) ──
+
+    property_crm = CRM(os.path.join(tempfile.mkdtemp(), "integrity-property.db"))
+    property_rng = random.Random(PROPERTY_SEED)
+    property_invariants = {
+        "no_exception": True,
+        "add_returns_id": True,
+        "get_after_add_identity": True,
+        "add_roundtrip_fields": True,
+        "update_targeted_field": True,
+        "update_preserves_other_fields": True,
+        "archive_preserves_record": True,
+        "archive_visibility": True,
+    }
+    property_exceptions = []
+    unicode_names = (
+        "Zoë 東京", "Łukasz 🚀", "नमस्ते दोस्त", "Мария Иванова",
+        "李雷", "Renée O’Connor", "أمل الزهراني", "Δημήτρης Παπάς",
+    )
+    statuses = (
+        "prospect", "contacted", "met", "proposal_drafted",
+        "verbal_yes", "active_customer", "lost",
+    )
+    tracked_input_fields = (
+        "name", "email", "company", "title", "deal_size", "status",
+        "source", "notes", "tags",
+    )
+    update_fields = (
+        "name", "company", "title", "deal_size", "status", "source",
+        "notes", "tags", "last_contacted",
+    )
+    preserved_fields = (
+        "id", "email", "name", "company", "title", "deal_size", "status",
+        "source", "notes", "tags", "archived", "last_contacted", "created_at",
+    )
+
+    for index in range(200):
+        base_name = property_rng.choice(unicode_names)
+        name = f"{base_name} {index:03d}"
+        if index % 41 == 0:
+            name += " " + ("界" * 512)
+
+        odd_token = f"{property_rng.getrandbits(32):08x}"
+        email_shapes = (
+            f"prop.{index}+{odd_token}@sub-{index % 17}.example.test",
+            f"odd_%{index}-{odd_token}@x{index % 19}.example.test",
+            f"UPPER+{index}.{odd_token}@Case-{index % 13}.Example.TEST",
+        )
+        email = None if index % 11 == 0 else email_shapes[index % len(email_shapes)]
+        contact_input = {
+            "name": name,
+            "email": email,
+            "company": "" if index % 4 == 0 else f"Café 会社 {property_rng.randrange(50)}",
+            "title": "" if index % 5 == 0 else f"R&D / 🛠️ {property_rng.randrange(30)}",
+            "deal_size": "" if index % 6 == 0 else f"${property_rng.randrange(1, 999)}K",
+            "status": property_rng.choice(statuses),
+            "source": "" if index % 7 == 0 else "seeded property pass",
+            "notes": (
+                "長" * 4096 if index % 37 == 0
+                else ("" if index % 3 == 0 else f"Odd note ☃ {odd_token}\nline two")
+            ),
+            "tags": "" if index % 8 == 0 else f"δelta,{property_rng.randrange(20)},🌍",
+        }
+
+        try:
+            contact_id = property_crm.add_contact(**contact_input)
+            property_invariants["add_returns_id"] &= (
+                isinstance(contact_id, int) and contact_id > 0
+            )
+
+            identifier = email if email is not None else name
+            stored = property_crm.get_contact(identifier)
+            property_invariants["get_after_add_identity"] &= bool(
+                stored and stored["id"] == contact_id
+            )
+            property_invariants["add_roundtrip_fields"] &= bool(
+                stored and all(
+                    stored[field] == contact_input[field]
+                    for field in tracked_input_fields
+                )
+            )
+
+            target_field = update_fields[index % len(update_fields)]
+            update_values = {
+                "name": f"更新 {base_name} {index:03d}",
+                "company": f"Updated 公司 {index}",
+                "title": f"Updated title 🧪 {index}",
+                "deal_size": f"${1000 + index}K",
+                "status": statuses[(statuses.index(contact_input["status"]) + 1) % len(statuses)],
+                "source": f"updated-source-{index}",
+                "notes": "更新-" + (("🧠" * 2048) if index % 31 == 0 else str(index)),
+                "tags": f"updated,βeta,{index}",
+                "last_contacted": f"2026-02-{1 + (index % 28):02d}",
+            }
+            target_value = update_values[target_field]
+            updated = property_crm.update_contact(
+                identifier, **{target_field: target_value}
+            )
+            post_identifier = (
+                email if email is not None
+                else (target_value if target_field == "name" else name)
+            )
+            after_update = property_crm.get_contact(post_identifier)
+            property_invariants["update_targeted_field"] &= bool(
+                updated and after_update
+                and updated[target_field] == target_value
+                and after_update[target_field] == target_value
+            )
+            property_invariants["update_preserves_other_fields"] &= bool(
+                stored and after_update and all(
+                    stored[field] == after_update[field]
+                    for field in preserved_fields if field != target_field
+                )
+            )
+
+            archived = property_crm.archive_contact(post_identifier)
+            archived_record = property_crm.get_contact(post_identifier)
+            property_invariants["archive_preserves_record"] &= bool(
+                archived is True and archived_record
+                and archived_record["id"] == contact_id
+                and archived_record["archived"] == 1
+                and all(
+                    archived_record[field] == after_update[field]
+                    for field in preserved_fields
+                    if field not in {"archived"}
+                )
+            )
+            visible_ids = {
+                row["id"] for row in property_crm.list_contacts()
+            }
+            all_ids = {
+                row["id"] for row in property_crm.list_contacts(
+                    include_archived=True
+                )
+            }
+            property_invariants["archive_visibility"] &= (
+                contact_id not in visible_ids and contact_id in all_ids
+            )
+        except Exception as exc:
+            property_invariants["no_exception"] = False
+            for invariant_name in property_invariants:
+                if invariant_name != "no_exception":
+                    property_invariants[invariant_name] = False
+            if len(property_exceptions) < 3:
+                property_exceptions.append(
+                    f"case {index}: {type(exc).__name__}: {exc}"
+                )
+
+    exception_detail = (
+        f" ({'; '.join(property_exceptions)})" if property_exceptions else ""
+    )
+    check(
+        f"property_crud_no_exception{exception_detail}",
+        property_invariants["no_exception"],
+    )
+    check("property_crud_add_returns_id", property_invariants["add_returns_id"])
+    check(
+        "property_crud_get_after_add_identity",
+        property_invariants["get_after_add_identity"],
+    )
+    check(
+        "property_crud_add_roundtrip_fields",
+        property_invariants["add_roundtrip_fields"],
+    )
+    check(
+        "property_crud_update_targeted_field",
+        property_invariants["update_targeted_field"],
+    )
+    check(
+        "property_crud_update_preserves_other_fields",
+        property_invariants["update_preserves_other_fields"],
+    )
+    check(
+        "property_crud_archive_preserves_record",
+        property_invariants["archive_preserves_record"],
+    )
+    check(
+        "property_crud_archive_visibility",
+        property_invariants["archive_visibility"],
+    )
+    property_crm.close()
+
     cadence_crm.close()
 
     ingest_crm.close()
@@ -5039,7 +5400,9 @@ def run_benchmarks():
         pass
 
 
-if __name__ == "__main__":
+def main():
+    global FAIL
+
     try:
         run_benchmarks()
     except Exception as e:
@@ -5047,9 +5410,43 @@ if __name__ == "__main__":
         FAIL += 1
         ERRORS.append(f"CRASH: {e}")
 
-    total = PASS + FAIL
+    results_line, score_line = result_lines(PASS, FAIL)
+    integrity_errors = score_integrity_errors(
+        PASS, FAIL, results_line, score_line
+    )
+    if integrity_errors:
+        FAIL += len(integrity_errors)
+        ERRORS.extend(integrity_errors)
+        results_line, score_line = result_lines(PASS, FAIL)
+
     print(f"\n{'=' * 40}")
-    print(f"RESULTS: {PASS}/{total} tests passed")
+    print(
+        "PERFORMANCE TIMINGS "
+        f"(seed={PERFORMANCE_SEED}, 500 contacts / 2000 activities):"
+    )
+    if PERFORMANCE_TIMINGS:
+        for timing in PERFORMANCE_TIMINGS:
+            if timing["elapsed_ms"] is None:
+                elapsed = "ERROR"
+                status = timing["error"]
+            else:
+                elapsed = f"{timing['elapsed_ms']:.3f} ms"
+                status = (
+                    "PASS" if timing["elapsed_ms"] <= timing["threshold_ms"]
+                    else "FAIL"
+                )
+            print(
+                f"  {timing['name']:<26} {elapsed:>12}  "
+                f"limit {timing['threshold_ms']:.3f} ms  {status}"
+            )
+    else:
+        print("  not run")
+    print(results_line)
     if ERRORS:
         print(f"FAILURES: {', '.join(ERRORS[:10])}")
-    print(f"score: {PASS}")
+    print(score_line)
+    return benchmark_exit_code(FAIL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
