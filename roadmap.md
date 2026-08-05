@@ -99,3 +99,14 @@ deals. The daily queue learns from being used.
 
 One and Two first (they compound: forecast feeds the action queue). Then Six —
 it makes the data loop self-referential. Then Three, Four, Five, Seven, Eight.
+
+## Wave three — self-proposed
+
+### [x] Thirteen. Benchmark find_intros capability
+Add focused benchmark cases for `CRM.find_intros()`; proposed by `propose_ticks()` and now covered.
+
+### [x] Fourteen. Benchmark network_summary capability
+Add focused benchmark cases for `CRM.network_summary()`; proposed by `propose_ticks()` and now covered.
+
+### [x] Fifteen. Benchmark unified_search capability
+Add focused benchmark cases for `CRM.unified_search()`; proposed by `propose_ticks()` and now covered.

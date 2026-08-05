@@ -6134,6 +6134,214 @@ def run_benchmarks():
     )
     proposal_crm.close()
 
+    # ── 86. find_intros — self-proposed coverage (4 tests) ──
+
+    find_intros_crm = CRM(os.path.join(tempfile.mkdtemp(), "find-intros.db"))
+    find_intros_crm.add_contact(
+        "Alex Acme", email="alex@acme.test", company="Acme"
+    )
+    find_intros_crm.add_contact(
+        "Taylor Target", email="taylor@acme.test", company="Acme"
+    )
+    find_intros_crm.add_contact(
+        "Blair Bridge", email="blair@bridge.test", company="Bridge Co"
+    )
+    with find_intros_crm.conn:
+        find_intros_crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ("contact:alex acme", "imessage_total", "140", "imessage",
+                 "2026-03-05 09:00:00"),
+                ("contact:alex acme", "message_intensity", "high", "imessage",
+                 "2026-03-05 09:00:01"),
+                ("contact:blair bridge", "imessage_total", "75", "imessage",
+                 "2026-03-05 09:00:02"),
+                ("contact:blair bridge", "message_intensity", "medium", "imessage",
+                 "2026-03-05 09:00:03"),
+                ("contact:blair bridge", "knows", "contact:taylor target", "fixture",
+                 "2026-03-05 09:00:04"),
+            ),
+        )
+    intro_matches = find_intros_crm.find_intros("Acme")
+    intro_by_connector = {item["connector"]: item for item in intro_matches}
+
+    # 86a. Direct and graph-backed paths are both returned from seeded data.
+    check(
+        "find_intros_known_paths",
+        [item["connector"] for item in intro_matches]
+        == ["Alex Acme", "Blair Bridge", "Taylor Target"],
+    )
+
+    # 86b. A strong employee relationship carries its measured warmth details.
+    check(
+        "find_intros_direct_warm_path",
+        intro_by_connector["Alex Acme"]["connection_to_target"] == "Works at Acme"
+        and intro_by_connector["Alex Acme"]["relationship_to_you"]
+        == {"imessage_total": 140, "intensity": "high"}
+        and intro_by_connector["Alex Acme"]["warmth_score"] == 90,
+    )
+
+    # 86c. A warm referrer to a target employee is exposed as a second path.
+    check(
+        "find_intros_graph_warm_path",
+        intro_by_connector["Blair Bridge"]["connection_to_target"]
+        == "Connected to Taylor Target"
+        and intro_by_connector["Blair Bridge"]["warmth_score"] == 65,
+    )
+
+    # 86d. An unrelated target has no fabricated intro paths.
+    check(
+        "find_intros_empty_case",
+        find_intros_crm.find_intros("Nobody Incorporated") == [],
+    )
+    find_intros_crm.close()
+
+    # ── 87. network_summary — self-proposed coverage (4 tests) ──
+
+    network_crm = CRM(os.path.join(tempfile.mkdtemp(), "network-summary.db"))
+    network_crm.add_contact(
+        "Nora North", email="nora@acme.test", company="Acme-Labs",
+        deal_size="$10K",
+    )
+    network_crm.add_contact(
+        "Owen Orbit", email="owen@openai.test", company="OpenAI",
+        deal_size="$15K",
+    )
+    network_crm.add_contact("Pam Pine", email="pam@independent.test")
+    with network_crm.conn:
+        network_crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ("phone:+15550001", "name", "Nora North", "macos_contacts",
+                 "2026-03-01 09:00:00"),
+                ("phone:+15550001", "imessage_total", "42", "imessage",
+                 "2026-03-01 09:00:01"),
+                ("phone:+15550002", "imessage_total", "25", "imessage",
+                 "2026-03-01 09:00:02"),
+                ("contact:owen orbit", "imessage_total", "30", "imessage",
+                 "2026-03-01 09:00:03"),
+                ("contact:pam pine", "company", "Acme Labs", "macos_contacts",
+                 "2026-03-01 09:00:04"),
+                ("company:beta-corp", "meeting_count", "2", "macos_calendar",
+                 "2026-03-01 09:00:05"),
+                ("contact:nora north", "mail_total", "7", "macos_mail",
+                 "2026-03-01 09:00:06"),
+                ("company:beta-corp", "stage", "target", "manual",
+                 "2026-03-01 09:00:07"),
+            ),
+        )
+    network = network_crm.network_summary()
+
+    # 87a. Fixture totals are 3 contacts, 6 entities, and 8 facts.
+    check(
+        "network_summary_totals",
+        network["total_contacts"] == 3
+        and network["total_graph_entities"] == 6
+        and network["total_facts"] == 8,
+    )
+
+    # 87b. Source counts match the seven fixture facts from supported ingestors.
+    check(
+        "network_summary_sources",
+        network["sources"] == {
+            "macos_contacts": 2,
+            "imessage": 3,
+            "macos_calendar": 1,
+            "macos_mail": 1,
+        },
+    )
+
+    # 87c. Message leaders are numeric-descending and one of two phones resolves.
+    check(
+        "network_summary_top_contacts",
+        network["top_contacts"] == [
+            {"name": "Nora North", "messages": 42},
+            {"name": "Owen Orbit", "messages": 30},
+            {"name": "+15550002", "messages": 25},
+        ]
+        and network["resolution_rate"] == 50.0,
+    )
+
+    # 87d. Company normalization deduplicates names and deal sizes sum to $25K.
+    check(
+        "network_summary_companies_pipeline",
+        network["companies"] == ["Acme Labs", "Beta Corp", "Openai"]
+        and network["pipeline_value"] == 25_000,
+    )
+    network_crm.close()
+
+    # ── 88. unified_search — self-proposed coverage (4 tests) ──
+
+    unified_crm = CRM(os.path.join(tempfile.mkdtemp(), "unified-search.db"))
+    uma_id = unified_crm.add_contact(
+        "Uma Vale", email="uma@example.test", notes="Aurora migration"
+    )
+    victor_id = unified_crm.add_contact(
+        "Victor Vale", email="victor@example.test", company="Aurora Labs"
+    )
+    unified_crm.add_contact("Quiet Quinn", email="quiet@example.test")
+    unified_crm.update_contact("uma@example.test", last_contacted="2026-03-03")
+    unified_crm.update_contact("victor@example.test", last_contacted="2026-03-02")
+    with unified_crm.conn:
+        unified_crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ("company:aurora-labs", "launch", "Green", "fixture-source",
+                 "2026-03-05 09:00:00"),
+                ("contact:uma vale", "initiative", "Aurora migration", "fixture-source",
+                 "2026-03-04 09:00:00"),
+                ("contact:victor vale", "project", "Northstar", "aurora-research",
+                 "2026-03-03 09:00:00"),
+            ),
+        )
+        unified_crm.conn.executemany(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                (uma_id, "meeting", "Aurora kickoff", "2026-03-06 09:00:00"),
+                (victor_id, "email", "Aurora follow-up", "2026-03-05 09:00:00"),
+            ),
+        )
+    unified_matches = unified_crm.unified_search("aurora")
+
+    # 88a. Contact fields are searched and sorted by last-contacted descending.
+    check(
+        "unified_search_contacts",
+        set(unified_matches) == {"contacts", "facts", "activities"}
+        and [row["name"] for row in unified_matches["contacts"]]
+        == ["Uma Vale", "Victor Vale"],
+    )
+
+    # 88b. Entity, value, and source matches retain observed-at ordering.
+    check(
+        "unified_search_facts",
+        [row["entity"] for row in unified_matches["facts"]] == [
+            "company:aurora-labs", "contact:uma vale", "contact:victor vale",
+        ],
+    )
+
+    # 88c. Activity summaries are searched and newest activity appears first.
+    check(
+        "unified_search_activities",
+        [row["contact_name"] for row in unified_matches["activities"]]
+        == ["Uma Vale", "Victor Vale"]
+        and [row["summary"] for row in unified_matches["activities"]]
+        == ["Aurora kickoff", "Aurora follow-up"],
+    )
+
+    # 88d. Repeated reads are stable and an absent token yields empty sections.
+    no_unified_matches = unified_crm.unified_search("no-such-token-9f3")
+    check(
+        "unified_search_deterministic_no_match",
+        unified_crm.unified_search("aurora") == unified_matches
+        and no_unified_matches
+        == {"contacts": [], "facts": [], "activities": []},
+    )
+    unified_crm.close()
+
     cadence_crm.close()
 
     ingest_crm.close()
