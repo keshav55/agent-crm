@@ -53,7 +53,7 @@ experiments worked. Store proposal → result → verdict in the facts table and
 have the next `evolve()` run read its own track record first. This is the tick
 that makes the data loop actually recursive.
 
-### Seven. Cadence auto-tuning
+### [x] Seven. Cadence auto-tuning
 Feed `optimal_cadence()` output back into reminder defaults per status, so the
 system's own analysis changes its own behavior.
 

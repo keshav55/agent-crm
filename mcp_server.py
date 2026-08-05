@@ -463,7 +463,7 @@ TOOLS = [
     },
     {
         "name": "crm_set_reminder",
-        "description": "Schedule a follow-up reminder for a contact",
+        "description": "Schedule a follow-up reminder; omit due_date to use tuned status cadence",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -471,7 +471,7 @@ TOOLS = [
                 "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)"},
                 "note": {"type": "string", "description": "Reminder note"},
             },
-            "required": ["identifier", "due_date", "note"],
+            "required": ["identifier", "note"],
         },
     },
     {
@@ -599,6 +599,16 @@ TOOLS = [
         "name": "crm_optimal_cadence",
         "description": "Data-driven follow-up timing from actual conversion data",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_tuned_cadence",
+        "description": "Get the per-status follow-up intervals currently used by the CRM",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Optional contact status"},
+            },
+        },
     },
     {
         "name": "crm_dead_pipeline",
@@ -864,7 +874,9 @@ def handle_tool_call(name, arguments):
             return result if result else f"Not found: {arguments['identifier']}"
 
         elif name == "crm_set_reminder":
-            rid = crm.set_reminder(arguments["identifier"], arguments["due_date"], arguments["note"])
+            rid = crm.set_reminder(
+                arguments["identifier"], arguments.get("due_date"), arguments["note"]
+            )
             return f"Reminder set (id={rid})" if rid else f"Not found: {arguments['identifier']}"
 
         elif name == "crm_due_reminders":
@@ -924,6 +936,11 @@ def handle_tool_call(name, arguments):
 
         elif name == "crm_optimal_cadence":
             return json.dumps(crm.optimal_cadence(), default=str, indent=2)
+
+        elif name == "crm_tuned_cadence":
+            return json.dumps(
+                crm.tuned_cadence(arguments.get("status")), default=str, indent=2
+            )
 
         elif name == "crm_dead_pipeline":
             return json.dumps(crm.dead_pipeline(stale_days=arguments.get("stale_days", 60)), default=str, indent=2)

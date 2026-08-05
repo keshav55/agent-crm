@@ -123,12 +123,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_dedup ON facts(entity, key, value, s
 
 
 class CRM:
+    CADENCE_DEFAULTS = {
+        "prospect": 14,
+        "contacted": 7,
+        "met": 5,
+        "proposal_drafted": 3,
+        "verbal_yes": 2,
+        "active_customer": 30,
+    }
+    CADENCE_BASE_DAYS = 7
+
     def __init__(self, db_path=DEFAULT_DB):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
+        self._tuned_cadence_cache = None
+        self._tuned_cadence_activity_count = None
 
     def close(self):
         self.conn.close()
@@ -449,15 +461,20 @@ class CRM:
 
     # --- Reminders ---
 
-    def set_reminder(self, identifier, due_date, note):
+    def set_reminder(self, identifier, due_date=None, note=None):
         """Schedule a follow-up reminder for a contact.
 
-        due_date: YYYY-MM-DD string or date object.
+        due_date: YYYY-MM-DD string or date object. When omitted, the contact's
+        tuned status cadence determines the due date.
         Returns the reminder id.
         """
         contact = self.get_contact(identifier)
         if not contact:
             return None
+        if not due_date:
+            due_date = date.today() + timedelta(
+                days=self.tuned_cadence(contact.get("status"))
+            )
         if isinstance(due_date, date):
             due_date = due_date.isoformat()
         self.conn.execute(
@@ -726,7 +743,7 @@ class CRM:
         pipeline = self.pipeline()
         actions = self.next_actions(limit=5)
         hc = self.health_check()
-        stale = self.stale_contacts(days=14)
+        stale = self.stale_contacts()
         gs = self.graph_stats()
 
         return {
@@ -918,12 +935,11 @@ class CRM:
         recent = self.conn.execute(
             "SELECT COUNT(*) FROM contacts WHERE archived = 0 AND last_contacted >= date('now', '-7 days')"
         ).fetchone()[0]
-        stale = self.conn.execute(
-            "SELECT COUNT(*) FROM contacts WHERE archived = 0 AND last_contacted < date('now', '-14 days') AND status NOT IN ('active_customer', 'churned', 'lost')"
-        ).fetchone()[0]
+        stale = len(self.stale_contacts())
         return {
             "total_contacts": total,
             "contacted_last_7d": recent,
+            # Kept for API compatibility; the count now uses per-status tuned cadence.
             "stale_14d": stale,
             "by_status": [dict(r) for r in by_status],
         }
@@ -938,7 +954,7 @@ class CRM:
             lines.append(f"| {c['name']} | {c['company'] or '-'} | {c['status']} | {c['deal_size'] or '-'} | {c['last_contacted'] or 'never'} |")
         lines.append("")
         stats = self.stats()
-        lines.append(f"**Total:** {stats['total_contacts']} · **Active last 7d:** {stats['contacted_last_7d']} · **Stale (14d+):** {stats['stale_14d']}")
+        lines.append(f"**Total:** {stats['total_contacts']} · **Active last 7d:** {stats['contacted_last_7d']} · **Stale (tuned):** {stats['stale_14d']}")
         return "\n".join(lines)
 
     # --- Import/Export ---
@@ -1985,14 +2001,15 @@ class CRM:
                     pass
 
             entry = {"name": c["name"], "email": c.get("email"), "score": sc, "status": c.get("status")}
+            cadence_days = self.tuned_cadence(c.get("status"))
 
-            if sc < 30 or (days_stale is not None and days_stale > 14):
+            if sc < 30 or (days_stale is not None and days_stale > cadence_days * 2):
                 cold.append(entry)
                 if days_stale is not None:
                     actions.append(f"Re-engage {c['name']} (last contacted {days_stale} days ago)")
                 else:
                     actions.append(f"Initiate contact with {c['name']} (never contacted)")
-            elif sc <= 60 or (days_stale is not None and days_stale > 7):
+            elif sc <= 60 or (days_stale is not None and days_stale > cadence_days):
                 at_risk.append(entry)
                 if days_stale is not None:
                     actions.append(f"Follow up with {c['name']} (last contacted {days_stale} days ago)")
@@ -2064,7 +2081,7 @@ class CRM:
             }
         return funnel
 
-    def _deal_probability_for_contact(self, contact, cadence, history, activity_rows=None):
+    def _deal_probability_for_contact(self, contact, history, activity_rows=None):
         """Score one open contact using precomputed CRM-wide patterns."""
         status = contact.get("status") or "prospect"
         stage_score = self.STAGE_PROBABILITIES.get(status, 0.10)
@@ -2088,13 +2105,7 @@ class CRM:
             except (ValueError, TypeError):
                 pass
 
-        winning_cadence = cadence.get("won_deals", {})
-        cadence_days = (winning_cadence.get("avg_gap_days")
-                        or winning_cadence.get("median_gap_days") or 7)
-        try:
-            cadence_days = max(float(cadence_days), 1.0)
-        except (ValueError, TypeError):
-            cadence_days = 7.0
+        cadence_days = float(self.tuned_cadence(status))
 
         days_since_activity = None
         recency_score = 0.0
@@ -2155,7 +2166,7 @@ class CRM:
                 or contact.get("status") in ("active_customer", "lost", "churned")):
             return None
         return self._deal_probability_for_contact(
-            contact, self.optimal_cadence(), self.win_loss_analysis()
+            contact, self.win_loss_analysis()
         )
 
     def forecast(self, limit=None):
@@ -2165,7 +2176,6 @@ class CRM:
         for callers that use ``weighted_pipeline`` and ``by_stage``.
         """
         contacts = self.list_contacts()
-        cadence = self.optimal_cadence()
         history = self.win_loss_analysis()
         activity_by_contact = {}
         for row in self.conn.execute(
@@ -2178,7 +2188,7 @@ class CRM:
             if contact.get("status") in ("active_customer", "lost", "churned"):
                 continue
             scored = self._deal_probability_for_contact(
-                contact, cadence, history, activity_by_contact.get(contact["id"], [])
+                contact, history, activity_by_contact.get(contact["id"], [])
             )
             deal_value = self._parse_deal_size(contact.get("deal_size"))
             ranked.append({
@@ -2277,24 +2287,28 @@ class CRM:
                     })
         return dupes
 
-    def stale_contacts(self, days=14):
-        """Contacts not contacted in N days, sorted by deal size (biggest first). Excludes terminal statuses.
+    def stale_contacts(self, days=None):
+        """Contacts past their follow-up cadence, sorted by deal size.
 
         Cross-references the knowledge graph: if a contact has recent facts
         (e.g. iMessage activity, calendar events) observed within the window,
-        they are NOT considered stale even if last_contacted is old.
+        they are NOT considered stale even if last_contacted is old. Passing
+        ``days`` explicitly overrides tuned cadence for all contacts.
         """
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
         rows = self.conn.execute(
             """SELECT * FROM contacts
-               WHERE status NOT IN ('active_customer', 'churned', 'lost')
-               AND (last_contacted IS NULL OR last_contacted < ?)
+               WHERE archived = 0
+               AND status NOT IN ('active_customer', 'churned', 'lost')
                ORDER BY last_contacted ASC NULLS FIRST""",
-            (cutoff,)
         ).fetchall()
         contacts = []
         for r in rows:
             c = dict(r)
+            cadence_days = self.tuned_cadence(c.get("status")) if days is None else max(int(days), 0)
+            cutoff = (date.today() - timedelta(days=cadence_days)).isoformat()
+            last_contacted = c.get("last_contacted")
+            if last_contacted and str(last_contacted)[:10] >= cutoff:
+                continue
             # Check knowledge graph for recent activity on this contact
             entity_keys = self._contact_entity_keys(c)
             placeholders = ",".join("?" * len(entity_keys))
@@ -2567,7 +2581,7 @@ class CRM:
         lines.append(f"- **MRR:** ${rev['mrr']:,.0f}")
         lines.append(f"- **Pipeline:** ${rev['pipeline_value']:,.0f}")
         lines.append(f"- **Active (7d):** {stats['contacted_last_7d']}")
-        lines.append(f"- **Stale (14d+):** {stats['stale_14d']}")
+        lines.append(f"- **Stale (tuned):** {stats['stale_14d']}")
 
         # Health summary
         hc = self.health_check()
@@ -2907,7 +2921,7 @@ class CRM:
                 count += 1
         return count
 
-    def touch_plan(self, identifier, cadence_days=7):
+    def touch_plan(self, identifier, cadence_days=None):
         """Auto-generate a follow-up schedule based on contact status and deal value.
 
         Returns a dict with suggested next_touch date, frequency, and channel.
@@ -2921,27 +2935,16 @@ class CRM:
         lc = contact.get("last_contacted")
         today = date.today()
 
-        # Determine cadence based on status and deal value
+        # Tuned status cadence owns timing; deal value only influences channel.
+        freq = (max(int(cadence_days), 1) if cadence_days is not None
+                else self.tuned_cadence(status))
         if status in ("verbal_yes", "proposal_drafted"):
-            freq = 3  # high urgency
             channel = "call"
         elif status == "active_customer":
-            freq = 30  # monthly check-in
             channel = "email"
         elif deal_val > 50000:
-            freq = 5  # high value = frequent
             channel = "call"
-        elif deal_val > 10000:
-            freq = 7
-            channel = "email"
-        elif status == "met":
-            freq = 7
-            channel = "email"
-        elif status == "contacted":
-            freq = 10
-            channel = "email"
         else:
-            freq = cadence_days
             channel = "email"
 
         # Calculate next touch
@@ -3920,6 +3923,14 @@ class CRM:
         eff = self.outreach_effectiveness()
         attr = self.source_attribution()
         stale = self.stale_contacts()
+        cadence = {
+            row["status"]: {
+                "tuned_days": row["interval_days"],
+                "default_days": row["default_days"],
+                "source": row["source"],
+            }
+            for row in self._tuned_cadence_rows()
+        }
 
         # Identify the biggest bottleneck
         bottleneck = None
@@ -4022,6 +4033,7 @@ class CRM:
             },
             "proposal": proposal,
             "experiment_id": experiment_id,
+            "cadence": cadence,
         }
 
     def experiments(self, status=None):
@@ -4198,6 +4210,61 @@ class CRM:
             result["recommendation"] = "Not enough data yet. Close more deals to calibrate."
 
         return result
+
+    def _tuned_cadence_snapshot(self):
+        """Return cached cadence values and their calibration metadata."""
+        activity_count = self.conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
+        if (self._tuned_cadence_cache is not None
+                and self._tuned_cadence_activity_count == activity_count):
+            return self._tuned_cadence_cache
+
+        winning = self.optimal_cadence().get("won_deals", {})
+        sample_size = winning.get("sample_size") or 0
+        winning_gap = winning.get("avg_gap_days") or winning.get("median_gap_days") or 0
+        try:
+            winning_gap = float(winning_gap)
+        except (TypeError, ValueError):
+            winning_gap = 0.0
+        learned = bool(sample_size and winning_gap > 0)
+
+        intervals = {}
+        for status, default_days in self.CADENCE_DEFAULTS.items():
+            if learned:
+                scaled_days = winning_gap * default_days / self.CADENCE_BASE_DAYS
+                intervals[status] = max(1, int(scaled_days + 0.5))
+            else:
+                intervals[status] = default_days
+
+        self._tuned_cadence_cache = {
+            "intervals": intervals,
+            "source": "learned" if learned else "default",
+            "winning_gap_days": winning_gap if learned else None,
+        }
+        self._tuned_cadence_activity_count = activity_count
+        return self._tuned_cadence_cache
+
+    def tuned_cadence(self, status=None):
+        """Return tuned follow-up interval days for one status or every status.
+
+        Winning activity gaps calibrate the contacted-stage base. Stage-shaped
+        static defaults supply both the relative tightening/loosening and the
+        fallback when no winning gaps have been observed yet.
+        """
+        cadence_snapshot = self._tuned_cadence_snapshot()
+        intervals = cadence_snapshot["intervals"]
+        if status is None:
+            return dict(intervals)
+        status_key = str(status).strip().lower().replace("-", "_").replace(" ", "_")
+        return intervals.get(status_key, self.CADENCE_BASE_DAYS)
+
+    def _tuned_cadence_rows(self):
+        cadence_snapshot = self._tuned_cadence_snapshot()
+        return [{
+            "status": status,
+            "interval_days": cadence_snapshot["intervals"][status],
+            "default_days": default_days,
+            "source": cadence_snapshot["source"],
+        } for status, default_days in self.CADENCE_DEFAULTS.items()]
 
     def import_json(self, path):
         """Import contacts from a JSON file. Format: list of dicts or {contacts: [...]}.
@@ -4652,15 +4719,8 @@ class CRM:
                  "days_overdue": days_overdue},
             )
 
-        cadence = self.optimal_cadence()
-        winning = cadence.get("won_deals", {})
-        cadence_days = winning.get("avg_gap_days") or winning.get("median_gap_days") or 7
-        try:
-            cadence_days = max(int(round(float(cadence_days))), 1)
-        except (TypeError, ValueError):
-            cadence_days = 7
-
         for contact in contacts:
+            cadence_days = self.tuned_cadence(contact.get("status"))
             last_contacted = contact.get("last_contacted")
             days_since = None
             if last_contacted:
@@ -4674,11 +4734,11 @@ class CRM:
                 continue
 
             if days_since is None:
-                reason = f"Never contacted; winning cadence is every {cadence_days} days"
+                reason = f"Never contacted; tuned cadence is every {cadence_days} days"
                 score = 50
             else:
                 overdue_days = days_since - cadence_days
-                reason = (f"Last touch was {days_since} days ago; winning cadence is "
+                reason = (f"Last touch was {days_since} days ago; tuned cadence is "
                           f"every {cadence_days} days")
                 score = min(45 + (overdue_days / cadence_days) * 15, 70)
             status = contact.get("status")
@@ -4764,12 +4824,14 @@ class CRM:
 
         for forecast_row in self.forecast()["contacts"]:
             probability = forecast_row["probability"]
+            forecast_cadence_days = self.tuned_cadence(forecast_row["status"])
             recency = next(
                 (signal.get("value") for signal in forecast_row["signals"]
                  if signal.get("name") == "activity_recency"),
                 None,
             )
-            if probability < 0.40 or (recency is not None and recency <= cadence_days):
+            if (probability < 0.40
+                    or (recency is not None and recency <= forecast_cadence_days)):
                 continue
             contact = contacts_by_id.get(forecast_row["contact"]["id"])
             if not contact:
@@ -4784,7 +4846,8 @@ class CRM:
                 action = "Follow up on proposal"
             else:
                 action = "Re-engage"
-            extra_staleness = 0 if recency is None else max(recency - cadence_days, 0)
+            extra_staleness = (0 if recency is None
+                               else max(recency - forecast_cadence_days, 0))
             add_signal(
                 contact, action, reason,
                 min(80 + probability * 15 + min(extra_staleness, 10) * 0.5, 105),
@@ -7197,8 +7260,9 @@ def main():
     # reminders
     p_remind = sub.add_parser("remind", help="Set a reminder for a contact")
     p_remind.add_argument("identifier")
-    p_remind.add_argument("date", help="Due date (YYYY-MM-DD or 'tomorrow', '+3d')")
-    p_remind.add_argument("note", help="Reminder note")
+    p_remind.add_argument("date", nargs="?",
+                          help="Due date (YYYY-MM-DD, 'tomorrow', '+3d'); omit for tuned cadence")
+    p_remind.add_argument("note", nargs="?", help="Reminder note")
 
     sub.add_parser("reminders", help="Show due and overdue reminders")
 
@@ -7314,7 +7378,8 @@ def main():
     sub.add_parser("duplicates", help="Find potential duplicate contacts")
 
     p_stalec = sub.add_parser("stale-contacts", help="Contacts not contacted in N days")
-    p_stalec.add_argument("--days", "-D", type=int, default=14)
+    p_stalec.add_argument("--days", "-D", type=int,
+                          help="Override per-status tuned cadence")
 
     # --- Agent Superpowers (Wave 3) CLI ---
     p_query = sub.add_parser("query", help="Natural language query")
@@ -7578,7 +7643,7 @@ def main():
         m = d["metrics"]
         print(f"\n  === CRM Dashboard ===\n")
         print(f"  Contacts: {m['total_contacts']}  |  MRR: ${m['mrr']:,.0f}  |  Pipeline: ${m['pipeline_value']:,.0f}")
-        print(f"  Active (7d): {m['active_last_7d']}  |  Stale (14d+): {m['stale_14d']}")
+        print(f"  Active (7d): {m['active_last_7d']}  |  Stale (tuned): {m['stale_14d']}")
         h = d["health"]
         print(f"  Health: {h['healthy']} healthy, {h['at_risk']} at risk, {h['cold']} cold")
         if d["top_actions"]:
@@ -7680,6 +7745,11 @@ def main():
         print(f"  Change: {p['change']}")
         print(f"  Measure: {p['measure']}")
         print(f"  Batch size: {p['batch_size']}")
+        cadence_summary = ", ".join(
+            f"{status} {values['tuned_days']}d/{values['default_days']}d"
+            for status, values in result["cadence"].items()
+        )
+        print(f"  Cadence (tuned/default): {cadence_summary}")
         print(f"  Experiment ID: {result['experiment_id']}\n")
 
     elif args.command == "experiments":
@@ -7740,12 +7810,10 @@ def main():
                 print(f"  {d['name']} ({d.get('company') or '-'}) — {d['trend']}: {d['recommendation']}")
 
     elif args.command == "cadence":
-        oc = crm.optimal_cadence()
-        w = oc["won_deals"]
-        l = oc["lost_deals"]
-        print(f"  Won deals: avg gap {w['avg_gap_days']}d, median {w['median_gap_days']}d ({w['sample_size']} gaps)")
-        print(f"  Lost deals: avg gap {l['avg_gap_days']}d, median {l['median_gap_days']}d ({l['sample_size']} gaps)")
-        print(f"\n  Recommendation: {oc['recommendation']}")
+        fmt_table(
+            crm._tuned_cadence_rows(),
+            ["status", "interval_days", "source", "default_days"],
+        )
 
     elif args.command == "quick-add":
         text = " ".join(args.text)
@@ -7800,9 +7868,17 @@ def main():
         print(f"  {'Deals':20} {c['new_deals']:>10} {p['new_deals']:>10} {ch['deals']:>10}")
 
     elif args.command == "remind":
-        # Parse date shortcuts
+        note = args.note
         raw_date = args.date
-        if raw_date == "tomorrow":
+        if note is None and raw_date is not None:
+            note = raw_date
+            raw_date = None
+        if not note:
+            p_remind.error("a reminder note is required")
+        # Parse date shortcuts
+        if raw_date is None:
+            due = None
+        elif raw_date == "tomorrow":
             due = (date.today() + timedelta(days=1)).isoformat()
         elif raw_date.startswith("+") and raw_date.endswith("d"):
             try:
@@ -7812,9 +7888,12 @@ def main():
                 due = raw_date
         else:
             due = raw_date
-        rid = crm.set_reminder(args.identifier, due, args.note)
+        rid = crm.set_reminder(args.identifier, due, note)
         if rid:
-            print(f"  Reminder set for {due}: {args.note} (id={rid})")
+            saved = crm.conn.execute(
+                "SELECT due_date FROM reminders WHERE id = ?", (rid,)
+            ).fetchone()
+            print(f"  Reminder set for {saved['due_date']}: {note} (id={rid})")
         else:
             print(f"  Not found: {args.identifier}")
 
@@ -7893,7 +7972,7 @@ def main():
         s = crm.stats()
         print(f"  Total contacts: {s['total_contacts']}")
         print(f"  Contacted (7d): {s['contacted_last_7d']}")
-        print(f"  Stale (14d+):   {s['stale_14d']}")
+        print(f"  Stale (tuned):   {s['stale_14d']}")
         print()
         for row in s["by_status"]:
             print(f"    {row['status']}: {row['n']}")
@@ -8089,7 +8168,8 @@ def main():
     elif args.command == "stale-contacts":
         stale = crm.stale_contacts(days=args.days)
         if not stale:
-            print(f"  No stale contacts (>{args.days} days)")
+            window = f">{args.days} days" if args.days is not None else "past tuned cadence"
+            print(f"  No stale contacts ({window})")
         else:
             fmt_table(stale, ["name", "company", "status", "deal_size", "last_contacted"])
 

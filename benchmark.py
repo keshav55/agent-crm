@@ -9,6 +9,7 @@ Each test = 1 point. Bonus points for performance thresholds.
 """
 
 import os
+import json
 import sqlite3
 import sys
 import time
@@ -4895,6 +4896,133 @@ def run_benchmarks():
         ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
     )
     check("ingest_reingest_idempotent", counts_after_reingest == counts_before_reingest)
+
+    # ── 81. Cadence Auto-Tuning (12 tests) ──
+
+    cadence_dir = tempfile.mkdtemp()
+    cadence_db = os.path.join(cadence_dir, "cadence.db")
+    cadence_crm = CRM(cadence_db)
+
+    # 81a. an empty CRM returns the complete static fallback schedule
+    static_cadence = cadence_crm.tuned_cadence()
+    check("tuned_cadence_defaults", static_cadence == CRM.CADENCE_DEFAULTS)
+
+    # 81b. status lookup returns the same scalar interval as the full schedule
+    check("tuned_cadence_status_lookup",
+          cadence_crm.tuned_cadence("proposal_drafted") == static_cadence["proposal_drafted"])
+
+    # One ten-day gap in won history becomes the learned contacted-stage base.
+    cadence_crm.add_contact("Cadence Winner", email="winner@cadence.test",
+                            status="active_customer")
+    cadence_winner_id = cadence_crm.get_contact("winner@cadence.test")["id"]
+    for days in (20, 10):
+        cadence_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) "
+            "VALUES (?, 'email', 'Winning cadence fixture', datetime('now', ?))",
+            (cadence_winner_id, f"-{days} days"),
+        )
+    cadence_crm.conn.commit()
+
+    # 81c. learned values scale from the winning gap and report their source
+    learned_cadence = cadence_crm.tuned_cadence()
+    learned_rows = cadence_crm._tuned_cadence_rows()
+    check("tuned_cadence_learned_values",
+          learned_cadence["contacted"] == 10 and learned_cadence["prospect"] == 20
+          and all(row["source"] == "learned" for row in learned_rows))
+
+    # 81d. late-stage follow-up remains tighter than top-of-funnel follow-up
+    check("tuned_cadence_stage_shape",
+          learned_cadence["verbal_yes"] < learned_cadence["proposal_drafted"]
+          < learned_cadence["prospect"])
+
+    cadence_crm.add_contact("Just Past", email="past@cadence.test", status="contacted")
+    cadence_crm.update_contact(
+        "past@cadence.test",
+        last_contacted=(_date.today() - timedelta(days=11)).isoformat(),
+    )
+    cadence_crm.add_contact("Still Inside", email="inside@cadence.test", status="contacted")
+    cadence_crm.update_contact(
+        "inside@cadence.test",
+        last_contacted=(_date.today() - timedelta(days=10)).isoformat(),
+    )
+    cadence_actions = {item["contact"]: item for item in cadence_crm.next_actions(limit=50)}
+
+    # 81e. a contact just past the tuned interval is cadence-overdue
+    check("next_actions_uses_tuned_boundary_past",
+          "cadence_overdue" in {signal["name"]
+                                 for signal in cadence_actions["Just Past"]["signals"]})
+
+    # 81f. a contact exactly inside the tuned interval is not cadence-overdue
+    check("next_actions_uses_tuned_boundary_inside",
+          "cadence_overdue" not in {signal["name"]
+                                     for signal in cadence_actions["Still Inside"]["signals"]})
+
+    # 81g. stale-contact detection uses the same per-status boundary
+    stale_cadence_names = {contact["name"] for contact in cadence_crm.stale_contacts()}
+    check("stale_contacts_use_tuned_cadence",
+          "Just Past" in stale_cadence_names and "Still Inside" not in stale_cadence_names)
+
+    # 81h. reminders without an explicit date use the contact's tuned status cadence
+    cadence_crm.add_contact("Verbal Val", email="val@cadence.test", status="verbal_yes")
+    cadence_reminder_id = cadence_crm.set_reminder(
+        "val@cadence.test", note="Send the contract"
+    )
+    cadence_due = cadence_crm.conn.execute(
+        "SELECT due_date FROM reminders WHERE id = ?", (cadence_reminder_id,)
+    ).fetchone()["due_date"]
+    check("reminder_default_uses_tuned_cadence",
+          cadence_due == (_date.today() + timedelta(
+              days=learned_cadence["verbal_yes"]
+          )).isoformat())
+
+    # 81i. adding activity invalidates a previously cached no-win result
+    cache_crm = CRM(os.path.join(tempfile.mkdtemp(), "cadence-cache.db"))
+    cache_crm.add_contact("Cache Winner", email="cache@cadence.test",
+                          status="active_customer")
+    cache_winner_id = cache_crm.get_contact("cache@cadence.test")["id"]
+    cache_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) "
+        "VALUES (?, 'email', 'First cache touch', datetime('now', '-8 days'))",
+        (cache_winner_id,),
+    )
+    cache_crm.conn.commit()
+    cached_default = cache_crm.tuned_cadence("contacted")
+    cache_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) "
+        "VALUES (?, 'email', 'Second cache touch', datetime('now'))",
+        (cache_winner_id,),
+    )
+    cache_crm.conn.commit()
+    check("tuned_cadence_cache_invalidates",
+          cached_default == CRM.CADENCE_DEFAULTS["contacted"]
+          and cache_crm.tuned_cadence("contacted") == 8)
+    cache_crm.close()
+
+    # 81j. unchanged activity history produces deterministic values
+    check("tuned_cadence_deterministic",
+          cadence_crm.tuned_cadence() == cadence_crm.tuned_cadence())
+
+    # 81k. evolve reports tuned and static values side by side
+    cadence_evolution = cadence_crm.evolve()
+    check("evolve_reports_tuned_cadence",
+          cadence_evolution["cadence"]["contacted"] == {
+              "tuned_days": 10, "default_days": 7, "source": "learned",
+          })
+
+    # 81l. MCP registers and serves the tuned-cadence tool
+    import mcp_server
+    original_cadence_mcp_db = mcp_server.DB_PATH
+    mcp_server.DB_PATH = cadence_db
+    cadence_mcp_names = {tool["name"] for tool in mcp_server.TOOLS}
+    cadence_mcp_value = json.loads(
+        mcp_server.handle_tool_call("crm_tuned_cadence", {"status": "verbal_yes"})
+    )
+    mcp_server.DB_PATH = original_cadence_mcp_db
+    check("tuned_cadence_mcp_tool",
+          "crm_tuned_cadence" in cadence_mcp_names
+          and cadence_mcp_value == learned_cadence["verbal_yes"])
+
+    cadence_crm.close()
 
     ingest_crm.close()
 
