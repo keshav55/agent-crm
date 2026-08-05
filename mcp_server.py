@@ -354,7 +354,7 @@ TOOLS = [
     },
     {
         "name": "crm_merge_contacts",
-        "description": "Merge two contacts into one. Combines activities, deals, and facts.",
+        "description": "Merge two contacts with a complete undo record. Combines activities, deals, reminders, custom fields, and facts.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -362,6 +362,40 @@ TOOLS = [
                 "merge": {"type": "string", "description": "Contact to absorb and delete"},
             },
             "required": ["keep", "merge"],
+        },
+    },
+    {
+        "name": "crm_doctor",
+        "description": "Report CRM integrity issues and optionally repair safe issues",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fix": {
+                    "type": "boolean",
+                    "description": "Repair safe issues such as orphan ownership and email normalization",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "crm_auto_merge",
+        "description": "Dry-run or apply deterministic duplicate merges above a confidence threshold",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threshold": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.9,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "List merges without changing data",
+                    "default": True,
+                },
+            },
         },
     },
     {
@@ -840,6 +874,23 @@ def handle_tool_call(name, arguments):
             if result:
                 return json.dumps(result, default=str, indent=2)
             return "One or both contacts not found"
+
+        elif name == "crm_doctor":
+            return json.dumps(
+                crm.doctor(fix=arguments.get("fix", False)),
+                default=str,
+                indent=2,
+            )
+
+        elif name == "crm_auto_merge":
+            return json.dumps(
+                crm.auto_merge(
+                    threshold=arguments.get("threshold", 0.9),
+                    dry_run=arguments.get("dry_run", True),
+                ),
+                default=str,
+                indent=2,
+            )
 
         elif name == "crm_unified_search":
             results = crm.unified_search(arguments["term"])

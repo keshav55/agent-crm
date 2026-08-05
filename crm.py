@@ -302,52 +302,313 @@ class CRM:
         self.conn.commit()
         return True
 
-    def merge_contacts(self, keep_identifier, merge_identifier):
-        """Merge two contacts into one. Keeps the first, absorbs the second.
+    def _contact_for_merge(self, identifier):
+        """Resolve a merge identifier, accepting an internal numeric id too."""
+        if isinstance(identifier, int) or (
+                isinstance(identifier, str) and identifier.isdigit()):
+            row = self.conn.execute(
+                "SELECT * FROM contacts WHERE id = ?", (int(identifier),)
+            ).fetchone()
+            return dict(row) if row else None
+        return self.get_contact(identifier)
 
-        Transfers all activities, deals, and facts from merge_identifier
-        to keep_identifier. Deletes the merged contact.
-        Returns the updated kept contact, or None if either not found.
+    def _next_merge_id(self):
+        """Return the next deterministic integer id for a merge audit fact."""
+        latest = 0
+        rows = self.conn.execute(
+            "SELECT DISTINCT entity FROM facts WHERE entity LIKE 'merge:%'"
+        ).fetchall()
+        for row in rows:
+            suffix = row["entity"].partition(":")[2]
+            if suffix.isdigit():
+                latest = max(latest, int(suffix))
+        return latest + 1
+
+    @staticmethod
+    def _insert_snapshot_row(conn, table, row):
+        """Insert a previously serialized SQLite row with its original id."""
+        columns = list(row)
+        placeholders = ", ".join("?" for _ in columns)
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(row[column] for column in columns),
+        )
+
+    def merge_contacts(self, keep_identifier, drop_identifier):
+        """Merge two contacts transactionally and retain a complete undo record.
+
+        Activity, deals, reminders, custom fields, and graph facts are moved to
+        the kept contact. Blank fields on the kept contact are filled from the
+        dropped contact, which is then deleted. The returned contact includes
+        ``merge_id`` for use with :meth:`undo_merge`.
         """
-        keep = self.get_contact(keep_identifier)
-        merge = self.get_contact(merge_identifier)
-        if not keep or not merge:
+        keep = self._contact_for_merge(keep_identifier)
+        drop = self._contact_for_merge(drop_identifier)
+        if not keep or not drop:
             return None
-        if keep["id"] == merge["id"]:
+        if keep["id"] == drop["id"]:
             return keep  # same contact
 
-        # Transfer activities
-        self.conn.execute(
-            "UPDATE activity SET contact_id = ? WHERE contact_id = ?",
-            (keep["id"], merge["id"])
-        )
-        # Transfer deals
-        self.conn.execute(
-            "UPDATE deals SET contact_id = ? WHERE contact_id = ?",
-            (keep["id"], merge["id"])
-        )
-        # Merge graph entities
-        keep_entity_keys = self._contact_entity_keys(keep)
-        merge_entity_keys = self._contact_entity_keys(merge)
-        primary_keep = f"contact:{keep['name'].lower()}"
-        for mek in merge_entity_keys:
-            if mek not in keep_entity_keys:
-                self.merge_entities(primary_keep, mek)
+        moved_ids = {}
+        for table in ("activity", "deals", "reminders", "custom_fields"):
+            moved_ids[table] = [
+                row["id"] for row in self.conn.execute(
+                    f"SELECT id FROM {table} WHERE contact_id = ? ORDER BY id",
+                    (drop["id"],),
+                ).fetchall()
+            ]
 
-        # Fill in missing fields from merged contact
-        fillable = {"company", "title", "deal_size", "source", "notes", "tags"}
-        updates = {}
-        for field in fillable:
-            if not keep.get(field) and merge.get(field):
-                updates[field] = merge[field]
-        if updates:
-            self.update_contact(keep_identifier, **updates)
+        custom_field_rows = [dict(row) for row in self.conn.execute(
+            """SELECT * FROM custom_fields
+               WHERE contact_id IN (?, ?) ORDER BY id""",
+            (keep["id"], drop["id"]),
+        ).fetchall()]
 
-        # Delete the merged contact
-        self.conn.execute("DELETE FROM contacts WHERE id = ?", (merge["id"],))
-        self.conn.commit()
+        entity_keys = sorted(set(
+            self._contact_entity_keys(keep) + self._contact_entity_keys(drop)
+        ))
+        placeholders = ", ".join("?" for _ in entity_keys)
+        fact_rows = [dict(row) for row in self.conn.execute(
+            f"SELECT rowid, * FROM facts WHERE entity IN ({placeholders}) ORDER BY rowid",
+            entity_keys,
+        ).fetchall()]
 
-        return self.get_contact(keep_identifier)
+        merge_id = self._next_merge_id()
+        moved_ids["facts"] = []
+        deleted_fact_ids = []
+        undo_payload = {
+            "version": 1,
+            "merge_id": merge_id,
+            "keep_contact": keep,
+            "drop_contact": drop,
+            "moved_row_ids": moved_ids,
+            "pre_merge": {
+                "contacts": {"keep": keep, "drop": drop},
+                "custom_fields": custom_field_rows,
+                "facts": fact_rows,
+            },
+        }
+
+        with self.conn:
+            for table in ("activity", "deals", "reminders"):
+                self.conn.execute(
+                    f"UPDATE {table} SET contact_id = ? WHERE contact_id = ?",
+                    (keep["id"], drop["id"]),
+                )
+
+            # Custom field names are unique per contact. Preserve the kept
+            # value on conflicts, except when it is blank and the drop value
+            # can safely fill it.
+            drop_fields = [
+                row for row in custom_field_rows
+                if row["contact_id"] == drop["id"]
+            ]
+            for field in drop_fields:
+                existing = self.conn.execute(
+                    """SELECT * FROM custom_fields
+                       WHERE contact_id = ? AND field_name = ?""",
+                    (keep["id"], field["field_name"]),
+                ).fetchone()
+                if existing:
+                    if not existing["field_value"] and field["field_value"]:
+                        self.conn.execute(
+                            """UPDATE custom_fields
+                               SET field_value = ?, updated_at = CURRENT_TIMESTAMP
+                               WHERE id = ?""",
+                            (field["field_value"], existing["id"]),
+                        )
+                    self.conn.execute(
+                        "DELETE FROM custom_fields WHERE id = ?", (field["id"],)
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE custom_fields SET contact_id = ? WHERE id = ?",
+                        (keep["id"], field["id"]),
+                    )
+
+            # Canonicalize every known name/email variant for both contacts to
+            # the kept contact's normalized-name entity. Resolve exact fact
+            # collisions deterministically by retaining the newest observation.
+            primary_keep = self._canonical_contact_entity(keep)
+            for fact in fact_rows:
+                if fact["entity"] == primary_keep:
+                    continue
+                collision = self.conn.execute(
+                    """SELECT rowid, observed_at FROM facts
+                       WHERE entity = ? AND key = ? AND value IS ? AND source IS ?
+                       ORDER BY rowid LIMIT 1""",
+                    (primary_keep, fact["key"], fact["value"], fact["source"]),
+                ).fetchone()
+                if collision:
+                    fact_time = fact["observed_at"] or ""
+                    collision_time = collision["observed_at"] or ""
+                    if (fact_time, fact["rowid"]) > (
+                            collision_time, collision["rowid"]):
+                        self.conn.execute(
+                            "DELETE FROM facts WHERE rowid = ?", (collision["rowid"],)
+                        )
+                        deleted_fact_ids.append(collision["rowid"])
+                        self.conn.execute(
+                            "UPDATE facts SET entity = ? WHERE rowid = ?",
+                            (primary_keep, fact["rowid"]),
+                        )
+                        moved_ids["facts"].append(fact["rowid"])
+                    else:
+                        self.conn.execute(
+                            "DELETE FROM facts WHERE rowid = ?", (fact["rowid"],)
+                        )
+                        deleted_fact_ids.append(fact["rowid"])
+                else:
+                    self.conn.execute(
+                        "UPDATE facts SET entity = ? WHERE rowid = ?",
+                        (primary_keep, fact["rowid"]),
+                    )
+                    moved_ids["facts"].append(fact["rowid"])
+
+            # Delete before copying a missing email so the UNIQUE constraint is
+            # never transiently violated.
+            self.conn.execute("DELETE FROM contacts WHERE id = ?", (drop["id"],))
+            fillable = (
+                "email", "company", "title", "deal_size", "source", "notes",
+                "tags", "last_contacted",
+            )
+            updates = {
+                field: drop[field]
+                for field in fillable
+                if not keep.get(field) and drop.get(field)
+            }
+            if updates:
+                assignments = ", ".join(f"{field} = ?" for field in updates)
+                self.conn.execute(
+                    f"""UPDATE contacts SET {assignments},
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    tuple(updates.values()) + (keep["id"],),
+                )
+
+            undo_payload["moved_row_ids"]["facts"] = sorted(
+                set(moved_ids["facts"])
+            )
+            undo_payload["deleted_fact_row_ids"] = sorted(set(deleted_fact_ids))
+            self.conn.execute(
+                """INSERT INTO facts (entity, key, value, source)
+                   VALUES (?, 'undo', ?, 'doctor')""",
+                (f"merge:{merge_id}", json.dumps(undo_payload, sort_keys=True)),
+            )
+
+        row = self.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (keep["id"],)
+        ).fetchone()
+        result = dict(row)
+        result["merge_id"] = merge_id
+        return result
+
+    def undo_merge(self, merge_id):
+        """Restore both contacts and row ownership from a merge audit fact."""
+        raw_id = str(merge_id)
+        if raw_id.startswith("merge:"):
+            raw_id = raw_id.partition(":")[2]
+        if not raw_id.isdigit():
+            return None
+        entity = f"merge:{int(raw_id)}"
+        undo_row = self.conn.execute(
+            """SELECT rowid, value FROM facts
+               WHERE entity = ? AND key = 'undo' AND source = 'doctor'
+               ORDER BY rowid DESC LIMIT 1""",
+            (entity,),
+        ).fetchone()
+        if not undo_row:
+            return None
+
+        payload = json.loads(undo_row["value"])
+        keep = payload["pre_merge"]["contacts"]["keep"]
+        drop = payload["pre_merge"]["contacts"]["drop"]
+        moved = payload["moved_row_ids"]
+
+        with self.conn:
+            current_keep = self.conn.execute(
+                "SELECT id FROM contacts WHERE id = ?", (keep["id"],)
+            ).fetchone()
+            if not current_keep:
+                self._insert_snapshot_row(self.conn, "contacts", keep)
+            else:
+                columns = [column for column in keep if column != "id"]
+                assignments = ", ".join(f"{column} = ?" for column in columns)
+                self.conn.execute(
+                    f"UPDATE contacts SET {assignments} WHERE id = ?",
+                    tuple(keep[column] for column in columns) + (keep["id"],),
+                )
+
+            existing_drop = self.conn.execute(
+                "SELECT id FROM contacts WHERE id = ?", (drop["id"],)
+            ).fetchone()
+            if existing_drop:
+                raise ValueError(
+                    f"Cannot undo merge {raw_id}: contact id {drop['id']} is in use"
+                )
+            self._insert_snapshot_row(self.conn, "contacts", drop)
+
+            for table in ("activity", "deals", "reminders"):
+                ids = moved.get(table, [])
+                if ids:
+                    placeholders = ", ".join("?" for _ in ids)
+                    self.conn.execute(
+                        f"""UPDATE {table} SET contact_id = ?
+                            WHERE id IN ({placeholders})""",
+                        (drop["id"], *ids),
+                    )
+
+            custom_rows = payload["pre_merge"].get("custom_fields", [])
+            custom_ids = [row["id"] for row in custom_rows]
+            if custom_ids:
+                placeholders = ", ".join("?" for _ in custom_ids)
+                self.conn.execute(
+                    f"DELETE FROM custom_fields WHERE id IN ({placeholders})",
+                    custom_ids,
+                )
+                for row in custom_rows:
+                    conflict = self.conn.execute(
+                        """SELECT id FROM custom_fields
+                           WHERE contact_id = ? AND field_name = ?""",
+                        (row["contact_id"], row["field_name"]),
+                    ).fetchone()
+                    if conflict:
+                        self.conn.execute(
+                            "DELETE FROM custom_fields WHERE id = ?", (conflict["id"],)
+                        )
+                    self._insert_snapshot_row(self.conn, "custom_fields", row)
+
+            fact_rows = payload["pre_merge"].get("facts", [])
+            fact_ids = [row["rowid"] for row in fact_rows]
+            if fact_ids:
+                placeholders = ", ".join("?" for _ in fact_ids)
+                self.conn.execute(
+                    f"DELETE FROM facts WHERE rowid IN ({placeholders})", fact_ids
+                )
+                for row in fact_rows:
+                    self.conn.execute(
+                        """DELETE FROM facts
+                           WHERE entity = ? AND key = ? AND value IS ?
+                             AND source IS ? AND rowid != ?""",
+                        (row["entity"], row["key"], row["value"],
+                         row["source"], row["rowid"]),
+                    )
+                    self._insert_snapshot_row(self.conn, "facts", row)
+
+            self.conn.execute(
+                "UPDATE facts SET key = 'undo_applied' WHERE rowid = ?",
+                (undo_row["rowid"],),
+            )
+
+        return {
+            "merge_id": int(raw_id),
+            "restored": True,
+            "keep": dict(self.conn.execute(
+                "SELECT * FROM contacts WHERE id = ?", (keep["id"],)
+            ).fetchone()),
+            "drop": dict(self.conn.execute(
+                "SELECT * FROM contacts WHERE id = ?", (drop["id"],)
+            ).fetchone()),
+        }
 
     def batch_add_contacts(self, contacts_list):
         """Add many contacts in a single transaction. Much faster than individual add_contact calls.
@@ -3288,52 +3549,303 @@ class CRM:
             "by_stage": avg_by_stage,
         }
 
+    @staticmethod
+    def _normalize_identity(value):
+        """Normalize human-entered names and companies for deterministic matching."""
+        if not value:
+            return ""
+        return " ".join(re.sub(r"[\W_]+", " ", str(value).casefold()).split())
+
+    @staticmethod
+    def _email_domain(email):
+        normalized = (email or "").strip().casefold()
+        return normalized.rpartition("@")[2] if "@" in normalized else ""
+
+    @staticmethod
+    def _edit_distance(left, right):
+        """Compute Levenshtein distance with a small, stdlib-only DP row."""
+        if len(left) < len(right):
+            left, right = right, left
+        previous = list(range(len(right) + 1))
+        for left_index, left_char in enumerate(left, start=1):
+            current = [left_index]
+            for right_index, right_char in enumerate(right, start=1):
+                current.append(min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1] + (left_char != right_char),
+                ))
+            previous = current
+        return previous[-1]
+
     def suggest_merges(self):
-        """Find duplicate contacts and suggest which to merge, with confidence scores.
+        """Suggest deterministic duplicate pairs with confidence in ``[0, 1]``."""
+        contacts = [dict(row) for row in self.conn.execute(
+            "SELECT * FROM contacts WHERE archived = 0 ORDER BY id"
+        ).fetchall()]
+        activity_counts = {
+            row["contact_id"]: row["count"]
+            for row in self.conn.execute(
+                """SELECT contact_id, COUNT(*) AS count FROM activity
+                   GROUP BY contact_id"""
+            ).fetchall()
+        }
 
-        Goes beyond find_duplicates by scoring each pair and recommending
-        which contact to keep (the one with more data).
-        """
-        dupes = self.find_duplicates()
+        def richness(contact):
+            populated = sum(
+                bool(contact.get(field))
+                for field in ("email", "company", "title", "deal_size", "notes", "tags")
+            )
+            return populated + min(activity_counts.get(contact["id"], 0), 5)
+
         suggestions = []
-        for d in dupes:
-            a_id = d["contact_a"]["id"]
-            b_id = d["contact_b"]["id"]
-            a = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (a_id,)).fetchone()
-            b = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (b_id,)).fetchone()
-            if not a or not b:
-                continue
-            a, b = dict(a), dict(b)
+        for index, contact_a in enumerate(contacts):
+            for contact_b in contacts[index + 1:]:
+                name_a = self._normalize_identity(contact_a.get("name"))
+                name_b = self._normalize_identity(contact_b.get("name"))
+                company_a = self._normalize_identity(contact_a.get("company"))
+                company_b = self._normalize_identity(contact_b.get("company"))
+                email_a = (contact_a.get("email") or "").strip().casefold()
+                email_b = (contact_b.get("email") or "").strip().casefold()
+                domain_a = self._email_domain(contact_a.get("email"))
+                domain_b = self._email_domain(contact_b.get("email"))
 
-            # Score which has more data
-            def _richness(c):
-                score = 0
-                for field in ("email", "company", "title", "deal_size", "notes", "tags"):
-                    if c.get(field):
-                        score += 1
-                act_count = self.conn.execute(
-                    "SELECT COUNT(*) FROM activity WHERE contact_id = ?", (c["id"],)
-                ).fetchone()[0]
-                score += min(act_count, 5)
-                return score
+                confidence = 0.0
+                reasons = []
+                if email_a and email_a == email_b:
+                    confidence = 0.98
+                    reasons.append("exact email match")
+                if name_a and name_a == name_b:
+                    if company_a and company_a == company_b:
+                        confidence = max(confidence, 0.88)
+                        reasons.append("same normalized name + same company")
+                    else:
+                        confidence = max(confidence, 0.62)
+                        reasons.append("same normalized name")
+                elif name_a and name_b and min(len(name_a), len(name_b)) >= 4:
+                    distance = self._edit_distance(name_a, name_b)
+                    relative_distance = distance / max(len(name_a), len(name_b))
+                    if (distance <= 2 and relative_distance <= 0.20
+                            and domain_a and domain_a == domain_b):
+                        confidence = max(confidence, 0.72)
+                        reasons.append("fuzzy name + shared email domain")
 
-            a_score = _richness(a)
-            b_score = _richness(b)
-            keep = a if a_score >= b_score else b
-            merge = b if a_score >= b_score else a
+                if not reasons:
+                    continue
+                score_a = richness(contact_a)
+                score_b = richness(contact_b)
+                if (score_a, -contact_a["id"]) >= (score_b, -contact_b["id"]):
+                    keep, drop = contact_a, contact_b
+                    keep_score, drop_score = score_a, score_b
+                else:
+                    keep, drop = contact_b, contact_a
+                    keep_score, drop_score = score_b, score_a
+                keep_summary = {
+                    "id": keep["id"], "name": keep["name"],
+                    "email": keep.get("email"), "richness": keep_score,
+                }
+                drop_summary = {
+                    "id": drop["id"], "name": drop["name"],
+                    "email": drop.get("email"), "richness": drop_score,
+                }
+                suggestions.append({
+                    "keep": keep_summary,
+                    "merge": drop_summary,
+                    "drop": dict(drop_summary),
+                    "reasons": reasons,
+                    "confidence": round(confidence, 2),
+                })
 
-            confidence = len(d["reasons"]) * 30  # 30% per reason
-            confidence = min(confidence, 90)
-
-            suggestions.append({
-                "keep": {"name": keep["name"], "email": keep.get("email"), "richness": max(a_score, b_score)},
-                "merge": {"name": merge["name"], "email": merge.get("email"), "richness": min(a_score, b_score)},
-                "reasons": d["reasons"],
-                "confidence": confidence,
-            })
-
-        suggestions.sort(key=lambda x: x["confidence"], reverse=True)
+        suggestions.sort(key=lambda item: (
+            -item["confidence"], item["keep"]["id"], item["merge"]["id"]
+        ))
         return suggestions
+
+    def auto_merge(self, threshold=0.9, dry_run=True):
+        """Apply every merge suggestion at or above ``threshold``.
+
+        Dry-run is the default and returns the exact ordered suggestions without
+        changing the database.
+        """
+        threshold = float(threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0 and 1")
+        candidates = [
+            suggestion for suggestion in self.suggest_merges()
+            if suggestion["confidence"] >= threshold
+        ]
+        if dry_run:
+            return {
+                "dry_run": True,
+                "threshold": threshold,
+                "count": len(candidates),
+                "merges": candidates,
+            }
+
+        applied = []
+        skipped = []
+        representatives = {}
+
+        def representative(contact_id):
+            path = []
+            while contact_id in representatives:
+                path.append(contact_id)
+                contact_id = representatives[contact_id]
+            for prior_id in path:
+                representatives[prior_id] = contact_id
+            return contact_id
+
+        for suggestion in candidates:
+            keep_id = representative(suggestion["keep"]["id"])
+            drop_id = representative(suggestion["merge"]["id"])
+            if keep_id == drop_id:
+                continue
+            keep_before = self._contact_for_merge(keep_id)
+            drop_before = self._contact_for_merge(drop_id)
+            result = self.merge_contacts(keep_id, drop_id)
+            if result:
+                representatives[drop_id] = keep_id
+                applied.append({
+                    "merge_id": result.get("merge_id"),
+                    "keep": {
+                        "id": keep_id,
+                        "name": keep_before["name"],
+                        "email": keep_before.get("email"),
+                    },
+                    "drop": {
+                        "id": drop_id,
+                        "name": drop_before["name"],
+                        "email": drop_before.get("email"),
+                    },
+                    "confidence": suggestion["confidence"],
+                    "reasons": suggestion["reasons"],
+                })
+            else:
+                skipped.append(suggestion)
+        return {
+            "dry_run": False,
+            "threshold": threshold,
+            "count": len(applied),
+            "merges": applied,
+            "skipped": skipped,
+        }
+
+    def _doctor_scan(self):
+        """Collect integrity issues without changing the database."""
+        orphans = {}
+        for table in ("activity", "deals", "reminders"):
+            orphans[table] = [dict(row) for row in self.conn.execute(
+                f"""SELECT child.* FROM {table} child
+                    LEFT JOIN contacts contact ON contact.id = child.contact_id
+                    WHERE contact.id IS NULL ORDER BY child.id"""
+            ).fetchall()]
+
+        unresolved_facts = []
+        fact_entities = self.conn.execute(
+            """SELECT DISTINCT entity FROM facts
+               WHERE entity LIKE 'contact:%' ORDER BY entity"""
+        ).fetchall()
+        for row in fact_entities:
+            if not self._resolve_entity_to_contact(row["entity"]):
+                unresolved_facts.append(row["entity"])
+
+        invalid_statuses = [dict(row) for row in self.conn.execute(
+            "SELECT id, name, status FROM contacts ORDER BY id"
+        ).fetchall() if row["status"] not in self.VALID_STATUSES]
+
+        bad_emails = []
+        for row in self.conn.execute(
+                "SELECT id, name, email FROM contacts WHERE email IS NOT NULL ORDER BY id"
+        ).fetchall():
+            normalized = row["email"].strip().lower()
+            if row["email"] != normalized:
+                issue = dict(row)
+                issue["normalized"] = normalized
+                bad_emails.append(issue)
+
+        report = {
+            "duplicates": self.suggest_merges(),
+            "orphans": orphans,
+            "unresolved_facts": unresolved_facts,
+            "invalid_statuses": invalid_statuses,
+            "bad_emails": bad_emails,
+        }
+        report["issue_count"] = (
+            len(report["duplicates"])
+            + sum(len(rows) for rows in orphans.values())
+            + len(unresolved_facts)
+            + len(invalid_statuses)
+            + len(bad_emails)
+        )
+        report["clean"] = report["issue_count"] == 0
+        return report
+
+    def doctor(self, fix=False):
+        """Report CRM integrity issues and optionally repair the safe subset."""
+        report = self._doctor_scan()
+        report["fixed"] = {
+            "orphan_contacts_created": [],
+            "emails_normalized": [],
+        }
+        if not fix:
+            return report
+
+        missing_contact_ids = sorted({
+            row["contact_id"]
+            for rows in report["orphans"].values()
+            for row in rows
+        })
+        fixed = report["fixed"]
+        with self.conn:
+            for contact_id in missing_contact_ids:
+                affected = {
+                    table: [row["id"] for row in rows
+                            if row["contact_id"] == contact_id]
+                    for table, rows in report["orphans"].items()
+                }
+                self.conn.execute(
+                    """INSERT INTO contacts
+                       (id, name, status, source, notes, archived)
+                       VALUES (?, ?, 'prospect', 'doctor', ?, 1)""",
+                    (contact_id, f"[Recovered contact {contact_id}]",
+                     "Placeholder created to preserve orphaned CRM rows"),
+                )
+                self.conn.execute(
+                    """INSERT INTO facts (entity, key, value, source)
+                       VALUES (?, 'relinked_rows', ?, 'doctor')
+                       ON CONFLICT(entity, key, value, source)
+                       DO UPDATE SET observed_at = CURRENT_TIMESTAMP""",
+                    (f"doctor:recovered-contact:{contact_id}",
+                     json.dumps(affected, sort_keys=True)),
+                )
+                fixed["orphan_contacts_created"].append({
+                    "contact_id": contact_id, "rows": affected,
+                })
+
+            for issue in report["bad_emails"]:
+                normalized = issue["normalized"]
+                if not _EMAIL_RE.match(normalized):
+                    continue
+                conflict = self.conn.execute(
+                    """SELECT id FROM contacts
+                       WHERE id != ? AND LOWER(TRIM(email)) = ? LIMIT 1""",
+                    (issue["id"], normalized),
+                ).fetchone()
+                if conflict:
+                    continue
+                self.conn.execute(
+                    "UPDATE contacts SET email = ? WHERE id = ?",
+                    (normalized, issue["id"]),
+                )
+                fixed["emails_normalized"].append({
+                    "contact_id": issue["id"],
+                    "from": issue["email"],
+                    "to": normalized,
+                })
+
+        remaining = self._doctor_scan()
+        remaining["fixed"] = fixed
+        return remaining
 
     def relationship_score(self, identifier):
         """Comprehensive relationship strength score (0-100) using ALL data sources.
@@ -6767,17 +7279,29 @@ class CRM:
 
     # --- Relationship Velocity ---
 
+    def _canonical_contact_entity(self, contact):
+        """Return the stable primary graph entity for a contact."""
+        normalized_name = self._normalize_identity(contact.get("name"))
+        return f"contact:{normalized_name}"
+
     def _contact_entity_keys(self, contact):
         """Return all entity key variants for a contact, used across graph lookups."""
-        name_lower = contact["name"].lower()
-        parts = name_lower.split()
-        keys = list(set(
-            [f"contact:{name_lower}",
-             f"contact:{name_lower.replace(' ', '_')}"]
-            + [f"contact:{p}" for p in parts]
-            + ([f"contact:{contact['email'].lower()}"] if contact.get("email") else [])
-        ))
-        return keys
+        raw_name_lower = contact["name"].casefold()
+        name_lower = " ".join(raw_name_lower.split())
+        normalized_name = self._normalize_identity(contact["name"])
+        parts = normalized_name.split()
+        keys = {
+            f"contact:{raw_name_lower}",
+            f"contact:{raw_name_lower.replace(' ', '_')}",
+            f"contact:{name_lower}",
+            f"contact:{name_lower.replace(' ', '_')}",
+            f"contact:{normalized_name}",
+            f"contact:{normalized_name.replace(' ', '_')}",
+            *(f"contact:{part}" for part in parts),
+        }
+        if contact.get("email"):
+            keys.add(f"contact:{contact['email'].strip().casefold()}")
+        return sorted(keys)
 
     def velocity(self, identifier, window_days=14):
         """Measure engagement velocity: acceleration or decay of interactions.
@@ -7742,7 +8266,26 @@ def main():
 
     p_merge = sub.add_parser("merge", help="Merge two contacts into one")
     p_merge.add_argument("keep", help="Contact to keep (email or name)")
-    p_merge.add_argument("merge_into", help="Contact to merge in (will be deleted)")
+    p_merge.add_argument("drop", help="Contact to absorb (will be deleted)")
+
+    p_unmerge = sub.add_parser("unmerge", help="Undo a contact merge by merge id")
+    p_unmerge.add_argument("merge_id", help="Merge id, e.g. 3 or merge:3")
+
+    p_automerge = sub.add_parser(
+        "automerge", help="Merge high-confidence duplicate contacts"
+    )
+    p_automerge.add_argument(
+        "--apply", action="store_true", help="Apply merges (default is dry-run)"
+    )
+    p_automerge.add_argument(
+        "--threshold", type=float, default=0.9,
+        help="Minimum confidence from 0 to 1 (default: 0.9)",
+    )
+
+    p_doctor = sub.add_parser("doctor", help="Check CRM data integrity")
+    p_doctor.add_argument(
+        "--fix", action="store_true", help="Repair safe integrity issues"
+    )
 
     # ingest
     p_ingest = sub.add_parser("ingest", help="Import from local data sources (macOS)")
@@ -8703,11 +9246,30 @@ def main():
         print()
 
     elif args.command == "merge":
-        result = crm.merge_contacts(args.keep, args.merge_into)
+        result = crm.merge_contacts(args.keep, args.drop)
         if result:
-            print(f"  Merged into: {result['name']} (activities, deals, and facts combined)")
+            print(
+                f"  Merged into: {result['name']} "
+                f"(merge id: {result['merge_id']})"
+            )
         else:
             print("  One or both contacts not found")
+
+    elif args.command == "unmerge":
+        result = crm.undo_merge(args.merge_id)
+        if result:
+            print(json.dumps(result, default=str, indent=2))
+        else:
+            print(f"  Merge not found or already undone: {args.merge_id}")
+
+    elif args.command == "automerge":
+        result = crm.auto_merge(
+            threshold=args.threshold, dry_run=not args.apply
+        )
+        print(json.dumps(result, default=str, indent=2))
+
+    elif args.command == "doctor":
+        print(json.dumps(crm.doctor(fix=args.fix), default=str, indent=2))
 
     elif args.command == "ingest":
         src = args.source

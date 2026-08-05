@@ -77,7 +77,7 @@ good the forecasts actually are. When enough closed outcomes exist, fit the
 signal weights from history (pure-stdlib logistic fit) instead of the
 hardcoded 0.45/0.20/... — the model retrains itself from its own track record.
 
-### Ten. Autonomous data hygiene
+### [x] Ten. Autonomous data hygiene
 `suggest_merges()` finds duplicates; nothing acts on them. Add confidence
 scoring, auto-merge above a threshold with full undo (merge log in facts),
 entity-key canonicalization across name/email variants, and a `doctor`

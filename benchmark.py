@@ -3097,6 +3097,336 @@ def run_benchmarks():
 
     sm_crm.close()
 
+    # ── 52d. Autonomous Data Hygiene (14 tests) ──
+
+    confidence_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-confidence.db"))
+    confidence_crm.add_contact(
+        "Email Erin", email="erin@confidence.test", title="VP"
+    )
+    confidence_crm.add_contact(
+        "Different Person", email="ERIN@CONFIDENCE.TEST"
+    )
+    confidence_crm.add_contact(
+        "Company Cara", email="cara@first.test", company="Acme"
+    )
+    confidence_crm.add_contact(
+        "company-cara", email="cara@second.test", company=" acme "
+    )
+    confidence_crm.add_contact(
+        "Name Nina", email="nina@first.test", company="First"
+    )
+    confidence_crm.add_contact(
+        " name  nina ", email="nina@second.test", company="Second"
+    )
+    confidence_crm.add_contact(
+        "Fuzzy Finn", email="finn@shared.test"
+    )
+    confidence_crm.add_contact(
+        "Fuzzy Fin", email="other@shared.test"
+    )
+
+    try:
+        confidence_suggestions = confidence_crm.suggest_merges()
+        email_confidence = next(
+            item["confidence"] for item in confidence_suggestions
+            if "exact email match" in item["reasons"]
+        )
+        company_confidence = next(
+            item["confidence"] for item in confidence_suggestions
+            if "same normalized name + same company" in item["reasons"]
+        )
+        name_confidence = next(
+            item["confidence"] for item in confidence_suggestions
+            if item["reasons"] == ["same normalized name"]
+        )
+        check(
+            "hygiene_confidence_email_gt_name_company",
+            email_confidence > company_confidence,
+        )
+        check(
+            "hygiene_confidence_name_company_gt_name_only_and_range",
+            company_confidence > name_confidence
+            and all(0.0 <= item["confidence"] <= 1.0
+                    for item in confidence_suggestions),
+        )
+        fuzzy = next(
+            item for item in confidence_suggestions
+            if "fuzzy name + shared email domain" in item["reasons"]
+        )
+        check(
+            "hygiene_confidence_fuzzy_shared_domain",
+            0.70 <= fuzzy["confidence"] < company_confidence,
+        )
+        check(
+            "hygiene_suggestions_deterministic",
+            confidence_suggestions == confidence_crm.suggest_merges(),
+        )
+    except (AttributeError, KeyError, StopIteration, TypeError):
+        check("hygiene_confidence_email_gt_name_company", False)
+        check("hygiene_confidence_name_company_gt_name_only_and_range", False)
+        check("hygiene_confidence_fuzzy_shared_domain", False)
+        check("hygiene_suggestions_deterministic", False)
+    confidence_crm.close()
+
+    hygiene_merge_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-merge.db"))
+    hygiene_keep_id = hygiene_merge_crm.add_contact(
+        "Hygiene Alice", email="keep@hygiene.test", notes="keep-note"
+    )
+    hygiene_drop_id = hygiene_merge_crm.add_contact(
+        "Hygiene Alice Duplicate", email="drop@hygiene.test",
+        company="Hygiene Co", title="CTO",
+    )
+    hygiene_merge_crm.log_activity(
+        "drop@hygiene.test", "call", "Drop-owned call"
+    )
+    hygiene_deal_id = hygiene_merge_crm.add_deal(
+        "drop@hygiene.test", "Drop-owned deal", "$8K"
+    )
+    hygiene_reminder_id = hygiene_merge_crm.set_reminder(
+        "drop@hygiene.test", "2026-08-20", "Drop-owned reminder"
+    )
+    hygiene_merge_crm.set_field(
+        "drop@hygiene.test", "region", "EMEA"
+    )
+    hygiene_field_id = hygiene_merge_crm.conn.execute(
+        "SELECT id FROM custom_fields WHERE contact_id = ?", (hygiene_drop_id,)
+    ).fetchone()[0]
+    hygiene_merge_crm.observe(
+        "contact:keep@hygiene.test", "preferred_channel", "email", "seed"
+    )
+    hygiene_merge_crm.observe(
+        "contact:hygiene_alice_duplicate", "timezone", "CET", "seed"
+    )
+    before_keep = dict(hygiene_merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE id = ?", (hygiene_keep_id,)
+    ).fetchone())
+    before_drop = dict(hygiene_merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE id = ?", (hygiene_drop_id,)
+    ).fetchone())
+    before_owners = {
+        table: [tuple(row) for row in hygiene_merge_crm.conn.execute(
+            f"SELECT id, contact_id FROM {table} ORDER BY id"
+        ).fetchall()]
+        for table in ("activity", "deals", "reminders", "custom_fields")
+    }
+    pre_merge_fact_ids = [row[0] for row in hygiene_merge_crm.conn.execute(
+        "SELECT rowid FROM facts ORDER BY rowid"
+    ).fetchall()]
+
+    try:
+        merge_result = hygiene_merge_crm.merge_contacts(
+            hygiene_keep_id, hygiene_drop_id
+        )
+        moved_activity = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM activity WHERE summary = 'Drop-owned call'"
+        ).fetchone()[0]
+        moved_deal = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM deals WHERE id = ?", (hygiene_deal_id,)
+        ).fetchone()[0]
+        check(
+            "hygiene_merge_moves_activity_deals",
+            moved_activity == hygiene_keep_id and moved_deal == hygiene_keep_id,
+        )
+        merged_contact = dict(hygiene_merge_crm.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (hygiene_keep_id,)
+        ).fetchone())
+        moved_reminder = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM reminders WHERE id = ?",
+            (hygiene_reminder_id,),
+        ).fetchone()[0]
+        moved_field = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM custom_fields WHERE id = ?",
+            (hygiene_field_id,),
+        ).fetchone()[0]
+        check(
+            "hygiene_merge_moves_reminders_fields_and_fills_blanks",
+            moved_reminder == hygiene_keep_id
+            and moved_field == hygiene_keep_id
+            and merged_contact["company"] == "Hygiene Co"
+            and merged_contact["title"] == "CTO",
+        )
+        canonical_entity = hygiene_merge_crm._canonical_contact_entity(before_keep)
+        canonicalized = hygiene_merge_crm.conn.execute(
+            f"""SELECT entity FROM facts
+                WHERE rowid IN ({', '.join('?' for _ in pre_merge_fact_ids)})""",
+            pre_merge_fact_ids,
+        ).fetchall()
+        check(
+            "hygiene_merge_canonicalizes_fact_variants",
+            len(canonicalized) == len(pre_merge_fact_ids)
+            and all(row["entity"] == canonical_entity for row in canonicalized),
+        )
+
+        undo_result = hygiene_merge_crm.undo_merge(merge_result["merge_id"])
+        restored_keep = dict(hygiene_merge_crm.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (hygiene_keep_id,)
+        ).fetchone())
+        restored_drop = dict(hygiene_merge_crm.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (hygiene_drop_id,)
+        ).fetchone())
+        check(
+            "hygiene_undo_restores_contacts_exactly",
+            undo_result["restored"]
+            and restored_keep == before_keep
+            and restored_drop == before_drop,
+        )
+        restored_owners = {
+            table: [tuple(row) for row in hygiene_merge_crm.conn.execute(
+                f"SELECT id, contact_id FROM {table} ORDER BY id"
+            ).fetchall()]
+            for table in ("activity", "deals", "reminders", "custom_fields")
+        }
+        check(
+            "hygiene_undo_restores_row_ownership_exactly",
+            restored_owners == before_owners,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_merge_moves_activity_deals", False)
+        check("hygiene_merge_moves_reminders_fields_and_fills_blanks", False)
+        check("hygiene_merge_canonicalizes_fact_variants", False)
+        check("hygiene_undo_restores_contacts_exactly", False)
+        check("hygiene_undo_restores_row_ownership_exactly", False)
+    hygiene_merge_crm.close()
+
+    dry_merge_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-dry.db"))
+    dry_merge_crm.add_contact("Dry One", email="dry@merge.test")
+    dry_merge_crm.add_contact("Dry Two", email="DRY@MERGE.TEST")
+    before_dry = {
+        table: [dict(row) for row in dry_merge_crm.conn.execute(
+            f"SELECT * FROM {table} ORDER BY 1"
+        ).fetchall()]
+        for table in ("contacts", "activity", "deals", "reminders",
+                      "custom_fields", "facts")
+    }
+    try:
+        dry_result = dry_merge_crm.auto_merge(threshold=0.9, dry_run=True)
+        after_dry = {
+            table: [dict(row) for row in dry_merge_crm.conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+            ).fetchall()]
+            for table in ("contacts", "activity", "deals", "reminders",
+                          "custom_fields", "facts")
+        }
+        check(
+            "hygiene_auto_merge_dry_run_no_mutation",
+            dry_result["dry_run"] and dry_result["count"] == 1
+            and before_dry == after_dry,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_dry_run_no_mutation", False)
+    dry_merge_crm.close()
+
+    threshold_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-threshold.db"))
+    threshold_crm.add_contact(
+        "Threshold Taylor", email="taylor@one.test", company="One"
+    )
+    threshold_crm.add_contact(
+        " threshold  taylor ", email="taylor@two.test", company="Two"
+    )
+    try:
+        high_threshold = threshold_crm.auto_merge(
+            threshold=0.9, dry_run=False
+        )
+        high_count = threshold_crm.conn.execute(
+            "SELECT COUNT(*) FROM contacts"
+        ).fetchone()[0]
+        low_threshold = threshold_crm.auto_merge(
+            threshold=0.6, dry_run=False
+        )
+        low_count = threshold_crm.conn.execute(
+            "SELECT COUNT(*) FROM contacts"
+        ).fetchone()[0]
+        check(
+            "hygiene_auto_merge_threshold_respected",
+            high_threshold["count"] == 0 and high_count == 2
+            and low_threshold["count"] == 1 and low_count == 1,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_threshold_respected", False)
+    threshold_crm.close()
+
+    doctor_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-doctor.db"))
+    doctor_contact_id = doctor_crm.add_contact(
+        "Doctor Dana", email="dana@doctor.test"
+    )
+    with doctor_crm.conn:
+        doctor_crm.conn.execute(
+            "UPDATE contacts SET email = ?, status = ? WHERE id = ?",
+            (" Dana@Doctor.TEST ", "impossible", doctor_contact_id),
+        )
+        doctor_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary) VALUES (999, 'note', 'orphan')"
+        )
+        doctor_crm.conn.execute(
+            "INSERT INTO deals (contact_id, name) VALUES (999, 'orphan')"
+        )
+        doctor_crm.conn.execute(
+            """INSERT INTO reminders (contact_id, due_date, note)
+               VALUES (999, '2026-08-20', 'orphan')"""
+        )
+        doctor_crm.conn.execute(
+            """INSERT INTO facts (entity, key, value, source)
+               VALUES ('contact:missing-person', 'role', 'ghost', 'seed')"""
+        )
+    try:
+        doctor_report = doctor_crm.doctor()
+        check(
+            "hygiene_doctor_finds_orphans_and_bad_email",
+            all(len(doctor_report["orphans"][table]) == 1
+                for table in ("activity", "deals", "reminders"))
+            and doctor_report["bad_emails"][0]["normalized"]
+            == "dana@doctor.test",
+        )
+        check(
+            "hygiene_doctor_finds_unresolved_facts_and_statuses",
+            "contact:missing-person" in doctor_report["unresolved_facts"]
+            and doctor_report["invalid_statuses"][0]["status"] == "impossible",
+        )
+    except (AttributeError, IndexError, KeyError, TypeError):
+        check("hygiene_doctor_finds_orphans_and_bad_email", False)
+        check("hygiene_doctor_finds_unresolved_facts_and_statuses", False)
+    doctor_crm.close()
+
+    doctor_fix_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-doctor-fix.db"))
+    fix_contact_id = doctor_fix_crm.add_contact(
+        "Doctor Fix", email="fix@doctor.test"
+    )
+    with doctor_fix_crm.conn:
+        doctor_fix_crm.conn.execute(
+            "UPDATE contacts SET email = ? WHERE id = ?",
+            (" Fix@Doctor.TEST ", fix_contact_id),
+        )
+        doctor_fix_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary) VALUES (777, 'note', 'orphan')"
+        )
+        doctor_fix_crm.conn.execute(
+            "INSERT INTO deals (contact_id, name) VALUES (777, 'orphan')"
+        )
+        doctor_fix_crm.conn.execute(
+            """INSERT INTO reminders (contact_id, due_date, note)
+               VALUES (777, '2026-08-20', 'orphan')"""
+        )
+    try:
+        fixed_report = doctor_fix_crm.doctor(fix=True)
+        second_report = doctor_fix_crm.doctor()
+        normalized_email = doctor_fix_crm.conn.execute(
+            "SELECT email FROM contacts WHERE id = ?", (fix_contact_id,)
+        ).fetchone()[0]
+        recovered = doctor_fix_crm.conn.execute(
+            "SELECT archived, source FROM contacts WHERE id = 777"
+        ).fetchone()
+        check(
+            "hygiene_doctor_fix_then_clean",
+            fixed_report["clean"] and second_report["clean"]
+            and normalized_email == "fix@doctor.test"
+            and recovered["archived"] == 1 and recovered["source"] == "doctor"
+            and len(fixed_report["fixed"]["emails_normalized"]) == 1
+            and len(fixed_report["fixed"]["orphan_contacts_created"]) == 1,
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_doctor_fix_then_clean", False)
+    doctor_fix_crm.close()
+
     # ── 53. Relationship Score (4 tests) ──
 
     rs_crm = CRM(os.path.join(tempfile.mkdtemp(), "rs.db"))
