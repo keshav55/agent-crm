@@ -6595,6 +6595,46 @@ def run_benchmarks():
         )
     except (AttributeError, TypeError, KeyError, ValueError, StopIteration):
         check("queue_stats_mcp_tool", False)
+    # 89o. queue_stats() rows expose the full documented shape directly.
+    try:
+        qs = learned_queue_crm.queue_stats()
+        required = {"signal", "surfaced", "acted", "moved", "act_rate",
+                    "move_rate", "multiplier", "weights_source"}
+        check("queue_stats_method_shape",
+              bool(qs) and all(required.issubset(row) for row in qs))
+    except (AttributeError, TypeError):
+        check("queue_stats_method_shape", False)
+
+    # 89p. every known queue signal appears exactly once.
+    try:
+        qs = learned_queue_crm.queue_stats()
+        names = [row["signal"] for row in qs]
+        check("queue_stats_covers_all_signals",
+              set(CRM.NEXT_ACTION_SIGNAL_NAMES).issubset(names)
+              and len(names) == len(set(names)))
+    except (AttributeError, TypeError):
+        check("queue_stats_covers_all_signals", False)
+
+    # 89q. rates agree with the raw surfaced/acted/moved counts.
+    try:
+        qs = learned_queue_crm.queue_stats()
+        ok = all(
+            (row["surfaced"] == 0 and row["act_rate"] == 0.0 and row["move_rate"] == 0.0)
+            or (abs(row["act_rate"] - row["acted"] / row["surfaced"]) < 1e-6
+                and abs(row["move_rate"] - row["moved"] / row["surfaced"]) < 1e-6)
+            for row in qs
+        )
+        check("queue_stats_rate_math", bool(qs) and ok)
+    except (AttributeError, TypeError, ZeroDivisionError):
+        check("queue_stats_rate_math", False)
+
+    # 89r. two consecutive calls return identical rows.
+    try:
+        check("queue_stats_deterministic",
+              learned_queue_crm.queue_stats() == learned_queue_crm.queue_stats())
+    except (AttributeError, TypeError):
+        check("queue_stats_deterministic", False)
+
     learned_queue_crm.close()
 
     cadence_crm.close()
