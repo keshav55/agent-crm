@@ -89,7 +89,7 @@ benchmark coverage, which next_actions signals never fire on real data, which
 CLI commands error most, where perf timings trend worse. Output: ranked
 candidate ticks in roadmap.md format. The system writes its own wave three.
 
-### Twelve. Outcome-driven action tuning
+### [x] Twelve. Outcome-driven action tuning
 `next_actions` urgency weights are hand-set. Log which surfaced actions get
 acted on (activity within N days of surfacing) and whether acted-on contacts
 advance stage; shift urgency weights toward action types that actually move

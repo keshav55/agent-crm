@@ -219,6 +219,11 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_queue_stats",
+        "description": "Get per-signal queue outcomes, rates, and learned urgency multipliers",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "crm_propose_ticks",
         "description": "Propose deterministic roadmap ticks from benchmark coverage, live CRM signals, and cached performance timings",
         "inputSchema": {"type": "object", "properties": {}},
@@ -796,6 +801,9 @@ def handle_tool_call(name, arguments):
         elif name == "crm_next_actions":
             actions = crm.next_actions(limit=arguments.get("limit", 10))
             return json.dumps(actions, default=str, indent=2)
+
+        elif name == "crm_queue_stats":
+            return json.dumps(crm.queue_stats(), default=str, indent=2)
 
         elif name == "crm_propose_ticks":
             return json.dumps(crm.propose_ticks(), default=str, indent=2)

@@ -6342,6 +6342,261 @@ def run_benchmarks():
     )
     unified_crm.close()
 
+    # ── 89. Outcome-Driven Action Tuning (14 tests) ──
+
+    queue_log_crm = CRM(os.path.join(tempfile.mkdtemp(), "queue-surface-log.db"))
+    queue_log_crm.add_contact(
+        "Surface Sue", email="sue@queue.test", status="prospect"
+    )
+    queue_log_crm.next_actions()
+    surface_facts = queue_log_crm.conn.execute(
+        """SELECT key, source, event_day FROM facts
+           WHERE entity = 'surfaced:sue@queue.test' AND source = 'queue'
+           ORDER BY key"""
+    ).fetchall()
+
+    # 89a. A returned action records the three public queue facts.
+    check(
+        "queue_surface_facts_recorded",
+        {row["key"] for row in surface_facts}
+        == {"signal_name", "action", "urgency"}
+        and all(row["source"] == "queue" and row["event_day"]
+                for row in surface_facts),
+    )
+
+    # 89b. Re-reading the queue on the same day updates instead of appending.
+    queue_log_crm.next_actions()
+    check(
+        "queue_surface_same_day_dedup",
+        queue_log_crm.conn.execute(
+            """SELECT COUNT(*) FROM facts
+               WHERE entity = 'surfaced:sue@queue.test'
+                 AND source = 'queue'"""
+        ).fetchone()[0] == 3,
+    )
+    queue_log_crm.close()
+
+    def seed_queue_outcome(crm, label, signal, *, acted, moved,
+                           late_activity=False):
+        email = f"{label}@queue-outcome.test"
+        contact_id = crm.add_contact(
+            f"Queue Outcome {label}", email=email, status="prospect"
+        )
+        surfaced_at = datetime.now() - timedelta(days=60 + contact_id)
+        observed_at = surfaced_at.isoformat(sep=" ", timespec="microseconds")
+        event_day = surfaced_at.date().isoformat()
+        entity = f"surfaced:{email}"
+        with crm.conn:
+            crm.conn.executemany(
+                """INSERT INTO facts
+                   (entity, key, value, source, observed_at, event_day)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    (entity, "signal_name", signal, "queue", observed_at, event_day),
+                    (entity, "action", f"Act on {label}", "queue", observed_at,
+                     event_day),
+                    (entity, "urgency", "50.0", "queue", observed_at, event_day),
+                    (entity, "contact_id", str(contact_id), "queue_meta", observed_at,
+                     event_day),
+                    (entity, "status", "prospect", "queue_meta", observed_at,
+                     event_day),
+                ),
+            )
+            if acted or late_activity:
+                activity_at = surfaced_at + timedelta(
+                    days=10 if late_activity else 2
+                )
+                crm.conn.execute(
+                    """INSERT INTO activity
+                       (contact_id, type, summary, created_at)
+                       VALUES (?, 'email', 'Queue fixture action', ?)""",
+                    (contact_id, activity_at.isoformat(
+                        sep=" ", timespec="microseconds")),
+                )
+        if moved:
+            crm.update_contact(email, status="contacted")
+            moved_at = (surfaced_at + timedelta(days=3)).isoformat(
+                sep=" ", timespec="microseconds"
+            )
+            canonical = crm._canonical_contact_entity(crm.get_contact(email))
+            with crm.conn:
+                crm.conn.execute(
+                    """UPDATE facts SET observed_at = ?
+                       WHERE entity = ? AND key = 'status'
+                         AND source = 'crm_status'""",
+                    (moved_at, canonical),
+                )
+                crm.conn.execute(
+                    "UPDATE contacts SET updated_at = ? WHERE id = ?",
+                    (moved_at, contact_id),
+                )
+        crm.archive_contact(email)
+        return contact_id
+
+    outcome_crm = CRM(os.path.join(tempfile.mkdtemp(), "queue-outcomes.db"))
+    seed_queue_outcome(
+        outcome_crm, "acted-moved", "cadence_overdue", acted=True, moved=True
+    )
+    seed_queue_outcome(
+        outcome_crm, "too-late", "cadence_overdue", acted=False, moved=False,
+        late_activity=True,
+    )
+    cadence_outcomes = next(
+        row for row in outcome_crm.action_outcomes(window_days=7)
+        if row["signal"] == "cadence_overdue"
+    )
+
+    # 89c. Activity inside the configured window counts as acted.
+    check("queue_outcome_acted_true", cadence_outcomes["acted"] == 1)
+
+    # 89d. Activity after the configured window does not count as acted.
+    check(
+        "queue_outcome_acted_false",
+        cadence_outcomes["surfaced"] - cadence_outcomes["acted"] == 1,
+    )
+
+    # 89e. A later status fact with a higher stage counts as moved.
+    check("queue_outcome_moved", cadence_outcomes["moved"] == 1)
+
+    # 89f. Two surfaces with one action and one move yield exact half rates.
+    check(
+        "queue_outcome_rates_exact",
+        cadence_outcomes == {
+            "signal": "cadence_overdue", "surfaced": 2, "acted": 1,
+            "moved": 1, "act_rate": 0.5, "move_rate": 0.5,
+        },
+    )
+
+    # 89g. Fewer than ten outcomes always keeps the default multiplier.
+    check(
+        "queue_weights_minimum",
+        outcome_crm.tuned_urgency_weights()["cadence_overdue"] == 1.0,
+    )
+    outcome_crm.close()
+
+    learned_queue_db = os.path.join(tempfile.mkdtemp(), "learned-queue.db")
+    learned_queue_crm = CRM(learned_queue_db)
+    learned_queue_crm.add_contact(
+        "Ranked Stale", email="stale@learned-queue.test", status="contacted"
+    )
+    learned_queue_crm.update_contact(
+        "stale@learned-queue.test", last_contacted=_date.today().isoformat()
+    )
+    learned_queue_crm.add_deal(
+        "stale@learned-queue.test", "Stale learned deal", "$25K", "proposal"
+    )
+    learned_queue_crm.conn.execute(
+        """UPDATE deals SET updated_at = datetime('now', '-45 days')
+           WHERE contact_id = ?""",
+        (learned_queue_crm.get_contact("stale@learned-queue.test")["id"],),
+    )
+    learned_queue_crm.add_contact(
+        "Ranked Reminder", email="reminder@learned-queue.test", status="contacted"
+    )
+    learned_queue_crm.update_contact(
+        "reminder@learned-queue.test", last_contacted=_date.today().isoformat()
+    )
+    learned_queue_crm.set_reminder(
+        "reminder@learned-queue.test", _date.today().isoformat(), "Due learned reminder"
+    )
+    default_rank = [
+        row["contact"] for row in learned_queue_crm.next_actions(limit=20)
+    ]
+    default_sources = {
+        row["contact"]: row["weights_source"]
+        for row in learned_queue_crm.next_actions(limit=20)
+    }
+
+    for index in range(10):
+        seed_queue_outcome(
+            learned_queue_crm, f"high-{index}", "stale_open_deal",
+            acted=True, moved=True,
+        )
+        seed_queue_outcome(
+            learned_queue_crm, f"low-{index}", "due_reminder",
+            acted=True, moved=False,
+        )
+
+    first_queue_weights = learned_queue_crm.tuned_urgency_weights()
+    second_queue_weights = learned_queue_crm.tuned_urgency_weights()
+
+    # 89h. Above-mean movement is capped at the upper bound.
+    check(
+        "queue_weight_upper_clamp",
+        first_queue_weights["stale_open_deal"] == 1.4,
+    )
+
+    # 89i. Below-mean movement is floored at the lower bound.
+    check(
+        "queue_weight_lower_clamp",
+        first_queue_weights["due_reminder"] == 0.6,
+    )
+
+    # 89j. Identical outcome history produces byte-for-byte-identical weights.
+    check(
+        "queue_weights_deterministic",
+        first_queue_weights == second_queue_weights,
+    )
+
+    learned_actions = learned_queue_crm.next_actions(limit=20)
+    learned_rank = [row["contact"] for row in learned_actions]
+    learned_sources = {
+        row["contact"]: row["weights_source"] for row in learned_actions
+    }
+
+    # 89k. Learning reverses the default reminder-over-stale ordering.
+    check(
+        "queue_learning_changes_rank",
+        default_rank.index("Ranked Reminder") < default_rank.index("Ranked Stale")
+        and learned_rank.index("Ranked Stale") < learned_rank.index("Ranked Reminder"),
+    )
+
+    # 89l. Public queue rows flip from default to learned signal weights.
+    check(
+        "queue_weights_source_flips",
+        default_sources["Ranked Stale"] == "default"
+        and default_sources["Ranked Reminder"] == "default"
+        and learned_sources["Ranked Stale"] == "learned"
+        and learned_sources["Ranked Reminder"] == "learned",
+    )
+
+    # 89m. queue-stats CLI prints rates and the active multiplier.
+    queue_cli = subprocess.run(
+        [sys.executable, os.path.abspath("crm.py"), "--db", learned_queue_db,
+         "queue-stats"],
+        capture_output=True, text=True, timeout=30,
+    )
+    check(
+        "queue_stats_cli",
+        queue_cli.returncode == 0
+        and "stale_open_deal" in queue_cli.stdout
+        and "1.40x" in queue_cli.stdout,
+    )
+
+    # 89n. MCP advertises and serves the same queue statistics.
+    try:
+        import mcp_server
+        original_queue_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = learned_queue_db
+        queue_tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        queue_mcp_output = json.loads(
+            mcp_server.handle_tool_call("crm_queue_stats", {})
+        )
+        mcp_server.DB_PATH = original_queue_mcp_db
+        stale_stats = next(
+            row for row in queue_mcp_output
+            if row["signal"] == "stale_open_deal"
+        )
+        check(
+            "queue_stats_mcp_tool",
+            "crm_queue_stats" in queue_tool_names
+            and stale_stats["multiplier"] == 1.4
+            and stale_stats["weights_source"] == "learned",
+        )
+    except (AttributeError, TypeError, KeyError, ValueError, StopIteration):
+        check("queue_stats_mcp_tool", False)
+    learned_queue_crm.close()
+
     cadence_crm.close()
 
     ingest_crm.close()

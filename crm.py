@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS facts (
     key TEXT NOT NULL,
     value TEXT,
     source TEXT,
-    observed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    observed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    event_day DATE NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS reminders (
@@ -121,7 +122,6 @@ CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
 CREATE INDEX IF NOT EXISTS idx_facts_key ON facts(entity, key);
 CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source);
 CREATE INDEX IF NOT EXISTS idx_facts_value ON facts(value);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_dedup ON facts(entity, key, value, source);
 """
 
 
@@ -182,6 +182,31 @@ class CRM:
         except sqlite3.OperationalError:
             self.conn.execute("ALTER TABLE contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
             self.conn.commit()
+        # Queue surface events need to retain the same fact values on different
+        # days while preserving the graph's existing exact-fact deduplication.
+        try:
+            self.conn.execute("SELECT event_day FROM facts LIMIT 0")
+        except sqlite3.OperationalError:
+            self.conn.execute(
+                "ALTER TABLE facts ADD COLUMN event_day DATE NOT NULL DEFAULT ''"
+            )
+        with self.conn:
+            self.conn.execute("DROP INDEX IF EXISTS idx_facts_dedup")
+            self.conn.execute(
+                """DELETE FROM facts WHERE rowid NOT IN (
+                       SELECT MAX(rowid) FROM facts
+                       GROUP BY entity, key, value, source, event_day
+                   )"""
+            )
+            self.conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_dedup
+                   ON facts(entity, key, value, source, event_day)"""
+            )
+            self.conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_surface_daily
+                   ON facts(entity, key, source, event_day)
+                   WHERE source IN ('queue', 'queue_meta') AND event_day != ''"""
+            )
 
     # --- Contacts ---
 
@@ -218,7 +243,14 @@ class CRM:
         self.conn.commit()
         # Re-fetch by id so renames (no email) still return the updated row
         row = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (contact["id"],)).fetchone()
-        return dict(row) if row else None
+        updated = dict(row) if row else None
+        if (updated and "status" in updates
+                and updates["status"] != contact.get("status")):
+            self.observe(
+                self._canonical_contact_entity(updated), "status",
+                updates["status"], source="crm_status",
+            )
+        return updated
 
     def get_contact(self, identifier):
         """Get contact by email or name (partial match)."""
@@ -1234,7 +1266,10 @@ class CRM:
             "id", "contact_id", "name", "value", "stage", "notes",
             "created_at", "updated_at", "closed_at",
         ),
-        "facts": ("rowid", "entity", "key", "value", "source", "observed_at"),
+        "facts": (
+            "rowid", "entity", "key", "value", "source", "observed_at",
+            "event_day",
+        ),
     }
 
     _CSV_FIELDS = _FULL_TABLE_COLUMNS["contacts"]
@@ -1312,7 +1347,12 @@ class CRM:
                         column_sql = ", ".join(columns)
                         self.conn.executemany(
                             f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
-                            [tuple(row.get(column) for column in columns) for row in data[table]],
+                            [tuple(
+                                (row.get(column) or "")
+                                if table == "facts" and column == "event_day"
+                                else row.get(column)
+                                for column in columns
+                            ) for row in data[table]],
                         )
                         imported[table] = len(data[table])
                 else:
@@ -1397,10 +1437,11 @@ class CRM:
                         fact_values = (
                             row.get("entity"), row.get("key"), row.get("value"),
                             row.get("source"), row.get("observed_at"),
+                            row.get("event_day") or "",
                         )
                         exists = self.conn.execute(
                             """SELECT 1 FROM facts WHERE entity IS ? AND key IS ? AND value IS ?
-                               AND source IS ? AND observed_at IS ?""",
+                               AND source IS ? AND observed_at IS ? AND event_day IS ?""",
                             fact_values,
                         ).fetchone()
                         if exists:
@@ -1408,7 +1449,9 @@ class CRM:
                             continue
                         try:
                             self.conn.execute(
-                                "INSERT INTO facts (entity, key, value, source, observed_at) VALUES (?, ?, ?, ?, ?)",
+                                """INSERT INTO facts
+                                   (entity, key, value, source, observed_at, event_day)
+                                   VALUES (?, ?, ?, ?, ?, ?)""",
                                 fact_values,
                             )
                             imported["facts"] += 1
@@ -1576,8 +1619,9 @@ class CRM:
         if not entity or not key:
             raise ValueError("entity and key must be non-empty")
         self.conn.execute(
-            """INSERT INTO facts (entity, key, value, source) VALUES (?, ?, ?, ?)
-               ON CONFLICT(entity, key, value, source)
+            """INSERT INTO facts (entity, key, value, source, event_day)
+               VALUES (?, ?, ?, ?, '')
+               ON CONFLICT(entity, key, value, source, event_day)
                DO UPDATE SET observed_at = CURRENT_TIMESTAMP""",
             (entity, key, value, source)
         )
@@ -1603,8 +1647,9 @@ class CRM:
                 raise ValueError("entity and key must be non-empty")
             rows.append((entity, key, value, src))
         self.conn.executemany(
-            """INSERT INTO facts (entity, key, value, source) VALUES (?, ?, ?, ?)
-               ON CONFLICT(entity, key, value, source)
+            """INSERT INTO facts (entity, key, value, source, event_day)
+               VALUES (?, ?, ?, ?, '')
+               ON CONFLICT(entity, key, value, source, event_day)
                DO UPDATE SET observed_at = CURRENT_TIMESTAMP""",
             rows
         )
@@ -2096,6 +2141,10 @@ class CRM:
         "one_sided_messaging",
         "high_probability_quiet",
     )
+    ACTION_LEARNING_MIN_OUTCOMES = 10
+    ACTION_MOVE_WINDOW_DAYS = 30
+    ACTION_MULTIPLIER_MIN = 0.6
+    ACTION_MULTIPLIER_MAX = 1.4
     DEFAULT_FORECAST_WEIGHTS = {
         "stage": 0.45,
         "activity_recency": 0.20,
@@ -2509,7 +2558,7 @@ class CRM:
             self.conn.executemany(
                 """INSERT INTO facts (entity, key, value, source, observed_at)
                    VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(entity, key, value, source)
+                   ON CONFLICT(entity, key, value, source, event_day)
                    DO UPDATE SET observed_at = excluded.observed_at""",
                 rows,
             )
@@ -3823,7 +3872,7 @@ class CRM:
                 self.conn.execute(
                     """INSERT INTO facts (entity, key, value, source)
                        VALUES (?, 'relinked_rows', ?, 'doctor')
-                       ON CONFLICT(entity, key, value, source)
+                       ON CONFLICT(entity, key, value, source, event_day)
                        DO UPDATE SET observed_at = CURRENT_TIMESTAMP""",
                     (f"doctor:recovered-contact:{contact_id}",
                      json.dumps(affected, sort_keys=True)),
@@ -5441,6 +5490,310 @@ class CRM:
 
     # --- Automation & Intelligence (Wave 4) ---
 
+    @staticmethod
+    def _queue_timestamp(value):
+        """Parse SQLite/ISO timestamps into comparable naive UTC datetimes."""
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    @classmethod
+    def _queue_status_rank(cls, status):
+        """Return a comparable sales-stage rank; terminal losses never advance."""
+        normalized = str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+        ranks = {
+            "prospect": 0,
+            "contacted": 1,
+            "qualification": 1,
+            "qualified": 1,
+            "met": 2,
+            "proposal": 3,
+            "proposal_drafted": 3,
+            "negotiating": 4,
+            "negotiation": 4,
+            "verbal_yes": 5,
+            "active_customer": 6,
+        }
+        return ranks.get(normalized)
+
+    def _surface_outcome_events(self, window_days):
+        """Join mature daily queue surface events to batched CRM outcomes."""
+        surface_rows = self.conn.execute(
+            """SELECT entity,
+                      COALESCE(NULLIF(event_day, ''), observed_at) AS event_id,
+                      MIN(CASE WHEN source = 'queue' THEN observed_at END) AS surfaced_at,
+                      MAX(CASE WHEN source = 'queue' AND key = 'signal_name'
+                               THEN value END) AS signal_name,
+                      MAX(CASE WHEN source = 'queue' AND key = 'action'
+                               THEN value END) AS action,
+                      MAX(CASE WHEN source = 'queue' AND key = 'urgency'
+                               THEN value END) AS urgency,
+                      MAX(CASE WHEN source = 'queue_meta' AND key = 'contact_id'
+                               THEN value END) AS contact_id,
+                      MAX(CASE WHEN source = 'queue_meta' AND key = 'status'
+                               THEN value END) AS surfaced_status
+               FROM facts
+               WHERE entity LIKE 'surfaced:%'
+                 AND source IN ('queue', 'queue_meta')
+               GROUP BY entity, COALESCE(NULLIF(event_day, ''), observed_at)
+               HAVING signal_name IS NOT NULL AND action IS NOT NULL
+                  AND urgency IS NOT NULL
+               ORDER BY surfaced_at, entity"""
+        ).fetchall()
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        maturity_cutoff = now - timedelta(days=self.ACTION_MOVE_WINDOW_DAYS)
+        surfaces = []
+        for row in surface_rows:
+            surfaced_at = self._queue_timestamp(row["surfaced_at"])
+            if surfaced_at is None or surfaced_at > maturity_cutoff:
+                continue
+            surfaces.append({**dict(row), "surfaced_at": surfaced_at})
+        if not surfaces:
+            return []
+
+        contacts = [dict(row) for row in self.conn.execute(
+            "SELECT * FROM contacts ORDER BY id"
+        ).fetchall()]
+        contacts_by_id = {contact["id"]: contact for contact in contacts}
+        contacts_by_key = {
+            str(contact.get("email") or contact["name"]).casefold(): contact
+            for contact in contacts
+        }
+        for surface in surfaces:
+            contact = None
+            try:
+                contact = contacts_by_id.get(int(surface.get("contact_id")))
+            except (TypeError, ValueError):
+                pass
+            if contact is None:
+                contact_key = surface["entity"].split(":", 1)[1].casefold()
+                contact = contacts_by_key.get(contact_key)
+            surface["contact"] = contact
+
+        relevant_ids = {
+            surface["contact"]["id"] for surface in surfaces
+            if surface["contact"] is not None
+        }
+        activities_by_contact = {contact_id: [] for contact_id in relevant_ids}
+        for row in self.conn.execute(
+                "SELECT contact_id, created_at FROM activity ORDER BY created_at"):
+            if row["contact_id"] in relevant_ids:
+                activity_at = self._queue_timestamp(row["created_at"])
+                if activity_at is not None:
+                    activities_by_contact[row["contact_id"]].append(activity_at)
+
+        entity_to_contact = {}
+        for contact in contacts:
+            if contact["id"] not in relevant_ids:
+                continue
+            for entity in self._contact_entity_keys(contact):
+                entity_to_contact[entity] = contact["id"]
+        statuses_by_contact = {contact_id: [] for contact_id in relevant_ids}
+        for row in self.conn.execute(
+                """SELECT entity, value, observed_at FROM facts
+                   WHERE key = 'status' AND source != 'queue_meta'
+                   ORDER BY observed_at, rowid"""):
+            contact_id = entity_to_contact.get(row["entity"])
+            if contact_id is None:
+                continue
+            status_at = self._queue_timestamp(row["observed_at"])
+            if status_at is not None:
+                statuses_by_contact[contact_id].append(
+                    (status_at, row["value"])
+                )
+
+        outcomes = []
+        for surface in surfaces:
+            contact = surface["contact"]
+            if contact is None:
+                continue
+            surfaced_at = surface["surfaced_at"]
+            act_deadline = surfaced_at + timedelta(days=window_days)
+            move_deadline = surfaced_at + timedelta(
+                days=self.ACTION_MOVE_WINDOW_DAYS
+            )
+            activity_times = activities_by_contact.get(contact["id"], [])
+            acted = any(
+                surfaced_at < activity_at <= act_deadline
+                for activity_at in activity_times
+            )
+
+            baseline_status = surface.get("surfaced_status")
+            status_events = statuses_by_contact.get(contact["id"], [])
+            if self._queue_status_rank(baseline_status) is None:
+                earlier_statuses = [
+                    status for status_at, status in status_events
+                    if status_at <= surfaced_at
+                ]
+                if earlier_statuses:
+                    baseline_status = earlier_statuses[-1]
+                else:
+                    updated_at = self._queue_timestamp(contact.get("updated_at"))
+                    if updated_at is not None and updated_at <= surfaced_at:
+                        baseline_status = contact.get("status")
+
+            baseline_rank = self._queue_status_rank(baseline_status)
+            advanced = False
+            if baseline_rank is not None:
+                advanced = any(
+                    surfaced_at < status_at <= move_deadline
+                    and self._queue_status_rank(status) is not None
+                    and self._queue_status_rank(status) > baseline_rank
+                    for status_at, status in status_events
+                )
+                if not advanced:
+                    updated_at = self._queue_timestamp(contact.get("updated_at"))
+                    current_rank = self._queue_status_rank(contact.get("status"))
+                    advanced = (
+                        updated_at is not None
+                        and surfaced_at < updated_at <= move_deadline
+                        and current_rank is not None
+                        and current_rank > baseline_rank
+                    )
+
+            outcomes.append({
+                "signal": surface["signal_name"],
+                "acted": acted,
+                # Attribute movement only when the surfaced action was taken.
+                "moved": acted and advanced,
+            })
+        return outcomes
+
+    def action_outcomes(self, window_days=7):
+        """Summarize mature surfaced actions and their downstream outcomes.
+
+        An action is ``acted`` when activity is logged after surfacing and
+        within ``window_days``. It is ``moved`` when that acted-on contact also
+        advances sales stage within 30 days. Only events old enough to observe
+        the full movement window are scored, avoiding partial-outcome bias.
+        """
+        try:
+            window_days = max(int(window_days), 0)
+        except (TypeError, ValueError):
+            window_days = 7
+        grouped = {}
+        for outcome in self._surface_outcome_events(window_days):
+            stats = grouped.setdefault(outcome["signal"], {
+                "signal": outcome["signal"],
+                "surfaced": 0,
+                "acted": 0,
+                "moved": 0,
+            })
+            stats["surfaced"] += 1
+            stats["acted"] += int(outcome["acted"])
+            stats["moved"] += int(outcome["moved"])
+
+        signal_order = {
+            signal: index for index, signal in enumerate(self.NEXT_ACTION_SIGNAL_NAMES)
+        }
+        rows = []
+        for signal, stats in grouped.items():
+            surfaced = stats["surfaced"]
+            stats["act_rate"] = round(stats["acted"] / surfaced, 4)
+            stats["move_rate"] = round(stats["moved"] / surfaced, 4)
+            rows.append(stats)
+        rows.sort(key=lambda row: (
+            signal_order.get(row["signal"], len(signal_order)), row["signal"]
+        ))
+        return rows
+
+    def _urgency_weight_model(self):
+        """Return multipliers, learned signal names, and their outcome stats."""
+        outcome_rows = self.action_outcomes()
+        by_signal = {row["signal"]: row for row in outcome_rows}
+        all_signals = list(self.NEXT_ACTION_SIGNAL_NAMES)
+        all_signals.extend(sorted(set(by_signal) - set(all_signals)))
+        multipliers = {signal: 1.0 for signal in all_signals}
+        learned_signals = {
+            signal for signal, stats in by_signal.items()
+            if stats["surfaced"] >= self.ACTION_LEARNING_MIN_OUTCOMES
+        }
+        if learned_signals:
+            mean_move_rate = sum(
+                by_signal[signal]["move_rate"] for signal in learned_signals
+            ) / len(learned_signals)
+            if mean_move_rate > 0:
+                for signal in learned_signals:
+                    relative_rate = by_signal[signal]["move_rate"] / mean_move_rate
+                    multipliers[signal] = round(min(max(
+                        relative_rate, self.ACTION_MULTIPLIER_MIN
+                    ), self.ACTION_MULTIPLIER_MAX), 4)
+        return multipliers, learned_signals, outcome_rows
+
+    def tuned_urgency_weights(self):
+        """Return deterministic per-signal urgency multipliers from outcomes."""
+        return self._urgency_weight_model()[0]
+
+    def queue_stats(self):
+        """Return action outcomes alongside the multiplier currently in use."""
+        multipliers, learned_signals, outcome_rows = self._urgency_weight_model()
+        by_signal = {row["signal"]: row for row in outcome_rows}
+        signal_names = list(self.NEXT_ACTION_SIGNAL_NAMES)
+        signal_names.extend(sorted(set(by_signal) - set(signal_names)))
+        rows = []
+        for signal in signal_names:
+            row = dict(by_signal.get(signal, {
+                "signal": signal,
+                "surfaced": 0,
+                "acted": 0,
+                "moved": 0,
+                "act_rate": 0.0,
+                "move_rate": 0.0,
+            }))
+            row["multiplier"] = multipliers[signal]
+            row["weights_source"] = (
+                "learned" if signal in learned_signals else "default"
+            )
+            rows.append(row)
+        return rows
+
+    def _record_surfaced_actions(self, actions):
+        """Persist one grouped queue fact event per returned contact and day."""
+        if not actions:
+            return 0
+        event_day = date.today().isoformat()
+        observed_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(
+            sep=" ", timespec="microseconds"
+        )
+        rows = []
+        for action in actions:
+            entity = f"surfaced:{action['_contact_key']}"
+            rows.extend((
+                (entity, "signal_name", action["_primary_signal"], "queue",
+                 observed_at, event_day),
+                (entity, "action", action["action"], "queue",
+                 observed_at, event_day),
+                (entity, "urgency", str(action["urgency_score"]), "queue",
+                 observed_at, event_day),
+                (entity, "contact_id", str(action["_contact_id"]), "queue_meta",
+                 observed_at, event_day),
+                (entity, "status", action["_status"], "queue_meta",
+                 observed_at, event_day),
+            ))
+        with self.conn:
+            self.conn.executemany(
+                """INSERT INTO facts
+                   (entity, key, value, source, observed_at, event_day)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT DO UPDATE SET
+                       value = excluded.value,
+                       observed_at = excluded.observed_at""",
+                rows,
+            )
+        return len(actions)
+
     def next_actions(self, limit=10):
         """Build one ranked, explainable "do this today" queue.
 
@@ -5456,6 +5809,7 @@ class CRM:
         if limit == 0:
             return []
 
+        urgency_weights, learned_signals, _ = self._urgency_weight_model()
         today = date.today()
         contacts = [
             contact for contact in self.list_contacts()
@@ -5477,17 +5831,29 @@ class CRM:
                 "deal_value": self._parse_deal_size(contact.get("deal_size")),
                 "signals": [],
                 "_primary_score": -1,
+                "_primary_signal": None,
+                "_contact_id": contact["id"],
+                "_contact_key": contact.get("email") or contact["name"],
+                "_status": contact.get("status") or "prospect",
             })
-            signal_score = round(float(score), 1)
+            base_score = round(float(score), 1)
+            multiplier = urgency_weights.get(name, 1.0)
+            signal_score = round(base_score * multiplier, 1)
+            weights_source = "learned" if name in learned_signals else "default"
             entry["signals"].append({
                 "name": name,
                 "value": value,
                 "urgency_score": signal_score,
+                "base_urgency_score": base_score,
+                "multiplier": multiplier,
+                "weights_source": weights_source,
             })
             if signal_score > entry["_primary_score"]:
                 entry["action"] = action
                 entry["reason"] = reason
                 entry["_primary_score"] = signal_score
+                entry["_primary_signal"] = name
+                entry["weights_source"] = weights_source
 
         # Explicit commitments always win. Even a reminder due today scores
         # above the maximum possible non-reminder action.
@@ -5667,7 +6033,13 @@ class CRM:
         actions.sort(key=lambda item: (
             -item["urgency_score"], item["contact"].lower(), item["action"].lower()
         ))
-        return actions[:limit]
+        surfaced = actions[:limit]
+        self._record_surfaced_actions(surfaced)
+        for entry in surfaced:
+            for private_key in (
+                    "_primary_signal", "_contact_id", "_contact_key", "_status"):
+                entry.pop(private_key, None)
+        return surfaced
 
     def propose_ticks(self, benchmark_path="benchmark.py", crm_path="crm.py",
                       roadmap_path="roadmap.md"):
@@ -8410,6 +8782,8 @@ def main():
 
     sub.add_parser("calibration", help="Forecast Brier score, reliability, and learned weights")
 
+    sub.add_parser("queue-stats", help="Queue outcomes and learned urgency multipliers")
+
     sub.add_parser("propose", help="Propose the CRM's next roadmap ticks")
 
     p_today = sub.add_parser("today", help="Rank the best CRM actions to do today")
@@ -9231,6 +9605,18 @@ def main():
                       if bucket["actual_win_rate"] is not None else "-")
             print(f"  {bucket['predicted_decile']:<12} {bucket['count']:>6} "
                   f"{mean:>8} {actual:>8}")
+
+    elif args.command == "queue-stats":
+        rows = [{
+            **row,
+            "act_rate": f"{row['act_rate']:.1%}",
+            "move_rate": f"{row['move_rate']:.1%}",
+            "multiplier": f"{row['multiplier']:.2f}x",
+        } for row in crm.queue_stats()]
+        fmt_table(rows, [
+            "signal", "surfaced", "acted", "moved", "act_rate",
+            "move_rate", "multiplier", "weights_source",
+        ])
 
     elif args.command == "today":
         actions = crm.next_actions(limit=args.limit)
