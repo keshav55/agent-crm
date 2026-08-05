@@ -4051,138 +4051,235 @@ class CRM:
     # --- Automation & Intelligence (Wave 4) ---
 
     def next_actions(self, limit=10):
-        """Recommended actions prioritized by urgency and deal value.
+        """Build one ranked, explainable "do this today" queue.
 
-        Cross-references iMessage reciprocity and velocity data so that
-        contacts who are actively reaching out to you (one-sided-in) or
-        whose relationships are decaying surface as actionable items.
+        The queue composes existing reminder, cadence, relationship-health,
+        stale-deal, and close-probability signals. Each contact appears once;
+        the strongest signal chooses the action while all supporting signals
+        remain available for agents and other callers.
         """
-        contacts = self.list_contacts()
-        actions = []
-        today = date.today()
-        priority_rank = {"high": 0, "medium": 1, "low": 2}
-        contacts_with_actions = set()
+        try:
+            limit = max(int(limit), 0)
+        except (TypeError, ValueError):
+            limit = 10
+        if limit == 0:
+            return []
 
-        # --- Pre-compute iMessage reciprocity data for all contacts ---
-        # Build a lookup: lowercased contact name -> {sent, received, total, intensity}
+        today = date.today()
+        contacts = [
+            contact for contact in self.list_contacts()
+            if contact.get("status") not in ("lost", "churned")
+        ]
+        contacts_by_id = {contact["id"]: contact for contact in contacts}
+        contacts_by_email = {
+            contact["email"].lower(): contact
+            for contact in contacts if contact.get("email")
+        }
+        contacts_by_name = {contact["name"].lower(): contact for contact in contacts}
+        queued = {}
+
+        def add_signal(contact, action, reason, score, name, value):
+            entry = queued.setdefault(contact["id"], {
+                "contact": contact["name"],
+                "action": action,
+                "reason": reason,
+                "deal_value": self._parse_deal_size(contact.get("deal_size")),
+                "signals": [],
+                "_primary_score": -1,
+            })
+            signal_score = round(float(score), 1)
+            entry["signals"].append({
+                "name": name,
+                "value": value,
+                "urgency_score": signal_score,
+            })
+            if signal_score > entry["_primary_score"]:
+                entry["action"] = action
+                entry["reason"] = reason
+                entry["_primary_score"] = signal_score
+
+        # Explicit commitments always win. Even a reminder due today scores
+        # above the maximum possible non-reminder action.
+        for reminder in self.due_reminders():
+            contact = contacts_by_id.get(reminder["contact_id"])
+            if not contact:
+                continue
+            try:
+                due_date = date.fromisoformat(str(reminder["due_date"])[:10])
+                days_overdue = max((today - due_date).days, 0)
+            except (ValueError, TypeError):
+                days_overdue = 0
+            if days_overdue:
+                reason = f"Reminder overdue by {days_overdue} day{'s' if days_overdue != 1 else ''}"
+                signal_name = "overdue_reminder"
+            else:
+                reason = "Reminder due today"
+                signal_name = "due_reminder"
+            add_signal(
+                contact,
+                reminder.get("note") or "Complete reminder",
+                reason,
+                120 + min(days_overdue, 30),
+                signal_name,
+                {"reminder_id": reminder["id"], "due_date": reminder["due_date"],
+                 "days_overdue": days_overdue},
+            )
+
+        cadence = self.optimal_cadence()
+        winning = cadence.get("won_deals", {})
+        cadence_days = winning.get("avg_gap_days") or winning.get("median_gap_days") or 7
+        try:
+            cadence_days = max(int(round(float(cadence_days))), 1)
+        except (TypeError, ValueError):
+            cadence_days = 7
+
+        for contact in contacts:
+            last_contacted = contact.get("last_contacted")
+            days_since = None
+            if last_contacted:
+                try:
+                    days_since = max(
+                        (today - date.fromisoformat(str(last_contacted)[:10])).days, 0
+                    )
+                except (ValueError, TypeError):
+                    pass
+            if days_since is not None and days_since <= cadence_days:
+                continue
+
+            if days_since is None:
+                reason = f"Never contacted; winning cadence is every {cadence_days} days"
+                score = 50
+            else:
+                overdue_days = days_since - cadence_days
+                reason = (f"Last touch was {days_since} days ago; winning cadence is "
+                          f"every {cadence_days} days")
+                score = min(45 + (overdue_days / cadence_days) * 15, 70)
+            status = contact.get("status")
+            if status == "active_customer":
+                action = "Check in"
+            elif status == "prospect" and days_since is None:
+                action = "Initial outreach"
+            else:
+                action = "Follow up"
+            add_signal(
+                contact, action, reason, score, "cadence_overdue",
+                {"days_since_contact": days_since, "cadence_days": cadence_days},
+            )
+
+        # relationship_health_report owns the health/velocity calculation; this
+        # queue only translates low scores into a ranked action.
+        for health in self.relationship_health_report():
+            contact = None
+            if health.get("email"):
+                contact = contacts_by_email.get(health["email"].lower())
+            if not contact:
+                contact = contacts_by_name.get(health["name"].lower())
+            if not contact or health.get("score", 0) >= 40:
+                continue
+            score = health.get("score", 0)
+            reason = f"Relationship health is low at {score}/100"
+            add_signal(
+                contact, "Rebuild relationship", reason,
+                35 + (40 - score) * 0.5,
+                "low_relationship_health",
+                {"score": score, "trend": health.get("trend")},
+            )
+
+        for deal in self.stale_deals(days=30):
+            contact = contacts_by_id.get(deal["contact_id"])
+            if not contact:
+                continue
+            try:
+                updated = date.fromisoformat(str(deal["updated_at"])[:10])
+                stale_days = max((today - updated).days, 30)
+            except (ValueError, TypeError):
+                stale_days = 30
+            reason = f"Open deal '{deal['name']}' has been stale for {stale_days} days"
+            add_signal(
+                contact, "Review stale deal", reason,
+                min(75 + stale_days / 3, 90),
+                "stale_open_deal",
+                {"deal_id": deal["id"], "deal": deal["name"], "stale_days": stale_days},
+            )
+
+        # iMessage reciprocity: they message you heavily, you barely reply.
         imsg_rows = self.conn.execute(
             """SELECT entity, key, value FROM facts
                WHERE source = 'imessage'
-               AND key IN ('imessage_sent', 'imessage_received', 'imessage_total', 'message_intensity')"""
+               AND key IN ('imessage_sent', 'imessage_received', 'imessage_total')"""
         ).fetchall()
         imsg_by_entity = {}
-        for r in imsg_rows:
-            e = r["entity"]
-            if e not in imsg_by_entity:
-                imsg_by_entity[e] = {}
-            imsg_by_entity[e][r["key"]] = r["value"]
+        for row in imsg_rows:
+            imsg_by_entity.setdefault(row["entity"], {})[row["key"]] = row["value"]
+        if imsg_by_entity:
+            for contact in contacts:
+                best = None
+                for variant in self._contact_entity_keys(contact):
+                    data = imsg_by_entity.get(variant)
+                    if data and "imessage_total" in data:
+                        total = int(data.get("imessage_total", 0))
+                        if best is None or total > best["total"]:
+                            best = {
+                                "sent": int(data.get("imessage_sent", 0)),
+                                "received": int(data.get("imessage_received", 0)),
+                                "total": total,
+                            }
+                if (best and best["received"] > 5 and best["sent"] > 0
+                        and best["received"] > best["sent"] * 5):
+                    reason = (f"They've sent {best['received']} messages, you've sent "
+                              f"{best['sent']} — relationship is one-sided")
+                    add_signal(
+                        contact, "Reply", reason,
+                        min(85 + best["received"] / best["sent"], 95),
+                        "one_sided_messaging",
+                        {"sent": best["sent"], "received": best["received"]},
+                    )
 
-        def _get_imsg_data(contact):
-            """Resolve iMessage data for a CRM contact across entity key variants."""
-            variants = self._contact_entity_keys(contact)
-            best = None
-            for v in variants:
-                data = imsg_by_entity.get(v)
-                if data and "imessage_total" in data:
-                    total = int(data.get("imessage_total", 0))
-                    if best is None or total > best.get("total", 0):
-                        best = {
-                            "sent": int(data.get("imessage_sent", 0)),
-                            "received": int(data.get("imessage_received", 0)),
-                            "total": total,
-                            "intensity": data.get("message_intensity", "low"),
-                        }
-            return best
-
-        for c in contacts:
-            identifier = c.get("email") or c["name"]
-            name = c["name"]
-            status = c.get("status", "prospect")
-            deal_val = self._parse_deal_size(c.get("deal_size"))
-            lc = c.get("last_contacted")
-            days_since = None
-            if lc:
-                try:
-                    days_since = (today - date.fromisoformat(str(lc)[:10])).days
-                except (ValueError, TypeError):
-                    pass
-
-            acts = self.get_activity(identifier, limit=50)
-            act_types = [a["type"] for a in acts]
-
-            # Check for unresolved conflicts
-            entity_keys = self._contact_entity_keys(c)
-            has_conflicts = False
-            for ek in entity_keys:
-                if self.conflicts(entity=ek):
-                    has_conflicts = True
-                    break
-
-            # Verbal yes -> Send contract (high) — check before stale so it takes priority
+        for forecast_row in self.forecast()["contacts"]:
+            probability = forecast_row["probability"]
+            recency = next(
+                (signal.get("value") for signal in forecast_row["signals"]
+                 if signal.get("name") == "activity_recency"),
+                None,
+            )
+            if probability < 0.40 or (recency is not None and recency <= cadence_days):
+                continue
+            contact = contacts_by_id.get(forecast_row["contact"]["id"])
+            if not contact:
+                continue
+            quiet_reason = ("no recorded activity" if recency is None
+                            else f"quiet for {recency} days")
+            reason = f"{probability:.0%} close probability, but {quiet_reason}"
+            status = forecast_row["status"]
             if status == "verbal_yes":
-                actions.append({"contact": name, "action": "Send contract", "reason": "Verbal yes — close the deal", "priority": "high", "deal_value": deal_val})
-                contacts_with_actions.add(name)
-                continue
+                action = "Send contract"
+            elif status == "proposal_drafted":
+                action = "Follow up on proposal"
+            else:
+                action = "Re-engage"
+            extra_staleness = 0 if recency is None else max(recency - cadence_days, 0)
+            add_signal(
+                contact, action, reason,
+                min(80 + probability * 15 + min(extra_staleness, 10) * 0.5, 105),
+                "high_probability_quiet",
+                {"probability": probability, "days_since_activity": recency},
+            )
 
-            # iMessage reciprocity: they message you heavily, you barely reply (high)
-            imsg = _get_imsg_data(c)
-            if imsg and imsg["received"] > 5 and imsg["sent"] > 0 and imsg["received"] > imsg["sent"] * 5:
-                actions.append({
-                    "contact": name,
-                    "action": "Reply",
-                    "reason": f"They've sent {imsg['received']} messages, you've sent {imsg['sent']} — relationship is one-sided",
-                    "priority": "high",
-                    "deal_value": deal_val,
-                })
-                contacts_with_actions.add(name)
-                continue
+        actions = []
+        for entry in queued.values():
+            supporting_bonus = min(max(len(entry["signals"]) - 1, 0) * 2, 4)
+            entry["urgency_score"] = round(entry.pop("_primary_score") + supporting_bonus, 1)
+            if entry["urgency_score"] >= 80:
+                entry["priority"] = "high"
+            elif entry["urgency_score"] >= 55:
+                entry["priority"] = "medium"
+            else:
+                entry["priority"] = "low"
+            actions.append(entry)
 
-            # Stale high-value contacts -> Follow up (high)
-            if deal_val > 0 and (days_since is None or days_since > 14) and status not in ("active_customer", "lost", "churned"):
-                actions.append({"contact": name, "action": "Follow up", "reason": "High-value contact gone stale", "priority": "high", "deal_value": deal_val})
-                contacts_with_actions.add(name)
-                continue
-
-            # Proposal drafted > 7 days -> Follow up on proposal (medium)
-            if status == "proposal_drafted" and days_since is not None and days_since > 7:
-                actions.append({"contact": name, "action": "Follow up on proposal", "reason": "Proposal sent over 7 days ago", "priority": "medium", "deal_value": deal_val})
-                contacts_with_actions.add(name)
-                continue
-
-            # Met but no proposal -> Draft proposal (medium)
-            if status == "met":
-                actions.append({"contact": name, "action": "Draft proposal", "reason": "Met but no proposal yet", "priority": "medium", "deal_value": deal_val})
-                contacts_with_actions.add(name)
-                continue
-
-            # Decaying velocity on pipeline contacts -> Re-engage (medium)
-            if status not in ("active_customer", "lost", "churned") and len(acts) >= 2:
-                vel = self.velocity(identifier)
-                if vel and vel["trend"] == "decaying" and vel["days_until_cold"] is not None:
-                    actions.append({
-                        "contact": name,
-                        "action": "Re-engage",
-                        "reason": f"Engagement decaying — projected cold in {vel['days_until_cold']} days",
-                        "priority": "medium",
-                        "deal_value": deal_val,
-                    })
-                    contacts_with_actions.add(name)
-                    continue
-
-            # Prospects with no activity -> Initial outreach (low)
-            if status == "prospect" and len(acts) == 0:
-                actions.append({"contact": name, "action": "Initial outreach", "reason": "Prospect with no activity", "priority": "low", "deal_value": deal_val})
-                contacts_with_actions.add(name)
-                continue
-
-            # Unresolved conflicts -> Verify (low)
-            if has_conflicts:
-                actions.append({"contact": name, "action": "Verify conflicting info", "reason": "Conflicting facts detected", "priority": "low", "deal_value": deal_val})
-                contacts_with_actions.add(name)
-                continue
-
-        # Sort: priority first (high < medium < low), then deal_value descending
-        actions.sort(key=lambda a: (priority_rank.get(a["priority"], 9), -a["deal_value"]))
+        actions.sort(key=lambda item: (
+            -item["urgency_score"], item["contact"].lower(), item["action"].lower()
+        ))
         return actions[:limit]
 
     def suggest_status(self, identifier):
@@ -6313,6 +6410,9 @@ def main():
     p_forecast = sub.add_parser("forecast", help="Rank open deals by close probability")
     p_forecast.add_argument("--limit", "-n", type=int, help="Maximum contacts to show")
 
+    p_today = sub.add_parser("today", help="Rank the best CRM actions to do today")
+    p_today.add_argument("--limit", "-n", type=int, default=10, help="Maximum actions to show")
+
     sub.add_parser("duplicates", help="Find potential duplicate contacts")
 
     p_stalec = sub.add_parser("stale-contacts", help="Contacts not contacted in N days")
@@ -7021,6 +7121,19 @@ def main():
         else:
             fmt_table(rows, ["name", "company", "status", "probability", "deal_value", "weighted_value"])
         print(f"\n  Weighted Pipeline: ${fc['weighted_pipeline']:,.0f}")
+
+    elif args.command == "today":
+        actions = crm.next_actions(limit=args.limit)
+        if not actions:
+            print("  No actions for today")
+        else:
+            rows = [{
+                "rank": rank,
+                "name": item["contact"],
+                "action": item["action"],
+                "reason": item["reason"],
+            } for rank, item in enumerate(actions, 1)]
+            fmt_table(rows, ["rank", "name", "action", "reason"])
 
     elif args.command == "duplicates":
         dupes = crm.find_duplicates()

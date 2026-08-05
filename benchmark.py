@@ -3827,6 +3827,192 @@ def run_benchmarks():
 
     prob_crm.close()
 
+    # ── 76. Next-Best-Action Queue (12 tests) ──
+
+    empty_actions_crm = CRM(os.path.join(tempfile.mkdtemp(), "empty-actions.db"))
+
+    # 76a. an empty CRM has no recommended actions
+    try:
+        check("next_actions_empty_crm", empty_actions_crm.next_actions() == [])
+    except (AttributeError, TypeError):
+        check("next_actions_empty_crm", False)
+    empty_actions_crm.close()
+
+    actions_dir = tempfile.mkdtemp()
+    actions_db = os.path.join(actions_dir, "next-actions.db")
+    actions_crm = CRM(actions_db)
+
+    # A seven-day winning activity gap calibrates optimal_cadence().
+    actions_crm.add_contact("Won Pattern", email="won@actions.com", status="active_customer")
+    won_pattern_id = actions_crm.get_contact("won@actions.com")["id"]
+    for days in (14, 7):
+        actions_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) "
+            "VALUES (?, 'email', 'Winning touch', datetime('now', ?))",
+            (won_pattern_id, f"-{days} days"),
+        )
+    actions_crm.update_contact("won@actions.com", last_contacted=_date.today().isoformat())
+
+    actions_crm.add_contact("Reminder Rita", email="rita@actions.com", status="contacted")
+    actions_crm.update_contact("rita@actions.com", last_contacted=_date.today().isoformat())
+    actions_crm.set_reminder(
+        "rita@actions.com", (_date.today() - timedelta(days=3)).isoformat(), "Call Rita"
+    )
+
+    actions_crm.add_contact("Mild Cadence", email="mild@actions.com", status="contacted")
+    actions_crm.update_contact(
+        "mild@actions.com", last_contacted=(_date.today() - timedelta(days=10)).isoformat()
+    )
+
+    actions_crm.add_contact("Health Hank", email="hank@actions.com", status="prospect")
+    actions_crm.update_contact("hank@actions.com", last_contacted=_date.today().isoformat())
+
+    actions_crm.add_contact("Stale Deal Sam", email="sam@actions.com", status="contacted")
+    actions_crm.update_contact("sam@actions.com", last_contacted=_date.today().isoformat())
+    actions_crm.add_deal("sam@actions.com", "Expansion", value="$25K", stage="proposal")
+    actions_crm.conn.execute(
+        "UPDATE deals SET updated_at = datetime('now', '-45 days') WHERE contact_id = ?",
+        (actions_crm.get_contact("sam@actions.com")["id"],),
+    )
+
+    actions_crm.add_contact(
+        "Quiet Quinn", email="quinn@actions.com", status="verbal_yes",
+        deal_size="$50K", source="referral",
+    )
+    quiet_id = actions_crm.get_contact("quinn@actions.com")["id"]
+    actions_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) "
+        "VALUES (?, 'meeting', 'Buying signal', datetime('now', '-21 days'))",
+        (quiet_id,),
+    )
+    actions_crm.update_contact(
+        "quinn@actions.com", last_contacted=(_date.today() - timedelta(days=21)).isoformat()
+    )
+
+    actions_crm.add_contact("Limit Leo", email="leo@actions.com", status="prospect")
+
+    for name, email, status in (
+        ("Lost Lola", "lost@actions.com", "lost"),
+        ("Churned Chad", "churned@actions.com", "churned"),
+        ("Archived Aria", "archived@actions.com", "verbal_yes"),
+    ):
+        actions_crm.add_contact(name, email=email, status=status, deal_size="$100K")
+        actions_crm.set_reminder(
+            email, (_date.today() - timedelta(days=30)).isoformat(), "Should stay hidden"
+        )
+    actions_crm.archive_contact("archived@actions.com")
+    actions_crm.conn.commit()
+
+    # 76b. limit truncates without changing the established rank
+    try:
+        all_actions = actions_crm.next_actions(limit=50)
+        limited_actions = actions_crm.next_actions(limit=2)
+        check("next_actions_limit", len(limited_actions) == 2 and
+              limited_actions == all_actions[:2])
+    except (AttributeError, TypeError):
+        check("next_actions_limit", False)
+
+    # 76c. the queue is ordered by urgency descending
+    try:
+        urgency = [item["urgency_score"] for item in actions_crm.next_actions(limit=50)]
+        check("next_actions_urgency_order", urgency == sorted(urgency, reverse=True))
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_urgency_order", False)
+
+    # 76d. an overdue reminder outranks a mildly overdue cadence
+    try:
+        by_name = {item["contact"]: item for item in actions_crm.next_actions(limit=50)}
+        check("next_actions_reminder_priority",
+              by_name["Reminder Rita"]["urgency_score"] >
+              by_name["Mild Cadence"]["urgency_score"])
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_reminder_priority", False)
+
+    # 76e. archived, lost, and churned contacts never enter the queue
+    try:
+        names = {item["contact"] for item in actions_crm.next_actions(limit=50)}
+        check("next_actions_excludes_inactive",
+              not names.intersection({"Archived Aria", "Lost Lola", "Churned Chad"}))
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_excludes_inactive", False)
+
+    # 76f. unchanged CRM data produces byte-for-byte-equivalent rows
+    try:
+        first_actions = actions_crm.next_actions(limit=50)
+        second_actions = actions_crm.next_actions(limit=50)
+        check("next_actions_deterministic", first_actions == second_actions)
+    except (AttributeError, TypeError):
+        check("next_actions_deterministic", False)
+
+    # 76g. every row exposes the documented queue contract
+    try:
+        required = {"contact", "action", "reason", "urgency_score", "signals"}
+        queue = actions_crm.next_actions(limit=50)
+        check("next_actions_required_keys", bool(queue) and
+              all(required.issubset(item) for item in queue))
+    except (AttributeError, TypeError):
+        check("next_actions_required_keys", False)
+
+    # 76h. reasons are always useful display strings
+    try:
+        queue = actions_crm.next_actions(limit=50)
+        check("next_actions_nonempty_reason", bool(queue) and all(
+            isinstance(item["reason"], str) and item["reason"].strip() for item in queue
+        ))
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_nonempty_reason", False)
+
+    # 76h2. one-sided iMessage traffic surfaces a Reply action
+    try:
+        actions_crm.add_contact("Chatty Charlie", email="charlie@imsg.test", status="contacted")
+        for k, v in (("imessage_sent", "2"), ("imessage_received", "40"), ("imessage_total", "42")):
+            actions_crm.observe("contact:charlie@imsg.test", k, v, source="imessage")
+        charlie = next(item for item in actions_crm.next_actions(limit=50)
+                       if item["contact"] == "Chatty Charlie")
+        check("next_actions_imsg_reciprocity",
+              "one_sided_messaging" in {signal["name"] for signal in charlie["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_imsg_reciprocity", False)
+
+    # 76i. contacts beyond the learned winning cadence expose that signal
+    try:
+        mild = next(item for item in actions_crm.next_actions(limit=50)
+                    if item["contact"] == "Mild Cadence")
+        check("next_actions_cadence_signal",
+              "cadence_overdue" in {signal["name"] for signal in mild["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_cadence_signal", False)
+
+    # 76j. low relationship-health scores surface as an explicit signal
+    try:
+        hank = next(item for item in actions_crm.next_actions(limit=50)
+                    if item["contact"] == "Health Hank")
+        check("next_actions_health_signal",
+              "low_relationship_health" in {signal["name"] for signal in hank["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_health_signal", False)
+
+    # 76k. stale open deals surface through the existing stale_deals detector
+    try:
+        sam = next(item for item in actions_crm.next_actions(limit=50)
+                   if item["contact"] == "Stale Deal Sam")
+        check("next_actions_stale_deal_signal",
+              "stale_open_deal" in {signal["name"] for signal in sam["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_stale_deal_signal", False)
+
+    # 76l. high-probability deals that went quiet get a close-focused action
+    try:
+        quinn = next(item for item in actions_crm.next_actions(limit=50)
+                     if item["contact"] == "Quiet Quinn")
+        signal_names = {signal["name"] for signal in quinn["signals"]}
+        check("next_actions_probability_signal",
+              "high_probability_quiet" in signal_names and quinn["action"] == "Send contract")
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_probability_signal", False)
+
+    actions_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)

@@ -25,7 +25,7 @@ Use `win_loss_analysis()` history to score open deals: given status, cadence,
 activity recency, and source, estimate close likelihood. New method
 `deal_probability(identifier)`, CLI `crm.py forecast`, MCP tool. ~15 tests.
 
-### Two. Next-best-action queue
+### [x] Two. Next-best-action queue
 Combine reminders, `optimal_cadence()`, health scores, and stale-deal detection
 into one ranked "do this today" list. `next_actions(limit=10)`, CLI
 `crm.py today`. This is the single highest-leverage daily entry point. ~12 tests.

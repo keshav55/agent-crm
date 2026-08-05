@@ -184,7 +184,7 @@ TOOLS = [
     },
     {
         "name": "crm_next_actions",
-        "description": "Get recommended next actions across all contacts, prioritized",
+        "description": "Get the ranked do-this-today queue from reminders, cadence, relationship health, stale deals, and close probability",
         "inputSchema": {
             "type": "object",
             "properties": {
