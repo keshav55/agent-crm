@@ -14,8 +14,8 @@ Usage:
     python crm.py log jane@co.com email "Sent proposal, she's interested"
     python crm.py activity jane@co.com
     python crm.py search "acme"
-    python crm.py export --format csv
-    python crm.py import contacts.csv
+    python crm.py export backup.json
+    python crm.py import-csv contacts.csv
     python crm.py markdown
     python crm.py stats
 """
@@ -27,10 +27,12 @@ import sys
 import os
 import json
 import re
+import quopri
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_DB = os.environ.get("CRM_DB", "crm.db")
+SCHEMA_VERSION = 1
 
 # Simple email regex: local@domain.tld — rejects obviously bogus values
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
@@ -636,38 +638,82 @@ class CRM:
         return vcf_text
 
     def import_vcard(self, path):
-        """Import contacts from a vCard (.vcf) file. Returns count imported."""
+        """Import FN, EMAIL, ORG, and TEL fields from one or more vCards."""
         if not os.path.exists(path):
             return 0
-        with open(path, "r") as f:
-            content = f.read()
+
+        with open(path, "rb") as f:
+            physical_lines = f.read().splitlines()
+
+        # RFC 6350 folds long content lines by starting the continuation with
+        # a space or tab. Some older vCard writers also use quoted-printable
+        # soft line breaks, so accept those here too.
+        lines = []
+        for raw_line in physical_lines:
+            if lines and (raw_line.startswith((b" ", b"\t")) or lines[-1].endswith(b"=")):
+                if lines[-1].endswith(b"="):
+                    lines[-1] = lines[-1][:-1]
+                lines[-1] += raw_line[1:] if raw_line.startswith((b" ", b"\t")) else raw_line
+            else:
+                lines.append(raw_line)
+
+        def decode_value(raw_value, params):
+            encoding = params.get("ENCODING", "").upper()
+            if encoding in ("QUOTED-PRINTABLE", "Q"):
+                raw_value = quopri.decodestring(raw_value)
+            charset = params.get("CHARSET", "utf-8")
+            try:
+                value = raw_value.decode(charset)
+            except (LookupError, UnicodeDecodeError):
+                value = raw_value.decode("utf-8", errors="replace")
+            return (value.replace("\\n", "\n").replace("\\N", "\n")
+                         .replace("\\,", ",").replace("\\;", ";")
+                         .replace("\\:", ":").replace("\\\\", "\\"))
+
         count = 0
-        # Split into individual vCards
-        cards = content.split("BEGIN:VCARD")
-        for card in cards:
-            if not card.strip():
+        card = None
+        for raw_line in lines:
+            if raw_line.strip().upper() == b"BEGIN:VCARD":
+                card = {"FN": [], "EMAIL": [], "ORG": [], "TEL": [], "TITLE": [], "NOTE": []}
                 continue
-            name = email = company = title = notes = None
-            for line in card.split("\n"):
-                line = line.strip()
-                if line.startswith("FN:"):
-                    name = line[3:].strip()
-                elif line.startswith("EMAIL"):
-                    email = line.split(":", 1)[1].strip() if ":" in line else None
-                elif line.startswith("ORG:"):
-                    company = line[4:].strip()
-                elif line.startswith("TITLE:"):
-                    title = line[6:].strip()
-                elif line.startswith("NOTE:"):
-                    notes = line[5:].replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
-            if name:
-                try:
-                    self._validate_email(email)
-                    self.add_contact(name=name, email=email, company=company,
-                                     title=title, notes=notes, source="vcard_import")
-                    count += 1
-                except (sqlite3.IntegrityError, ValueError):
-                    pass  # skip duplicates and invalid emails
+            if raw_line.strip().upper() == b"END:VCARD":
+                if card:
+                    name = card["FN"][0].strip() if card["FN"] else None
+                    email = card["EMAIL"][0].strip() if card["EMAIL"] else None
+                    company = card["ORG"][0].split(";", 1)[0].strip() if card["ORG"] else None
+                    title = card["TITLE"][0].strip() if card["TITLE"] else None
+                    notes = card["NOTE"][0].strip() if card["NOTE"] else None
+                    if name:
+                        try:
+                            self._validate_email(email)
+                            self.add_contact(name=name, email=email or None, company=company or None,
+                                             title=title or None, notes=notes or None,
+                                             source="vcard_import")
+                            phones = [phone.strip() for phone in card["TEL"] if phone.strip()]
+                            if phones:
+                                entity = f"contact:{name.lower()}"
+                                self.observe_many(
+                                    [(entity, "phone", phone, "vcard_import") for phone in phones],
+                                    source="vcard_import",
+                                )
+                            count += 1
+                        except (sqlite3.IntegrityError, ValueError):
+                            pass  # skip duplicates and invalid emails
+                card = None
+                continue
+            if card is None or b":" not in raw_line:
+                continue
+
+            raw_head, raw_value = raw_line.split(b":", 1)
+            head_parts = raw_head.decode("ascii", errors="ignore").split(";")
+            property_name = head_parts[0].rsplit(".", 1)[-1].upper()
+            params = {}
+            for param in head_parts[1:]:
+                if "=" in param:
+                    key, value = param.split("=", 1)
+                    params[key.upper()] = value.strip('"')
+            if property_name in card:
+                card[property_name].append(decode_value(raw_value, params))
         return count
 
     def dashboard(self):
@@ -897,15 +943,216 @@ class CRM:
 
     # --- Import/Export ---
 
+    _FULL_TABLE_COLUMNS = {
+        "contacts": (
+            "id", "email", "name", "company", "title", "deal_size", "status",
+            "source", "notes", "tags", "archived", "last_contacted",
+            "created_at", "updated_at",
+        ),
+        "activity": ("id", "contact_id", "type", "summary", "created_at"),
+        "deals": (
+            "id", "contact_id", "name", "value", "stage", "notes",
+            "created_at", "updated_at", "closed_at",
+        ),
+        "facts": ("rowid", "entity", "key", "value", "source", "observed_at"),
+    }
+
+    _CSV_FIELDS = _FULL_TABLE_COLUMNS["contacts"]
+    _CSV_ALIASES = {
+        "name": {"name", "full name", "contact name"},
+        "email": {"email", "email address", "e mail", "e-mail", "e-mail address"},
+        "company": {"company", "company name", "organization", "organisation", "org"},
+        "title": {"title", "job title", "role", "position"},
+        "deal_size": {"deal size", "deal value", "amount", "value"},
+        "status": {"status", "stage", "lifecycle", "lifecycle stage"},
+        "source": {"source", "lead source", "origin"},
+        "phone": {"phone", "phone number", "mobile", "mobile phone", "telephone", "tel"},
+        "notes": {"notes", "note", "description", "comments", "comment"},
+        "tags": {"tags", "tag"},
+        "archived": {"archived"},
+        "last_contacted": {"last contacted", "last contact", "last_contacted"},
+        "created_at": {"created at", "created_at"},
+        "updated_at": {"updated at", "updated_at"},
+        "id": {"id", "contact id", "contact_id"},
+    }
+
+    @staticmethod
+    def _normalized_csv_header(header):
+        return re.sub(r"[^a-z0-9]+", " ", str(header).strip().lower()).strip()
+
+    def export_full(self):
+        """Return a lossless, versioned export of every core CRM table."""
+        exported = {"schema_version": SCHEMA_VERSION}
+        primary_keys = {"contacts": "id", "activity": "id", "deals": "id", "facts": "rowid"}
+        for table in ("contacts", "activity", "deals", "facts"):
+            rows = self.conn.execute(
+                f"SELECT * FROM {table} ORDER BY {primary_keys[table]}"
+            ).fetchall()
+            exported[table] = [dict(row) for row in rows]
+        return exported
+
+    def import_full(self, data, merge=False):
+        """Restore an ``export_full`` payload, optionally merging contacts.
+
+        A non-merge restore preserves primary keys and timestamps exactly, and
+        therefore requires empty core tables. Merge mode maps imported child
+        rows to contacts matched by email, falling back to an exact name match.
+        """
+        required = ("contacts", "activity", "deals", "facts")
+        if not isinstance(data, dict):
+            return {"error": "Full import data must be an object"}
+        if data.get("schema_version") != SCHEMA_VERSION:
+            return {"error": f"Unsupported schema_version: {data.get('schema_version')}"}
+        if any(not isinstance(data.get(table), list) for table in required):
+            return {"error": "Full import requires contacts, activity, deals, and facts lists"}
+        if any(not isinstance(row, dict) for table in required for row in data[table]):
+            return {"error": "Full import rows must be objects"}
+
+        if not merge:
+            counts = {
+                table: self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in required
+            }
+            if any(counts.values()):
+                return {
+                    "error": "Full import requires an empty database; use merge=True to combine data",
+                    "counts": counts,
+                }
+
+        imported = {"contacts": 0, "activity": 0, "deals": 0, "facts": 0}
+        updated_contacts = 0
+        skipped = {"activity": 0, "deals": 0, "facts": 0}
+
+        try:
+            with self.conn:
+                if not merge:
+                    for table in required:
+                        columns = self._FULL_TABLE_COLUMNS[table]
+                        placeholders = ", ".join("?" for _ in columns)
+                        column_sql = ", ".join(columns)
+                        self.conn.executemany(
+                            f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
+                            [tuple(row.get(column) for column in columns) for row in data[table]],
+                        )
+                        imported[table] = len(data[table])
+                else:
+                    contact_columns = self._FULL_TABLE_COLUMNS["contacts"]
+                    mutable_contact_columns = contact_columns[1:]
+                    contact_ids = {}
+                    for row in data["contacts"]:
+                        existing = None
+                        if row.get("email"):
+                            existing = self.conn.execute(
+                                "SELECT id FROM contacts WHERE email = ? COLLATE NOCASE",
+                                (row["email"],),
+                            ).fetchone()
+                        if existing is None and row.get("name"):
+                            existing = self.conn.execute(
+                                "SELECT id FROM contacts WHERE name = ?", (row["name"],)
+                            ).fetchone()
+
+                        if existing:
+                            target_id = existing["id"]
+                            assignments = ", ".join(f"{column} = ?" for column in mutable_contact_columns)
+                            self.conn.execute(
+                                f"UPDATE contacts SET {assignments} WHERE id = ?",
+                                tuple(row.get(column) for column in mutable_contact_columns) + (target_id,),
+                            )
+                            updated_contacts += 1
+                        else:
+                            placeholders = ", ".join("?" for _ in mutable_contact_columns)
+                            self.conn.execute(
+                                f"INSERT INTO contacts ({', '.join(mutable_contact_columns)}) VALUES ({placeholders})",
+                                tuple(row.get(column) for column in mutable_contact_columns),
+                            )
+                            target_id = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                        contact_ids[row.get("id")] = target_id
+                        imported["contacts"] += 1
+
+                    for row in data["activity"]:
+                        target_id = contact_ids.get(row.get("contact_id"))
+                        if target_id is None:
+                            raise ValueError(f"activity references unknown contact_id {row.get('contact_id')}")
+                        exists = self.conn.execute(
+                            """SELECT 1 FROM activity
+                               WHERE contact_id = ? AND type IS ? AND summary IS ? AND created_at IS ?""",
+                            (target_id, row.get("type"), row.get("summary"), row.get("created_at")),
+                        ).fetchone()
+                        if exists:
+                            skipped["activity"] += 1
+                            continue
+                        self.conn.execute(
+                            "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, ?, ?, ?)",
+                            (target_id, row.get("type"), row.get("summary"), row.get("created_at")),
+                        )
+                        imported["activity"] += 1
+
+                    for row in data["deals"]:
+                        target_id = contact_ids.get(row.get("contact_id"))
+                        if target_id is None:
+                            raise ValueError(f"deal references unknown contact_id {row.get('contact_id')}")
+                        deal_values = (
+                            target_id, row.get("name"), row.get("value"), row.get("stage"),
+                            row.get("notes"), row.get("created_at"), row.get("updated_at"),
+                            row.get("closed_at"),
+                        )
+                        exists = self.conn.execute(
+                            """SELECT 1 FROM deals WHERE contact_id = ? AND name IS ? AND value IS ?
+                               AND stage IS ? AND notes IS ? AND created_at IS ?
+                               AND updated_at IS ? AND closed_at IS ?""",
+                            deal_values,
+                        ).fetchone()
+                        if exists:
+                            skipped["deals"] += 1
+                            continue
+                        self.conn.execute(
+                            """INSERT INTO deals
+                               (contact_id, name, value, stage, notes, created_at, updated_at, closed_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            deal_values,
+                        )
+                        imported["deals"] += 1
+
+                    for row in data["facts"]:
+                        fact_values = (
+                            row.get("entity"), row.get("key"), row.get("value"),
+                            row.get("source"), row.get("observed_at"),
+                        )
+                        exists = self.conn.execute(
+                            """SELECT 1 FROM facts WHERE entity IS ? AND key IS ? AND value IS ?
+                               AND source IS ? AND observed_at IS ?""",
+                            fact_values,
+                        ).fetchone()
+                        if exists:
+                            skipped["facts"] += 1
+                            continue
+                        try:
+                            self.conn.execute(
+                                "INSERT INTO facts (entity, key, value, source, observed_at) VALUES (?, ?, ?, ?, ?)",
+                                fact_values,
+                            )
+                            imported["facts"] += 1
+                        except sqlite3.IntegrityError:
+                            # Older schemas deduplicate identical fact content even
+                            # when the observation timestamps differ.
+                            skipped["facts"] += 1
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            return {"error": f"Full import failed: {exc}"}
+
+        return {
+            "imported": imported,
+            "updated_contacts": updated_contacts,
+            "skipped": skipped,
+            "merge": bool(merge),
+        }
+
     def export_csv(self, path=None, enrich=False):
         """Export contacts to CSV.
 
         If enrich=True, append activity_count, deal_count, and score columns
         so the spreadsheet gives a complete picture of each contact.
         """
-        contacts = self.list_contacts()
-        if not contacts:
-            return ""
+        contacts = [dict(row) for row in self.conn.execute("SELECT * FROM contacts ORDER BY id")]
         if enrich:
             for c in contacts:
                 cid = c["id"]
@@ -919,37 +1166,124 @@ class CRM:
                 c["score"] = sc["score"] if sc else 0
         output = path or sys.stdout
         should_close = False
-        if isinstance(output, str):
-            output = open(output, "w", newline="")
+        if isinstance(output, (str, os.PathLike)):
+            output = open(output, "w", newline="", encoding="utf-8")
             should_close = True
-        writer = csv.DictWriter(output, fieldnames=contacts[0].keys())
+        fieldnames = list(self._CSV_FIELDS)
+        if enrich:
+            fieldnames.extend(("activity_count", "deal_count", "score"))
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(contacts)
         if should_close:
             output.close()
         return path or "stdout"
 
-    def import_csv(self, path):
-        count = 0
-        with open(path, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+    def import_csv(self, path, mapping=None):
+        """Import contacts from CSV with common-header auto-detection."""
+        outcome = {"imported": 0, "skipped": 0, "errors": 0}
+        with open(path, "r", newline="", encoding="utf-8-sig") as f:
+            sample = f.read(8192)
+            f.seek(0)
+            if not sample.strip():
+                return outcome
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                reader = csv.DictReader(f, dialect=dialect, strict=True)
+            except csv.Error:
+                reader = csv.DictReader(f, strict=True)
+
+            headers = reader.fieldnames or []
+            field_map = {}
+            for header in headers:
+                normalized = self._normalized_csv_header(header)
+                for field, aliases in self._CSV_ALIASES.items():
+                    if normalized in {self._normalized_csv_header(alias) for alias in aliases}:
+                        field_map[normalized] = field
+                        break
+
+            if mapping:
+                canonical_fields = {
+                    self._normalized_csv_header(field): field for field in self._CSV_ALIASES
+                }
+                for left, right in mapping.items():
+                    left_normalized = self._normalized_csv_header(left)
+                    right_normalized = self._normalized_csv_header(right)
+                    if left_normalized in canonical_fields and right_normalized not in canonical_fields:
+                        source_header = right_normalized
+                        target_field = canonical_fields[left_normalized]
+                    else:
+                        source_header = left_normalized
+                        target_field = canonical_fields.get(right_normalized)
+                    if target_field is None:
+                        continue
+                    field_map = {
+                        source: target for source, target in field_map.items()
+                        if target != target_field
+                    }
+                    field_map[source_header] = target_field
+
+            while True:
                 try:
-                    self.add_contact(
-                        name=row.get("name", ""),
-                        email=row.get("email"),
-                        company=row.get("company"),
-                        title=row.get("title"),
-                        deal_size=row.get("deal_size"),
-                        status=row.get("status", "prospect"),
-                        source=row.get("source"),
-                        notes=row.get("notes"),
-                        tags=row.get("tags"),
+                    row = next(reader)
+                except StopIteration:
+                    break
+                except csv.Error:
+                    outcome["errors"] += 1
+                    break
+
+                if None in row or any(value is None for value in row.values()):
+                    outcome["errors"] += 1
+                    continue
+                normalized = {}
+                for header, value in row.items():
+                    field = field_map.get(self._normalized_csv_header(header))
+                    if field:
+                        normalized[field] = value.strip() if isinstance(value, str) else value
+
+                name = normalized.get("name", "")
+                if not name:
+                    outcome["skipped"] += 1
+                    continue
+
+                try:
+                    archived = None
+                    if "archived" in normalized and normalized["archived"] != "":
+                        archived = int(normalized["archived"])
+                    contact_id = self.add_contact(
+                        name=name,
+                        email=normalized.get("email") or None,
+                        company=normalized.get("company") or None,
+                        title=normalized.get("title") or None,
+                        deal_size=normalized.get("deal_size") or None,
+                        status=normalized.get("status") or "prospect",
+                        source=normalized.get("source") or None,
+                        notes=normalized.get("notes") or None,
+                        tags=normalized.get("tags") or None,
                     )
-                    count += 1
+                    metadata = {
+                        key: normalized[key] for key in
+                        ("last_contacted", "created_at", "updated_at")
+                        if normalized.get(key)
+                    }
+                    if archived is not None:
+                        metadata["archived"] = archived
+                    if metadata:
+                        assignments = ", ".join(f"{key} = ?" for key in metadata)
+                        self.conn.execute(
+                            f"UPDATE contacts SET {assignments} WHERE id = ?",
+                            tuple(metadata.values()) + (contact_id,),
+                        )
+                        self.conn.commit()
+                    phone = normalized.get("phone")
+                    if phone:
+                        self.observe(f"contact:{name.lower()}", "phone", phone, source="csv_import")
+                    outcome["imported"] += 1
                 except sqlite3.IntegrityError:
-                    pass  # skip duplicates
-        return count
+                    outcome["skipped"] += 1
+                except (TypeError, ValueError):
+                    outcome["errors"] += 1
+        return outcome
 
     # --- Context Graph ---
 
@@ -6559,14 +6893,19 @@ def main():
     # json
     sub.add_parser("json", help="Dump CRM as JSON (for agent consumption)")
 
-    # export
-    p_export = sub.add_parser("export", help="Export contacts to CSV")
-    p_export.add_argument("--output", "-o", help="Output file path")
-    p_export.add_argument("--enrich", action="store_true", help="Include activity_count, deal_count, and score columns")
+    # import/export
+    p_export = sub.add_parser("export", help="Export a full CRM backup as JSON")
+    p_export.add_argument("file", nargs="?", help="JSON output path (prints to stdout if omitted)")
 
-    # import
-    p_import = sub.add_parser("import", help="Import contacts from CSV")
-    p_import.add_argument("file", help="CSV file path")
+    p_import = sub.add_parser("import", help="Import a full CRM JSON backup")
+    p_import.add_argument("file", help="JSON backup path")
+    p_import.add_argument("--merge", action="store_true", help="Merge into a non-empty database")
+
+    p_import_csv = sub.add_parser("import-csv", help="Import contacts from CSV")
+    p_import_csv.add_argument("file", help="CSV file path")
+
+    p_export_csv = sub.add_parser("export-csv", help="Export contacts to CSV")
+    p_export_csv.add_argument("file", help="CSV output path")
 
     # observe
     p_obs = sub.add_parser("observe", help="Record a fact: entity key value [source]")
@@ -7213,13 +7552,31 @@ def main():
         print(json.dumps(crm.to_json(), indent=2, default=str))
 
     elif args.command == "export":
-        crm.export_csv(args.output, enrich=args.enrich)
-        if args.output:
-            print(f"Exported to: {args.output}")
+        exported = crm.export_full()
+        if args.file:
+            with open(args.file, "w", encoding="utf-8") as f:
+                json.dump(exported, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            print(f"Exported full backup to: {args.file}")
+        else:
+            print(json.dumps(exported, indent=2, ensure_ascii=False))
 
     elif args.command == "import":
-        count = crm.import_csv(args.file)
-        print(f"Imported: {count} contacts")
+        try:
+            with open(args.file, "r", encoding="utf-8") as f:
+                imported_data = json.load(f)
+            result = crm.import_full(imported_data, merge=args.merge)
+        except (OSError, json.JSONDecodeError) as exc:
+            result = {"error": f"Could not read full import: {exc}"}
+        print(json.dumps(result, indent=2))
+
+    elif args.command == "import-csv":
+        result = crm.import_csv(args.file)
+        print(json.dumps(result, indent=2))
+
+    elif args.command == "export-csv":
+        crm.export_csv(args.file)
+        print(f"Exported contacts to: {args.file}")
 
     elif args.command == "observe":
         crm.observe(args.entity, args.key, args.value, args.source)

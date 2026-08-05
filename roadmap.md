@@ -30,7 +30,7 @@ Combine reminders, `optimal_cadence()`, health scores, and stale-deal detection
 into one ranked "do this today" list. `next_actions(limit=10)`, CLI
 `crm.py today`. This is the single highest-leverage daily entry point. ~12 tests.
 
-### Three. Import/export round-trip
+### [x] Three. Import/export round-trip
 CSV and vCard import, full JSON export/import that round-trips losslessly
 (contacts + activity + deals + facts). Makes the engine adoptable and makes
 backups real. ~15 tests.

@@ -192,8 +192,8 @@ def run_benchmarks():
     check("export_csv_creates_file", os.path.exists(export_path))
 
     crm2 = CRM(os.path.join(tempfile.mkdtemp(), "import_test.db"))
-    count = crm2.import_csv(export_path)
-    check("import_csv_count", count >= 2)
+    csv_result = crm2.import_csv(export_path)
+    check("import_csv_count", csv_result["imported"] >= 2)
     imported = crm2.list_contacts()
     check("import_csv_data", len(imported) >= 2)
     crm2.close()
@@ -4174,6 +4174,242 @@ def run_benchmarks():
         check("experiment_mcp_tools", False)
 
     experiment_crm.close()
+
+    # ── 78. Full Import/Export Round-Trip (16 tests) ──
+
+    roundtrip_dir = tempfile.mkdtemp()
+    roundtrip_source = CRM(os.path.join(roundtrip_dir, "source.db"))
+    roundtrip_source.add_contact(
+        "Round Trip Alice", email="alice@roundtrip.test", company="Source Co",
+        title="CTO", deal_size="$42K", status="proposal_drafted",
+        source="referral", notes="Preserve me", tags="vip,technical",
+    )
+    roundtrip_source.add_contact(
+        "Exact Name Bob", company="Name Match Co", status="contacted", notes="No email"
+    )
+    roundtrip_source.log_activity("alice@roundtrip.test", "meeting", "Reviewed proposal")
+    roundtrip_source.add_deal(
+        "alice@roundtrip.test", "Enterprise plan", value="$42K",
+        stage="proposal", notes="Annual contract",
+    )
+    roundtrip_source.observe(
+        "company:source-co", "industry", "robotics", source="benchmark"
+    )
+    roundtrip_source.conn.execute(
+        "UPDATE activity SET created_at = '2025-01-02 03:04:05' WHERE summary = 'Reviewed proposal'"
+    )
+    roundtrip_source.conn.execute(
+        """UPDATE deals SET created_at = '2025-01-03 04:05:06',
+           updated_at = '2025-01-04 05:06:07', closed_at = '2025-01-05 06:07:08'
+           WHERE name = 'Enterprise plan'"""
+    )
+    roundtrip_source.conn.execute(
+        "UPDATE facts SET observed_at = '2025-01-06 07:08:09' WHERE source = 'benchmark'"
+    )
+    roundtrip_source.conn.commit()
+    full_export = roundtrip_source.export_full()
+
+    # 78a. export contract is versioned and contains every core table
+    check(
+        "full_export_contract",
+        set(full_export) == {"schema_version", "contacts", "activity", "deals", "facts"}
+        and full_export["schema_version"] == 1,
+    )
+
+    roundtrip_target = CRM(os.path.join(roundtrip_dir, "target.db"))
+    full_import_result = roundtrip_target.import_full(full_export)
+    restored_export = roundtrip_target.export_full()
+
+    # 78b-e. every table round-trips with identical counts, fields, ids, and timestamps
+    check(
+        "full_roundtrip_contacts",
+        full_import_result["imported"]["contacts"] == len(full_export["contacts"])
+        and restored_export["contacts"] == full_export["contacts"],
+    )
+    check(
+        "full_roundtrip_activity",
+        full_import_result["imported"]["activity"] == len(full_export["activity"])
+        and restored_export["activity"] == full_export["activity"],
+    )
+    check(
+        "full_roundtrip_deals",
+        full_import_result["imported"]["deals"] == len(full_export["deals"])
+        and restored_export["deals"] == full_export["deals"],
+    )
+    check(
+        "full_roundtrip_facts",
+        full_import_result["imported"]["facts"] == len(full_export["facts"])
+        and restored_export["facts"] == full_export["facts"],
+    )
+
+    # 78f. a non-merge restore refuses non-empty databases without changing them
+    before_refused_import = roundtrip_target.export_full()
+    refused_import = roundtrip_target.import_full(full_export)
+    check(
+        "full_import_nonempty_error",
+        "error" in refused_import and roundtrip_target.export_full() == before_refused_import,
+    )
+
+    merge_crm = CRM(os.path.join(roundtrip_dir, "merge.db"))
+    merge_crm.add_contact(
+        "Old Alice Name", email="alice@roundtrip.test", company="Old Co", notes="Old notes"
+    )
+    merge_crm.add_contact("Exact Name Bob", company="Old Name Match Co")
+    first_merge = merge_crm.import_full(full_export, merge=True)
+
+    # 78g. email matches update the existing contact rather than duplicating it
+    alice_rows = merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE email = 'alice@roundtrip.test'"
+    ).fetchall()
+    check(
+        "full_merge_email_upsert",
+        len(alice_rows) == 1 and alice_rows[0]["name"] == "Round Trip Alice"
+        and alice_rows[0]["company"] == "Source Co" and first_merge["updated_contacts"] == 2,
+    )
+
+    # 78h. contacts without email fall back to an exact name upsert
+    bob_rows = merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE name = 'Exact Name Bob'"
+    ).fetchall()
+    check(
+        "full_merge_exact_name_upsert",
+        len(bob_rows) == 1 and bob_rows[0]["company"] == "Name Match Co",
+    )
+
+    # 78i. repeated merges dedupe timestamped activity and facts
+    counts_before_second_merge = {
+        table: merge_crm.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("activity", "facts")
+    }
+    second_merge = merge_crm.import_full(full_export, merge=True)
+    counts_after_second_merge = {
+        table: merge_crm.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("activity", "facts")
+    }
+    check(
+        "full_merge_dedupes_timestamped_rows",
+        counts_after_second_merge == counts_before_second_merge
+        and second_merge["skipped"]["activity"] == len(full_export["activity"])
+        and second_merge["skipped"]["facts"] == len(full_export["facts"]),
+    )
+
+    # 78j. contact CSV export/import preserves every contact column
+    csv_roundtrip_path = os.path.join(roundtrip_dir, "contacts.csv")
+    roundtrip_source.export_csv(csv_roundtrip_path)
+    csv_roundtrip_crm = CRM(os.path.join(roundtrip_dir, "csv-roundtrip.db"))
+    csv_roundtrip_result = csv_roundtrip_crm.import_csv(csv_roundtrip_path)
+    source_contact_rows = [dict(row) for row in roundtrip_source.conn.execute(
+        "SELECT * FROM contacts ORDER BY id"
+    )]
+    csv_contact_rows = [dict(row) for row in csv_roundtrip_crm.conn.execute(
+        "SELECT * FROM contacts ORDER BY id"
+    )]
+    check(
+        "csv_contact_roundtrip",
+        csv_roundtrip_result == {"imported": 2, "skipped": 0, "errors": 0}
+        and csv_contact_rows == source_contact_rows,
+    )
+
+    # 78k. explicit mappings override odd headers and retain phone as a fact
+    odd_csv_path = os.path.join(roundtrip_dir, "odd-headers.csv")
+    with open(odd_csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("Person Label,Mail Box,Employer,Pipeline,Telephone,Long Memo\n")
+        f.write("Mapped Maya,maya@mapped.test,Odd Co,contacted,+15551234567,Met at demo\n")
+    odd_csv_crm = CRM(os.path.join(roundtrip_dir, "odd-csv.db"))
+    odd_csv_result = odd_csv_crm.import_csv(odd_csv_path, mapping={
+        "name": "Person Label", "email": "Mail Box", "company": "Employer",
+        "status": "Pipeline", "phone": "Telephone", "notes": "Long Memo",
+    })
+    mapped_maya = odd_csv_crm.get_contact("maya@mapped.test")
+    maya_facts = odd_csv_crm.facts_about("contact:mapped maya")
+    check(
+        "csv_odd_header_mapping",
+        odd_csv_result["imported"] == 1 and mapped_maya["company"] == "Odd Co"
+        and mapped_maya["status"] == "contacted" and mapped_maya["notes"] == "Met at demo"
+        and maya_facts["phone"]["value"] == "+15551234567",
+    )
+
+    # 78l. malformed rows count as errors while valid rows still import
+    malformed_csv_path = os.path.join(roundtrip_dir, "malformed.csv")
+    with open(malformed_csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("name,email\n")
+        f.write("Valid Vera,vera@valid.test\n")
+        f.write("Broken Bob,bob@broken.test,unexpected\n")
+    malformed_csv_crm = CRM(os.path.join(roundtrip_dir, "malformed-csv.db"))
+    malformed_csv_result = malformed_csv_crm.import_csv(malformed_csv_path)
+    check(
+        "csv_malformed_rows_counted",
+        malformed_csv_result == {"imported": 1, "skipped": 0, "errors": 1}
+        and malformed_csv_crm.get_contact("vera@valid.test") is not None,
+    )
+
+    # 78m. one vCard file can contain multiple contacts, organizations, and phones
+    multi_vcard_path = os.path.join(roundtrip_dir, "multi.vcf")
+    with open(multi_vcard_path, "w", encoding="utf-8", newline="") as f:
+        f.write("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Vera Card\r\n")
+        f.write("EMAIL;TYPE=WORK:vera@vcard.test\r\nORG:Card Co\r\nTEL;TYPE=CELL:+10000000001\r\nEND:VCARD\r\n")
+        f.write("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Victor Card\r\n")
+        f.write("EMAIL:victor@vcard.test\r\nORG:Other Co\r\nEND:VCARD\r\n")
+    multi_vcard_crm = CRM(os.path.join(roundtrip_dir, "multi-vcard.db"))
+    multi_vcard_count = multi_vcard_crm.import_vcard(multi_vcard_path)
+    check(
+        "vcard_multi_card_parse",
+        multi_vcard_count == 2 and multi_vcard_crm.get_contact("vera@vcard.test")["company"] == "Card Co"
+        and multi_vcard_crm.facts_about("contact:vera card")["phone"]["value"] == "+10000000001",
+    )
+
+    # 78n. folded lines and charset/encoding parameters decode without dependencies
+    folded_vcard_path = os.path.join(roundtrip_dir, "folded.vcf")
+    with open(folded_vcard_path, "wb") as f:
+        f.write(b"BEGIN:VCARD\r\nVERSION:3.0\r\n")
+        f.write(b"FN;CHARSET=ISO-8859-1;ENCODING=QUOTED-PRINTABLE:Jos=E9 Long\r\n")
+        f.write(b"EMAIL:jose@vcard.test\r\nORG:Very Long \r\n Company Name\r\n")
+        f.write(b"TEL;TYPE=WORK:+10000000002\r\nEND:VCARD\r\n")
+    folded_vcard_crm = CRM(os.path.join(roundtrip_dir, "folded-vcard.db"))
+    folded_vcard_count = folded_vcard_crm.import_vcard(folded_vcard_path)
+    folded_contact = folded_vcard_crm.get_contact("jose@vcard.test")
+    check(
+        "vcard_folded_charset_parse",
+        folded_vcard_count == 1 and folded_contact["name"] == "José Long"
+        and folded_contact["company"] == "Very Long Company Name"
+        and folded_vcard_crm.facts_about("contact:josé long")["phone"]["value"] == "+10000000002",
+    )
+
+    # 78o. empty CSV and vCard files are handled as zero-row imports
+    empty_path = os.path.join(roundtrip_dir, "empty")
+    with open(empty_path, "w", encoding="utf-8"):
+        pass
+    check(
+        "empty_import_files",
+        folded_vcard_crm.import_csv(empty_path) == {"imported": 0, "skipped": 0, "errors": 0}
+        and folded_vcard_crm.import_vcard(empty_path) == 0,
+    )
+
+    # 78p. MCP advertises and serves the full export and CSV import tools
+    try:
+        import mcp_server as _roundtrip_mcp
+        original_roundtrip_mcp_db = _roundtrip_mcp.DB_PATH
+        _roundtrip_mcp.DB_PATH = os.path.join(roundtrip_dir, "mcp.db")
+        mcp_tool_names = {tool["name"] for tool in _roundtrip_mcp.TOOLS}
+        mcp_csv_json = _roundtrip_mcp.handle_tool_call("crm_import_csv", {
+            "path": odd_csv_path,
+            "mapping": {"Person Label": "name", "Mail Box": "email"},
+        })
+        mcp_export_json = _roundtrip_mcp.handle_tool_call("crm_export_full", {})
+        _roundtrip_mcp.DB_PATH = original_roundtrip_mcp_db
+        check(
+            "roundtrip_mcp_tools",
+            {"crm_export_full", "crm_import_csv"}.issubset(mcp_tool_names)
+            and '"imported": 1' in mcp_csv_json and '"schema_version": 1' in mcp_export_json,
+        )
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("roundtrip_mcp_tools", False)
+
+    for roundtrip_crm in (
+        roundtrip_source, roundtrip_target, merge_crm, csv_roundtrip_crm,
+        odd_csv_crm, malformed_csv_crm, multi_vcard_crm, folded_vcard_crm,
+    ):
+        roundtrip_crm.close()
 
     # Clean up temp files
     try:

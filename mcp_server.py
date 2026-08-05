@@ -161,6 +161,27 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "crm_export_full",
+        "description": "Export a lossless, versioned backup of contacts, activity, deals, and facts",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_import_csv",
+        "description": "Import contacts from a local CSV file with automatic or explicit header mapping",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the CSV file"},
+                "mapping": {
+                    "type": "object",
+                    "description": "Optional CSV-header to CRM-field mapping (the reverse form is also accepted)",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "crm_score_contact",
         "description": "Get engagement score (0-100) for a contact",
         "inputSchema": {
@@ -687,6 +708,13 @@ def handle_tool_call(name, arguments):
 
         elif name == "crm_stats":
             return json.dumps(crm.stats(), default=str, indent=2)
+
+        elif name == "crm_export_full":
+            return json.dumps(crm.export_full(), default=str, indent=2)
+
+        elif name == "crm_import_csv":
+            result = crm.import_csv(arguments["path"], mapping=arguments.get("mapping"))
+            return json.dumps(result, default=str, indent=2)
 
         elif name == "crm_score_contact":
             score = crm.score_contact(arguments["identifier"])
