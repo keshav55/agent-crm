@@ -65,6 +65,36 @@ op exceeds threshold) and a property-based pass over CRUD so score inflation
 stays honest. The benchmark is the fitness function — it must be harder to game
 than to satisfy.
 
+## Wave two — the loop turns inward
+
+Wave one gave the system predictions, a daily queue, experiment memory, and
+self-tuned cadence. Wave two makes it measure and modify itself.
+
+### [x] Nine. Forecast calibration + learned weights
+Every `deal_probability()` call records its prediction as a fact. When a deal
+closes, score the prediction (Brier score). `calibration_report()` shows how
+good the forecasts actually are. When enough closed outcomes exist, fit the
+signal weights from history (pure-stdlib logistic fit) instead of the
+hardcoded 0.45/0.20/... — the model retrains itself from its own track record.
+
+### Ten. Autonomous data hygiene
+`suggest_merges()` finds duplicates; nothing acts on them. Add confidence
+scoring, auto-merge above a threshold with full undo (merge log in facts),
+entity-key canonicalization across name/email variants, and a `doctor`
+command that finds and fixes inconsistencies in one pass.
+
+### Eleven. Self-proposing roadmap
+`propose_ticks()` — the CRM introspects itself: which public methods have no
+benchmark coverage, which next_actions signals never fire on real data, which
+CLI commands error most, where perf timings trend worse. Output: ranked
+candidate ticks in roadmap.md format. The system writes its own wave three.
+
+### Twelve. Outcome-driven action tuning
+`next_actions` urgency weights are hand-set. Log which surfaced actions get
+acted on (activity within N days of surfacing) and whether acted-on contacts
+advance stage; shift urgency weights toward action types that actually move
+deals. The daily queue learns from being used.
+
 ## Order
 
 One and Two first (they compound: forecast feeds the action queue). Then Six —

@@ -3969,7 +3969,8 @@ def run_benchmarks():
     try:
         probability = prob_crm.deal_probability("early@prob.com")
         check("deal_probability_keys", isinstance(probability, dict) and
-              set(probability) == {"probability", "signals", "contact", "status"})
+              set(probability) == {"probability", "signals", "contact", "status",
+                                   "weights_source"})
     except (AttributeError, TypeError):
         check("deal_probability_keys", False)
 
@@ -5382,6 +5383,227 @@ def run_benchmarks():
         property_invariants["archive_visibility"],
     )
     property_crm.close()
+
+    # ── 84. Forecast Calibration & Learned Weights (14 tests) ──
+
+    prediction_crm = CRM(os.path.join(tempfile.mkdtemp(), "prediction-facts.db"))
+    prediction_crm.add_contact(
+        "Predict Pat", email="pat@prediction.test", status="prospect",
+        source="referral",
+    )
+    prediction_crm.deal_probability("pat@prediction.test")
+    recorded_prediction_facts = prediction_crm.conn.execute(
+        """SELECT key, value, source, observed_at FROM facts
+           WHERE entity = 'prediction:pat@prediction.test'
+           ORDER BY key"""
+    ).fetchall()
+
+    # 84a. A public prediction records all three forecast facts with timestamps.
+    check(
+        "prediction_facts_recorded",
+        {row["key"] for row in recorded_prediction_facts}
+        == {"probability", "status", "signals_snapshot"}
+        and all(row["source"] == "forecast" and row["observed_at"]
+                for row in recorded_prediction_facts),
+    )
+
+    # 84b. An unchanged prediction is below the materiality threshold.
+    prediction_crm.deal_probability("pat@prediction.test")
+    unchanged_fact_count = prediction_crm.conn.execute(
+        "SELECT COUNT(*) FROM facts WHERE entity = 'prediction:pat@prediction.test'"
+    ).fetchone()[0]
+    check("prediction_material_dedupe", unchanged_fact_count == 3)
+
+    # 84c. A stage-driven material probability change records a second event.
+    prediction_crm.update_contact("pat@prediction.test", status="verbal_yes")
+    prediction_crm.deal_probability("pat@prediction.test")
+    material_probability_count = prediction_crm.conn.execute(
+        """SELECT COUNT(*) FROM facts
+           WHERE entity = 'prediction:pat@prediction.test'
+             AND key = 'probability' AND source = 'forecast'"""
+    ).fetchone()[0]
+    check("prediction_material_change_recorded", material_probability_count == 2)
+
+    # 84d. Bulk forecast records predictions through the same path.
+    prediction_crm.add_contact(
+        "Forecast Fran", email="fran@prediction.test", status="contacted"
+    )
+    prediction_crm.forecast()
+    forecast_fact_keys = {
+        row["key"] for row in prediction_crm.conn.execute(
+            """SELECT key FROM facts
+               WHERE entity = 'prediction:fran@prediction.test'
+                 AND source = 'forecast'"""
+        ).fetchall()
+    }
+    check(
+        "forecast_records_prediction_facts",
+        forecast_fact_keys == {"probability", "status", "signals_snapshot"},
+    )
+    prediction_crm.close()
+
+    empty_calibration_crm = CRM(os.path.join(tempfile.mkdtemp(), "empty-calibration.db"))
+    empty_calibration = empty_calibration_crm.calibration_report()
+    # 84e. Empty calibration data is explicit rather than an error or NaN.
+    check(
+        "calibration_empty_case",
+        empty_calibration["scored_predictions"] == 0
+        and empty_calibration["brier_score"] is None
+        and empty_calibration["weights_source"] == "default"
+        and len(empty_calibration["reliability"]) == 10,
+    )
+    empty_calibration_crm.close()
+
+    calibration_crm = CRM(os.path.join(tempfile.mkdtemp(), "calibration.db"))
+
+    def seed_closed_prediction(crm, index, probability, outcome, stage, scores):
+        email = f"closed-{index}@calibration.test"
+        crm.add_contact(
+            f"Closed Calibration {index}", email=email, status="prospect",
+            source="fixture",
+        )
+        entity = f"prediction:{email}"
+        observed_at = f"2026-01-{1 + index:02d} 12:00:00.000000"
+        snapshot = {
+            name: {
+                "value": stage if name == "stage" else scores[name],
+                "score": scores[name],
+            }
+            for name in CRM.FORECAST_SIGNAL_NAMES
+        }
+        with crm.conn:
+            crm.conn.executemany(
+                """INSERT INTO facts (entity, key, value, source, observed_at)
+                   VALUES (?, ?, ?, 'forecast', ?)""",
+                (
+                    (entity, "probability", str(probability), observed_at),
+                    (entity, "status", stage, observed_at),
+                    (entity, "signals_snapshot", json.dumps(snapshot, sort_keys=True),
+                     observed_at),
+                ),
+            )
+        crm.update_contact(email, status=outcome)
+
+    low_scores = {name: 0.1 for name in CRM.FORECAST_SIGNAL_NAMES}
+    high_scores = {name: 0.9 for name in CRM.FORECAST_SIGNAL_NAMES}
+    seed_closed_prediction(
+        calibration_crm, 0, 0.25, "active_customer", "prospect", low_scores
+    )
+    seed_closed_prediction(
+        calibration_crm, 1, 0.75, "lost", "proposal_drafted", high_scores
+    )
+    calibration = calibration_crm.calibration_report()
+
+    # 84f. ((.25 - 1)^2 + (.75 - 0)^2) / 2 = .5625 exactly.
+    check(
+        "calibration_brier_exact",
+        calibration["scored_predictions"] == 2
+        and calibration["brier_score"] == 0.5625,
+    )
+
+    # 84g. Brier errors are also grouped by the recorded prediction stage.
+    check(
+        "calibration_stage_buckets",
+        calibration["by_stage"]["prospect"]
+        == {"count": 1, "brier_score": 0.5625}
+        and calibration["by_stage"]["proposal_drafted"]
+        == {"count": 1, "brier_score": 0.5625},
+    )
+
+    # 84h. Reliability deciles expose observed win rates for occupied buckets.
+    check(
+        "calibration_reliability_buckets",
+        calibration["reliability"][2]["predicted_decile"] == "20-30%"
+        and calibration["reliability"][2]["actual_win_rate"] == 1.0
+        and calibration["reliability"][7]["actual_win_rate"] == 0.0,
+    )
+
+    # 84i. Two closed outcomes are below the 20-outcome learning threshold.
+    check("learned_weights_minimum", calibration_crm.learned_weights() is None)
+    calibration_crm.close()
+
+    learned_db = os.path.join(tempfile.mkdtemp(), "learned-weights.db")
+    learned_crm = CRM(learned_db)
+    for index in range(20):
+        won = index < 10
+        seed_closed_prediction(
+            learned_crm,
+            index,
+            0.9 if won else 0.1,
+            "active_customer" if won else "lost",
+            "verbal_yes" if won else "prospect",
+            high_scores if won else low_scores,
+        )
+        learned_crm.update_contact(
+            f"closed-{index}@calibration.test",
+            source="winning-source" if won else "losing-source",
+        )
+
+    first_fit = learned_crm.learned_weights()
+    second_fit = learned_crm.learned_weights()
+    # 84j. Fixed initialization and iterations make repeated fits identical.
+    check(
+        "learned_weights_deterministic",
+        first_fit == second_fit and first_fit["outcome_count"] == 20,
+    )
+
+    learned_crm.add_contact(
+        "Clearly Winning", email="winning@calibration.test",
+        status="verbal_yes", source="winning-source",
+    )
+    learned_crm.add_contact(
+        "Clearly Losing", email="losing@calibration.test",
+        status="prospect", source="losing-source",
+    )
+    for days in (1, 3, 5, 7):
+        winning_id = learned_crm.get_contact("winning@calibration.test")["id"]
+        learned_crm.conn.execute(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, 'meeting', 'Strong buying signal', datetime('now', ?))""",
+            (winning_id, f"-{days} days"),
+        )
+    learned_crm.conn.commit()
+    winning_prediction = learned_crm.deal_probability("winning@calibration.test")
+    losing_prediction = learned_crm.deal_probability("losing@calibration.test")
+
+    # 84k. Once the threshold is met, public scoring identifies learned mode.
+    check(
+        "deal_probability_learned_mode",
+        winning_prediction["weights_source"] == "learned"
+        and losing_prediction["weights_source"] == "learned",
+    )
+
+    # 84l. A separable history ranks the clearly winning profile higher.
+    check(
+        "learned_weights_rank_profiles",
+        winning_prediction["probability"] > losing_prediction["probability"],
+    )
+
+    # 84m. Logistic scoring remains a valid probability in learned mode.
+    check(
+        "learned_probability_range",
+        all(0.0 <= prediction["probability"] <= 1.0
+            for prediction in (winning_prediction, losing_prediction)),
+    )
+
+    # 84n. MCP registers and serves the same calibration report.
+    try:
+        import mcp_server
+        original_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = learned_db
+        calibration_tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        calibration_output = mcp_server.handle_tool_call("crm_calibration", {})
+        mcp_server.DB_PATH = original_mcp_db
+        check(
+            "calibration_mcp_tool",
+            "crm_calibration" in calibration_tool_names
+            and '"brier_score"' in calibration_output
+            and '"weights_source": "learned"' in calibration_output,
+        )
+    except (AttributeError, TypeError, KeyError):
+        check("calibration_mcp_tool", False)
+
+    learned_crm.close()
 
     cadence_crm.close()
 

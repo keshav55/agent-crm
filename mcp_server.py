@@ -156,6 +156,11 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_calibration",
+        "description": "Measure forecast Brier score, reliability, and learned-weight status",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "crm_stats",
         "description": "Get CRM statistics — total contacts, by status, recent activity",
         "inputSchema": {"type": "object", "properties": {}},
@@ -727,6 +732,9 @@ def handle_tool_call(name, arguments):
 
         elif name == "crm_forecast":
             return json.dumps(crm.forecast(limit=arguments.get("limit")), default=str, indent=2)
+
+        elif name == "crm_calibration":
+            return json.dumps(crm.calibration_report(), default=str, indent=2)
 
         elif name == "crm_stats":
             return json.dumps(crm.stats(), default=str, indent=2)

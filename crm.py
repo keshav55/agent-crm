@@ -26,6 +26,8 @@ import csv
 import sys
 import os
 import json
+import math
+import random
 import re
 import quopri
 from datetime import datetime, date, timedelta, timezone
@@ -1816,6 +1818,24 @@ class CRM:
         "verbal_yes": 0.75,
         "active_customer": 1.0,
     }
+    FORECAST_SIGNAL_NAMES = (
+        "stage",
+        "activity_recency",
+        "activity_frequency",
+        "source",
+        "historical_win_rate",
+    )
+    DEFAULT_FORECAST_WEIGHTS = {
+        "stage": 0.45,
+        "activity_recency": 0.20,
+        "activity_frequency": 0.15,
+        "source": 0.10,
+        "historical_win_rate": 0.10,
+    }
+    FORECAST_LEARNING_MIN_OUTCOMES = 20
+    FORECAST_LEARNING_ITERATIONS = 800
+    FORECAST_LEARNING_RATE = 0.3
+    FORECAST_LEARNING_SEED = 9
 
     @staticmethod
     def _escape_like(s):
@@ -2081,7 +2101,8 @@ class CRM:
             }
         return funnel
 
-    def _deal_probability_for_contact(self, contact, history, activity_rows=None):
+    def _deal_probability_for_contact(self, contact, history, activity_rows=None,
+                                      weight_model=None):
         """Score one open contact using precomputed CRM-wide patterns."""
         status = contact.get("status") or "prospect"
         stage_score = self.STAGE_PROBABILITIES.get(status, 0.10)
@@ -2137,12 +2158,18 @@ class CRM:
         source_score = ((source_wins + 1) / (source_sample + 2)
                         if source_sample else historical_score)
 
+        weights_source = "learned" if weight_model else "default"
+        weights = (weight_model["weights"] if weight_model
+                   else self.DEFAULT_FORECAST_WEIGHTS)
         signal_values = [
-            ("stage", status, 0.45, stage_score),
-            ("activity_recency", days_since_activity, 0.20, recency_score),
-            ("activity_frequency", recent_activity_count, 0.15, frequency_score),
-            ("source", source, 0.10, source_score),
-            ("historical_win_rate", round(historical_score, 4), 0.10, historical_score),
+            ("stage", status, weights["stage"], stage_score),
+            ("activity_recency", days_since_activity,
+             weights["activity_recency"], recency_score),
+            ("activity_frequency", recent_activity_count,
+             weights["activity_frequency"], frequency_score),
+            ("source", source, weights["source"], source_score),
+            ("historical_win_rate", round(historical_score, 4),
+             weights["historical_win_rate"], historical_score),
         ]
         signals = [{
             "name": name,
@@ -2150,13 +2177,254 @@ class CRM:
             "weight": weight,
             "effect": round(weight * score, 4),
         } for name, value, weight, score in signal_values]
-        probability = round(min(max(sum(s["effect"] for s in signals), 0.0), 1.0), 4)
+        linear_score = sum(weight * score for _, _, weight, score in signal_values)
+        if weight_model:
+            logit = weight_model["intercept"] + linear_score
+            if logit >= 0:
+                probability = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
+            else:
+                exp_logit = math.exp(max(logit, -60.0))
+                probability = exp_logit / (1.0 + exp_logit)
+        else:
+            probability = min(max(sum(signal["effect"] for signal in signals), 0.0), 1.0)
+        probability = round(probability, 4)
 
         return {
             "probability": probability,
             "signals": signals,
             "contact": contact,
             "status": status,
+            "weights_source": weights_source,
+            "_signals_snapshot": {
+                name: {"value": value, "score": round(score, 6)}
+                for name, value, _, score in signal_values
+            },
+        }
+
+    @staticmethod
+    def _public_probability(scored):
+        """Remove recording-only fields from a probability response."""
+        return {key: value for key, value in scored.items()
+                if not key.startswith("_")}
+
+    def _record_prediction(self, contact, scored):
+        """Persist a materially changed forecast as one three-fact event."""
+        identifier = contact.get("email") or contact["name"]
+        entity = f"prediction:{identifier}"
+        latest = self.conn.execute(
+            """SELECT value FROM facts
+               WHERE entity = ? AND key = 'probability' AND source = 'forecast'
+               ORDER BY observed_at DESC, rowid DESC LIMIT 1""",
+            (entity,),
+        ).fetchone()
+        if latest:
+            try:
+                if abs(float(latest["value"]) - scored["probability"]) <= 0.020000000001:
+                    return False
+            except (TypeError, ValueError):
+                pass
+
+        observed_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(
+            sep=" ", timespec="microseconds"
+        )
+        rows = (
+            (entity, "probability", str(scored["probability"]), "forecast", observed_at),
+            (entity, "status", scored["status"], "forecast", observed_at),
+            (entity, "signals_snapshot", json.dumps(
+                scored["_signals_snapshot"], sort_keys=True, separators=(",", ":")
+            ), "forecast", observed_at),
+        )
+        with self.conn:
+            self.conn.executemany(
+                """INSERT INTO facts (entity, key, value, source, observed_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(entity, key, value, source)
+                   DO UPDATE SET observed_at = excluded.observed_at""",
+                rows,
+            )
+        return True
+
+    @classmethod
+    def _signal_scores_from_snapshot(cls, raw_snapshot):
+        """Parse both native and simple name-to-score prediction fixtures."""
+        try:
+            snapshot = json.loads(raw_snapshot)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+        if isinstance(snapshot, list):
+            snapshot = {
+                item.get("name"): item for item in snapshot
+                if isinstance(item, dict) and item.get("name")
+            }
+        if not isinstance(snapshot, dict):
+            return None
+
+        scores = {}
+        for name in cls.FORECAST_SIGNAL_NAMES:
+            item = snapshot.get(name)
+            if isinstance(item, dict):
+                item = item.get("score")
+            try:
+                scores[name] = min(max(float(item), 0.0), 1.0)
+            except (TypeError, ValueError):
+                return None
+        return scores
+
+    @staticmethod
+    def _stage_from_snapshot(raw_snapshot):
+        try:
+            snapshot = json.loads(raw_snapshot)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if isinstance(snapshot, dict):
+            stage = snapshot.get("stage")
+            if isinstance(stage, dict):
+                return stage.get("value")
+        if isinstance(snapshot, list):
+            for signal in snapshot:
+                if isinstance(signal, dict) and signal.get("name") == "stage":
+                    return signal.get("value")
+        return None
+
+    def _prediction_outcomes(self):
+        """Return recorded predictions whose contacts now have closed outcomes."""
+        rows = self.conn.execute(
+            """SELECT p.rowid AS prediction_rowid, p.entity,
+                      p.value AS probability, p.observed_at, c.status AS outcome_status,
+                      (SELECT s.value FROM facts s
+                       WHERE s.entity = p.entity AND s.key = 'status'
+                         AND s.source = 'forecast' AND s.observed_at = p.observed_at
+                       ORDER BY s.rowid DESC LIMIT 1) AS predicted_status,
+                      (SELECT s.value FROM facts s
+                       WHERE s.entity = p.entity AND s.key = 'signals_snapshot'
+                         AND s.source = 'forecast' AND s.observed_at = p.observed_at
+                       ORDER BY s.rowid DESC LIMIT 1) AS signals_snapshot
+               FROM facts p
+               JOIN contacts c
+                 ON p.entity = 'prediction:' || COALESCE(NULLIF(c.email, ''), c.name)
+               WHERE p.key = 'probability' AND p.source = 'forecast'
+                 AND c.status IN ('active_customer', 'lost', 'churned')
+               ORDER BY p.observed_at ASC, p.rowid ASC"""
+        ).fetchall()
+        outcomes = []
+        for row in rows:
+            try:
+                probability = float(row["probability"])
+            except (TypeError, ValueError):
+                continue
+            if not 0.0 <= probability <= 1.0:
+                continue
+            snapshot = row["signals_snapshot"]
+            outcomes.append({
+                "entity": row["entity"],
+                "probability": probability,
+                "outcome": 1 if row["outcome_status"] == "active_customer" else 0,
+                "stage": (row["predicted_status"]
+                          or self._stage_from_snapshot(snapshot) or "unknown"),
+                "scores": self._signal_scores_from_snapshot(snapshot),
+                "observed_at": row["observed_at"],
+                "rowid": row["prediction_rowid"],
+            })
+        return outcomes
+
+    def learned_weights(self):
+        """Fit deterministic logistic signal weights from closed predictions."""
+        latest_by_contact = {}
+        for prediction in self._prediction_outcomes():
+            if prediction["scores"] is not None:
+                latest_by_contact[prediction["entity"]] = prediction
+        samples = list(latest_by_contact.values())
+        if len(samples) < self.FORECAST_LEARNING_MIN_OUTCOMES:
+            return None
+
+        rng = random.Random(self.FORECAST_LEARNING_SEED)
+        weights = {
+            name: rng.uniform(-0.01, 0.01)
+            for name in self.FORECAST_SIGNAL_NAMES
+        }
+        intercept = rng.uniform(-0.01, 0.01)
+        sample_count = float(len(samples))
+
+        for _ in range(self.FORECAST_LEARNING_ITERATIONS):
+            weight_gradients = {name: 0.0 for name in self.FORECAST_SIGNAL_NAMES}
+            intercept_gradient = 0.0
+            for sample in samples:
+                logit = intercept + sum(
+                    weights[name] * sample["scores"][name]
+                    for name in self.FORECAST_SIGNAL_NAMES
+                )
+                if logit >= 0:
+                    predicted = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
+                else:
+                    exp_logit = math.exp(max(logit, -60.0))
+                    predicted = exp_logit / (1.0 + exp_logit)
+                error = predicted - sample["outcome"]
+                intercept_gradient += error
+                for name in self.FORECAST_SIGNAL_NAMES:
+                    weight_gradients[name] += error * sample["scores"][name]
+
+            intercept -= self.FORECAST_LEARNING_RATE * (
+                intercept_gradient / sample_count
+            )
+            for name in self.FORECAST_SIGNAL_NAMES:
+                weights[name] -= self.FORECAST_LEARNING_RATE * (
+                    weight_gradients[name] / sample_count
+                )
+
+        return {
+            "weights": {name: round(weights[name], 8)
+                        for name in self.FORECAST_SIGNAL_NAMES},
+            "intercept": round(intercept, 8),
+            "outcome_count": len(samples),
+            "iterations": self.FORECAST_LEARNING_ITERATIONS,
+        }
+
+    def calibration_report(self):
+        """Score past forecasts against closed outcomes with Brier calibration."""
+        predictions = self._prediction_outcomes()
+        learned = self.learned_weights()
+        stage_errors = {}
+        reliability_groups = [list() for _ in range(10)]
+
+        for prediction in predictions:
+            squared_error = (prediction["probability"] - prediction["outcome"]) ** 2
+            stage_errors.setdefault(prediction["stage"], []).append(squared_error)
+            decile = min(int(prediction["probability"] * 10), 9)
+            reliability_groups[decile].append(prediction)
+
+        by_stage = {
+            stage: {
+                "count": len(errors),
+                "brier_score": round(sum(errors) / len(errors), 6),
+            }
+            for stage, errors in sorted(stage_errors.items())
+        }
+        reliability = []
+        for decile, group in enumerate(reliability_groups):
+            lower = decile * 10
+            upper = (decile + 1) * 10
+            reliability.append({
+                "predicted_decile": f"{lower}-{upper}%",
+                "count": len(group),
+                "mean_prediction": (round(sum(p["probability"] for p in group) /
+                                             len(group), 4) if group else None),
+                "actual_win_rate": (round(sum(p["outcome"] for p in group) /
+                                           len(group), 4) if group else None),
+            })
+
+        squared_errors = [
+            (prediction["probability"] - prediction["outcome"]) ** 2
+            for prediction in predictions
+        ]
+        return {
+            "scored_predictions": len(predictions),
+            "brier_score": (round(sum(squared_errors) / len(squared_errors), 6)
+                            if squared_errors else None),
+            "by_stage": by_stage,
+            "reliability": reliability,
+            "weights_source": "learned" if learned else "default",
+            "learned_weights": learned,
         }
 
     def deal_probability(self, identifier):
@@ -2165,9 +2433,11 @@ class CRM:
         if (not contact or contact.get("archived")
                 or contact.get("status") in ("active_customer", "lost", "churned")):
             return None
-        return self._deal_probability_for_contact(
-            contact, self.win_loss_analysis()
+        scored = self._deal_probability_for_contact(
+            contact, self.win_loss_analysis(), weight_model=self.learned_weights()
         )
+        self._record_prediction(contact, scored)
+        return self._public_probability(scored)
 
     def forecast(self, limit=None):
         """Rank open-pipeline contacts by close probability.
@@ -2177,6 +2447,7 @@ class CRM:
         """
         contacts = self.list_contacts()
         history = self.win_loss_analysis()
+        weight_model = self.learned_weights()
         activity_by_contact = {}
         for row in self.conn.execute(
             "SELECT contact_id, created_at FROM activity ORDER BY contact_id, created_at DESC"
@@ -2188,8 +2459,10 @@ class CRM:
             if contact.get("status") in ("active_customer", "lost", "churned"):
                 continue
             scored = self._deal_probability_for_contact(
-                contact, history, activity_by_contact.get(contact["id"], [])
+                contact, history, activity_by_contact.get(contact["id"], []),
+                weight_model=weight_model,
             )
+            self._record_prediction(contact, scored)
             deal_value = self._parse_deal_size(contact.get("deal_size"))
             ranked.append({
                 "name": contact["name"],
@@ -2201,6 +2474,7 @@ class CRM:
                 "probability": scored["probability"],
                 "weighted_value": round(deal_value * scored["probability"], 2),
                 "signals": scored["signals"],
+                "weights_source": scored["weights_source"],
                 "contact": contact,
             })
 
@@ -2243,6 +2517,7 @@ class CRM:
             "weighted_pipeline": weighted_total,
             "closed_revenue": closed_revenue,
             "by_stage": by_stage,
+            "weights_source": "learned" if weight_model else "default",
         }
 
     def find_duplicates(self):
@@ -7372,6 +7647,8 @@ def main():
     p_forecast = sub.add_parser("forecast", help="Rank open deals by close probability")
     p_forecast.add_argument("--limit", "-n", type=int, help="Maximum contacts to show")
 
+    sub.add_parser("calibration", help="Forecast Brier score, reliability, and learned weights")
+
     p_today = sub.add_parser("today", help="Rank the best CRM actions to do today")
     p_today.add_argument("--limit", "-n", type=int, default=10, help="Maximum actions to show")
 
@@ -8141,6 +8418,34 @@ def main():
         else:
             fmt_table(rows, ["name", "company", "status", "probability", "deal_value", "weighted_value"])
         print(f"\n  Weighted Pipeline: ${fc['weighted_pipeline']:,.0f}")
+
+    elif args.command == "calibration":
+        report = crm.calibration_report()
+        print(f"  Scored predictions: {report['scored_predictions']}")
+        if report["brier_score"] is None:
+            print("  Brier score:        not available (no closed outcomes)")
+        else:
+            print(f"  Brier score:        {report['brier_score']:.4f}")
+        print(f"  Weights source:     {report['weights_source']}")
+
+        if report["by_stage"]:
+            print("\n  By stage:")
+            print(f"  {'Stage':<20} {'Count':>6} {'Brier':>8}")
+            print(f"  {'-'*20} {'-'*6} {'-'*8}")
+            for stage, stage_report in report["by_stage"].items():
+                print(f"  {stage:<20} {stage_report['count']:>6} "
+                      f"{stage_report['brier_score']:>8.4f}")
+
+        print("\n  Reliability:")
+        print(f"  {'Predicted':<12} {'Count':>6} {'Mean':>8} {'Actual':>8}")
+        print(f"  {'-'*12} {'-'*6} {'-'*8} {'-'*8}")
+        for bucket in report["reliability"]:
+            mean = (f"{bucket['mean_prediction']:.1%}"
+                    if bucket["mean_prediction"] is not None else "-")
+            actual = (f"{bucket['actual_win_rate']:.1%}"
+                      if bucket["actual_win_rate"] is not None else "-")
+            print(f"  {bucket['predicted_decile']:<12} {bucket['count']:>6} "
+                  f"{mean:>8} {actual:>8}")
 
     elif args.command == "today":
         actions = crm.next_actions(limit=args.limit)
