@@ -268,6 +268,18 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_intro_paths",
+        "description": "Find ranked 2-3 hop introduction paths through facts and shared affiliations",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_identifier": {"type": "string", "description": "Company, person, email, or contact entity to reach"},
+                "max_hops": {"type": "integer", "minimum": 2, "maximum": 3, "default": 3},
+            },
+            "required": ["target_identifier"],
+        },
+    },
+    {
         "name": "crm_relationship_health",
         "description": "Analyze relationship health across all contacts — surfaces decaying relationships and opportunities",
         "inputSchema": {"type": "object", "properties": {}},
@@ -763,6 +775,13 @@ def handle_tool_call(name, arguments):
 
         elif name == "crm_find_intros":
             results = crm.find_intros(arguments["target"])
+            return json.dumps(results, default=str, indent=2)
+
+        elif name == "crm_intro_paths":
+            results = crm.intro_paths(
+                arguments["target_identifier"],
+                max_hops=arguments.get("max_hops", 3),
+            )
             return json.dumps(results, default=str, indent=2)
 
         elif name == "crm_relationship_health":

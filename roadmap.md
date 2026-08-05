@@ -35,7 +35,7 @@ CSV and vCard import, full JSON export/import that round-trips losslessly
 (contacts + activity + deals + facts). Makes the engine adoptable and makes
 backups real. ~15 tests.
 
-### Four. Multi-hop intro paths
+### [x] Four. Multi-hop intro paths
 `intros` today finds direct warm paths. Extend the facts graph to walk 2–3 hops
 (`introduced_by`, `knows`, shared company/domain) with path scoring by
 relationship strength. ~10 tests.

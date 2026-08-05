@@ -5267,6 +5267,297 @@ class CRM:
 
         return results
 
+    def intro_paths(self, target_identifier, max_hops=3):
+        """Find ranked 2-3 hop paths from strong relationships to a target.
+
+        The graph is undirected. Explicit contact references in facts form its
+        strongest edges, while shared companies and email domains provide
+        weaker inferred edges. The user's side of each path is represented by
+        an anchor contact with message or activity history.
+        """
+        try:
+            max_hops = min(3, int(max_hops))
+        except (TypeError, ValueError):
+            return []
+        target_text = str(target_identifier or "").strip()
+        if max_hops < 2 or not target_text:
+            return []
+        if target_text.casefold() in {"me", "myself", "self", "you"}:
+            return []
+
+        contacts = [dict(row) for row in self.conn.execute(
+            "SELECT * FROM contacts WHERE archived = 0 ORDER BY id"
+        ).fetchall()]
+        if not contacts:
+            return []
+
+        contact_nodes = {c["id"]: f"crm:{c['id']}" for c in contacts}
+        contacts_by_node = {contact_nodes[c["id"]]: c for c in contacts}
+        aliases = {}
+
+        def normalize_contact_ref(value):
+            value = str(value or "").strip().casefold()
+            if not value.startswith("contact:"):
+                return None
+            suffix = " ".join(value[len("contact:"):].replace("_", " ").split())
+            return f"contact:{suffix}" if suffix else None
+
+        def add_alias(alias, node):
+            normalized = normalize_contact_ref(alias)
+            if normalized:
+                aliases.setdefault(normalized, set()).add(node)
+
+        for contact in contacts:
+            node = contact_nodes[contact["id"]]
+            for entity_key in self._contact_entity_keys(contact):
+                add_alias(entity_key, node)
+
+        def resolve_contact_ref(value):
+            normalized = normalize_contact_ref(value)
+            if not normalized:
+                return None
+            matches = aliases.get(normalized, set())
+            if len(matches) == 1:
+                return next(iter(matches))
+            return f"fact:{normalized}"
+
+        def node_name(node):
+            contact = contacts_by_node.get(node)
+            if contact:
+                return contact["name"]
+            raw = node[len("fact:contact:"):] if node.startswith("fact:contact:") else node
+            return raw if "@" in raw else raw.title()
+
+        graph = {}
+        edge_priority = {
+            "introduced_by": 5,
+            "knows": 4,
+            "works_with": 3,
+            "contact_reference": 2,
+            "shared_company": 1,
+            "shared_domain": 0,
+        }
+
+        def add_edge(left, right, weight, kind, detail=None):
+            if not left or not right or left == right:
+                return
+            edge = {"weight": weight, "kind": kind, "detail": detail}
+            existing = graph.setdefault(left, {}).get(right)
+            if existing:
+                existing_rank = (existing["weight"], edge_priority[existing["kind"]])
+                new_rank = (weight, edge_priority[kind])
+                if new_rank <= existing_rank:
+                    return
+            graph.setdefault(left, {})[right] = edge
+            graph.setdefault(right, {})[left] = edge
+
+        company_groups = {}
+        domain_groups = {}
+        for contact in contacts:
+            node = contact_nodes[contact["id"]]
+            company = " ".join((contact.get("company") or "").casefold().split())
+            if company:
+                company_groups.setdefault(company, {"label": contact["company"], "nodes": set()})["nodes"].add(node)
+            email = (contact.get("email") or "").strip().casefold()
+            if "@" in email:
+                domain = email.rsplit("@", 1)[1]
+                if domain:
+                    domain_groups.setdefault(domain, set()).add(node)
+
+        fact_rows = self.conn.execute(
+            "SELECT entity, key, value FROM facts ORDER BY rowid"
+        ).fetchall()
+        direct_totals = {}
+        direct_intensities = {}
+        intensity_rank = {"low": 1, "medium": 2, "high": 3}
+
+        for row in fact_rows:
+            left = resolve_contact_ref(row["entity"])
+            key = str(row["key"] or "").strip().casefold()
+            value = str(row["value"] or "").strip()
+            right = resolve_contact_ref(value)
+
+            if left and right:
+                if key in {"introduced_by", "introduced_to", "introduction"}:
+                    add_edge(left, right, 0.95, "introduced_by")
+                elif key in {"knows", "friend_of"}:
+                    add_edge(left, right, 0.85, "knows")
+                elif key in {"works_with", "worked_with", "colleague_of"}:
+                    add_edge(left, right, 0.75, "works_with")
+                else:
+                    add_edge(left, right, 0.70, "contact_reference")
+
+            if left in contacts_by_node and key in {"company", "works_at", "employer"} and not right:
+                company = value.casefold()
+                if company.startswith("company:"):
+                    company = company[len("company:"):]
+                company = " ".join(company.replace("_", " ").split())
+                if company:
+                    company_groups.setdefault(company, {"label": value.replace("company:", ""), "nodes": set()})["nodes"].add(left)
+
+            if left in contacts_by_node and key == "email" and "@" in value:
+                domain = value.casefold().rsplit("@", 1)[1]
+                if domain:
+                    domain_groups.setdefault(domain, set()).add(left)
+
+            if left in contacts_by_node and key in {"imessage_total", "email_total"}:
+                try:
+                    direct_totals[left] = max(direct_totals.get(left, 0), int(value))
+                except (TypeError, ValueError):
+                    pass
+            elif left in contacts_by_node and key == "message_intensity":
+                intensity = value.casefold()
+                current = direct_intensities.get(left, "")
+                if intensity_rank.get(intensity, 0) > intensity_rank.get(current, 0):
+                    direct_intensities[left] = intensity
+
+        for company, group in sorted(company_groups.items()):
+            nodes = sorted(group["nodes"], key=lambda node: (node_name(node).casefold(), node))
+            for index, left in enumerate(nodes):
+                for right in nodes[index + 1:]:
+                    add_edge(left, right, 0.60, "shared_company", group["label"] or company)
+
+        for domain, group in sorted(domain_groups.items()):
+            nodes = sorted(group, key=lambda node: (node_name(node).casefold(), node))
+            for index, left in enumerate(nodes):
+                for right in nodes[index + 1:]:
+                    add_edge(left, right, 0.40, "shared_domain", domain)
+
+        activity_counts = {
+            contact_nodes[row["contact_id"]]: row["activity_count"]
+            for row in self.conn.execute(
+                "SELECT contact_id, COUNT(*) AS activity_count FROM activity GROUP BY contact_id"
+            ).fetchall()
+            if row["contact_id"] in contact_nodes
+        }
+        anchors = []
+        for node, contact in contacts_by_node.items():
+            total = direct_totals.get(node, 0)
+            intensity = direct_intensities.get(node, "low")
+            message_strength = self._intro_warmth_score(total, intensity) / 100 if total else 0
+            activity_count = activity_counts.get(node, 0)
+            activity_strength = min(0.90, 0.35 + activity_count * 0.10) if activity_count else 0
+            strength = max(message_strength, activity_strength)
+            if strength >= 0.35:
+                anchors.append((node, strength))
+        anchors.sort(key=lambda item: (-item[1], node_name(item[0]).casefold(), item[0]))
+        if not anchors:
+            return []
+
+        target_folded = target_text.casefold()
+        exact_targets = {
+            node for node, contact in contacts_by_node.items()
+            if target_folded in {
+                contact["name"].strip().casefold(),
+                (contact.get("email") or "").strip().casefold(),
+            }
+        }
+        target_nodes = set(exact_targets)
+        if not target_nodes:
+            target_domain = target_folded[1:] if target_folded.startswith("@") else target_folded
+            for node, contact in contacts_by_node.items():
+                name = contact["name"].casefold()
+                email = (contact.get("email") or "").casefold()
+                company = (contact.get("company") or "").casefold()
+                domain = email.rsplit("@", 1)[1] if "@" in email else ""
+                if (target_folded in name or target_folded in email or target_folded in company
+                        or target_domain == domain or target_domain in domain):
+                    target_nodes.add(node)
+
+            normalized_target = normalize_contact_ref(
+                target_text if target_folded.startswith("contact:") else f"contact:{target_text}"
+            )
+            for node in graph:
+                if node in contacts_by_node:
+                    continue
+                graph_ref = node[len("fact:"):] if node.startswith("fact:") else node
+                if (graph_ref == normalized_target
+                        or target_folded in node_name(node).casefold()):
+                    target_nodes.add(node)
+
+        if not target_nodes:
+            return []
+        if exact_targets and exact_targets.issubset({node for node, _ in anchors}):
+            return []
+
+        def edge_explanation(left, right, edge):
+            left_name = node_name(left)
+            right_name = node_name(right)
+            if edge["kind"] == "introduced_by":
+                return f"{left_name} and {right_name} have an explicit introduction link"
+            if edge["kind"] == "knows":
+                return f"{left_name} knows {right_name}"
+            if edge["kind"] == "works_with":
+                return f"{left_name} works with {right_name}"
+            if edge["kind"] == "shared_company":
+                return f"{left_name} and {right_name} both work at {edge['detail']}"
+            if edge["kind"] == "shared_domain":
+                return f"{left_name} and {right_name} share @{edge['detail']}"
+            return f"{left_name} is linked to {right_name} in the facts graph"
+
+        paths = []
+        seen_paths = set()
+        for anchor, anchor_strength in anchors:
+            if anchor in target_nodes:
+                continue
+            frontier = [(anchor, [anchor], [], anchor_strength)]
+            for hops in range(1, max_hops + 1):
+                next_by_node = {}
+                for current, path, edges, strength in frontier:
+                    neighbors = sorted(
+                        graph.get(current, {}).items(),
+                        key=lambda item: (-item[1]["weight"], node_name(item[0]).casefold(), item[0]),
+                    )
+                    for neighbor, edge in neighbors:
+                        if neighbor in path:
+                            continue
+                        next_path = path + [neighbor]
+                        next_edges = edges + [(current, neighbor, edge)]
+                        next_strength = strength * edge["weight"] * 0.90
+                        candidate = (neighbor, next_path, next_edges, next_strength)
+                        existing = next_by_node.get(neighbor)
+                        candidate_names = tuple(node_name(node).casefold() for node in next_path)
+                        if existing:
+                            existing_names = tuple(node_name(node).casefold() for node in existing[1])
+                            if (next_strength < existing[3]
+                                    or (next_strength == existing[3]
+                                        and candidate_names >= existing_names)):
+                                continue
+                        next_by_node[neighbor] = candidate
+
+                frontier = []
+                for neighbor, path, edges, strength in sorted(
+                        next_by_node.values(),
+                        key=lambda item: tuple(node_name(node).casefold() for node in item[1])):
+                    if neighbor in target_nodes:
+                        if hops >= 2:
+                            display_path = [node_name(node) for node in path]
+                            path_key = tuple(name.casefold() for name in display_path)
+                            if path_key not in seen_paths:
+                                seen_paths.add(path_key)
+                                explanation_parts = [
+                                    f"Start with {display_path[0]}, a strong direct relationship"
+                                ]
+                                explanation_parts.extend(
+                                    edge_explanation(left, right, edge)
+                                    for left, right, edge in edges
+                                )
+                                paths.append({
+                                    "path": display_path,
+                                    "hops": hops,
+                                    "strength": round(strength, 4),
+                                    "explanation": "; ".join(explanation_parts) + ".",
+                                })
+                        continue
+                    frontier.append((neighbor, path, edges, strength))
+
+        paths.sort(key=lambda item: (
+            item["hops"],
+            -item["strength"],
+            tuple(name.casefold() for name in item["path"]),
+        ))
+        return paths
+
     @staticmethod
     def _intro_warmth_score(imessage_total, intensity):
         """Calculate a warmth score 0-100 for ranking intro paths."""
@@ -7124,6 +7415,7 @@ def main():
     # warm intros
     p_intros = sub.add_parser("intros", help="Find warm intro paths to a target company/person")
     p_intros.add_argument("target", help="Company name, person name, or email to find intros for")
+    p_intros.add_argument("--deep", action="store_true", help="Also search ranked 2-3 hop relationship paths")
 
     args = parser.parse_args()
     if not args.command:
@@ -8110,10 +8402,11 @@ def main():
 
     elif args.command == "intros":
         intros = crm.find_intros(args.target)
-        if not intros:
+        multi_hop_paths = crm.intro_paths(args.target) if args.deep or len(intros) < 3 else []
+        if not intros and not multi_hop_paths:
             print(f"  No warm intro paths found for: {args.target}")
             print(f"  Tip: Run 'python crm.py ingest all' to populate your knowledge graph from iMessage and Contacts.")
-        else:
+        if intros:
             print(f"\n  === Warm Intros to '{args.target}' ({len(intros)} paths) ===\n")
             for i, intro in enumerate(intros, 1):
                 rel = intro["relationship_to_you"]
@@ -8126,6 +8419,15 @@ def main():
                 print(f"     Connection: {intro['connection_to_target']}")
                 print(f"     Warmth:     [{bar}] {warmth}/100  (iMessage: {rel['imessage_total']} msgs, {rel['intensity']})")
                 print(f"     Action:     {intro['suggested_action']}")
+                print()
+        if multi_hop_paths:
+            print(f"\n  === Multi-hop Paths ({len(multi_hop_paths)} paths) ===\n")
+            for i, intro_path in enumerate(multi_hop_paths, 1):
+                route = " -> ".join(intro_path["path"])
+                print(f"  {i}. {route}")
+                print(f"     Hops:        {intro_path['hops']}")
+                print(f"     Strength:    {intro_path['strength']:.2f}")
+                print(f"     Explanation: {intro_path['explanation']}")
                 print()
 
     crm.close()

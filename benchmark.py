@@ -4405,6 +4405,151 @@ def run_benchmarks():
     except (AttributeError, TypeError, KeyError, ValueError):
         check("roundtrip_mcp_tools", False)
 
+    # ── 79. Multi-hop introduction paths (11 tests) ──
+    intro_dir = tempfile.mkdtemp()
+    intro_db = os.path.join(intro_dir, "intro-paths.db")
+    intro_crm = CRM(intro_db)
+
+    def add_intro_contact(name, email, company=None):
+        intro_crm.add_contact(name, email=email, company=company)
+
+    def make_intro_anchor(name):
+        entity = f"contact:{name.casefold().replace(' ', '_')}"
+        intro_crm.observe(entity, "imessage_total", "120", source="imessage")
+        intro_crm.observe(entity, "message_intensity", "high", source="imessage")
+
+    # A pure two-hop introduced_by chain.
+    add_intro_contact("Two Anchor", "two-anchor@two-anchor.example")
+    add_intro_contact("Two Bridge", "two-bridge@two-bridge.example")
+    add_intro_contact("Two Target", "two-target@two-target.example")
+    make_intro_anchor("Two Anchor")
+    intro_crm.observe("contact:two_anchor", "introduced_by", "contact:two_bridge")
+    intro_crm.observe("contact:two_bridge", "introduced_by", "contact:two_target")
+    two_hop_paths = intro_crm.intro_paths("Two Target", max_hops=2)
+    check(
+        "intro_paths_two_hop_introduced_chain",
+        any(path["path"] == ["Two Anchor", "Two Bridge", "Two Target"]
+            and path["hops"] == 2 for path in two_hop_paths),
+    )
+
+    # A target that requires all three allowed hops.
+    for name, email in (
+        ("Three Anchor", "three-anchor@three-anchor.example"),
+        ("Three First", "three-first@three-first.example"),
+        ("Three Second", "three-second@three-second.example"),
+        ("Three Target", "three-target@three-target.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Three Anchor")
+    intro_crm.observe("contact:three_anchor", "knows", "contact:three_first")
+    intro_crm.observe("contact:three_first", "knows", "contact:three_second")
+    intro_crm.observe("contact:three_second", "knows", "contact:three_target")
+    three_hop_at_two = intro_crm.intro_paths("Three Target", max_hops=2)
+    three_hop_at_three = intro_crm.intro_paths("Three Target", max_hops=3)
+    check("intro_paths_three_hop_respects_max_two", three_hop_at_two == [])
+    check(
+        "intro_paths_three_hop_found_at_three",
+        any(path["path"] == ["Three Anchor", "Three First", "Three Second", "Three Target"]
+            and path["hops"] == 3 for path in three_hop_at_three),
+    )
+
+    # A shorter route must rank before a longer route to the same target.
+    for name, email in (
+        ("Mixed Anchor", "mixed-anchor@mixed-anchor.example"),
+        ("Mixed Short", "mixed-short@mixed-short.example"),
+        ("Mixed Long One", "mixed-long-one@mixed-long-one.example"),
+        ("Mixed Long Two", "mixed-long-two@mixed-long-two.example"),
+        ("Mixed Target", "mixed-target@mixed-target.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Mixed Anchor")
+    intro_crm.observe("contact:mixed_anchor", "knows", "contact:mixed_short")
+    intro_crm.observe("contact:mixed_short", "knows", "contact:mixed_target")
+    intro_crm.observe("contact:mixed_anchor", "introduced_by", "contact:mixed_long_one")
+    intro_crm.observe("contact:mixed_long_one", "introduced_by", "contact:mixed_long_two")
+    intro_crm.observe("contact:mixed_long_two", "introduced_by", "contact:mixed_target")
+    mixed_paths = intro_crm.intro_paths("Mixed Target", max_hops=3)
+    check(
+        "intro_paths_shorter_outranks_longer",
+        len(mixed_paths) >= 2 and mixed_paths[0]["hops"] == 2
+        and any(path["hops"] == 3 for path in mixed_paths),
+    )
+
+    # At equal depth, explicit introduction edges beat a route containing a
+    # shared-domain inference.
+    for name, email in (
+        ("Explicit Anchor", "explicit-anchor@explicit-anchor.example"),
+        ("Explicit Bridge", "explicit-bridge@explicit-bridge.example"),
+        ("Domain Anchor", "domain-anchor@shared.example"),
+        ("Domain Bridge", "domain-bridge@shared.example"),
+        ("Rank Target", "rank-target@rank-target.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Explicit Anchor")
+    make_intro_anchor("Domain Anchor")
+    intro_crm.observe("contact:explicit_anchor", "introduced_by", "contact:explicit_bridge")
+    intro_crm.observe("contact:explicit_bridge", "introduced_by", "contact:rank_target")
+    intro_crm.observe("contact:domain_bridge", "knows", "contact:rank_target")
+    rank_paths = intro_crm.intro_paths("Rank Target", max_hops=2)
+    explicit_path = next((path for path in rank_paths if path["path"][0] == "Explicit Anchor"), None)
+    domain_path = next((path for path in rank_paths if path["path"][0] == "Domain Anchor"), None)
+    check(
+        "intro_paths_explicit_outranks_shared_domain",
+        explicit_path is not None and domain_path is not None
+        and rank_paths.index(explicit_path) < rank_paths.index(domain_path)
+        and explicit_path["strength"] > domain_path["strength"],
+    )
+
+    add_intro_contact("Isolated Target", "isolated@isolated.example")
+    check("intro_paths_no_path", intro_crm.intro_paths("Isolated Target") == [])
+    check(
+        "intro_paths_self_target",
+        intro_crm.intro_paths("me") == [] and intro_crm.intro_paths("Two Anchor") == [],
+    )
+
+    # Closing a loop in the three-hop component must not repeat nodes or run
+    # beyond the requested depth.
+    intro_crm.observe("contact:three_second", "knows", "contact:three_anchor")
+    cycle_paths = intro_crm.intro_paths("Three Target", max_hops=3)
+    check(
+        "intro_paths_cycles_are_bounded",
+        bool(cycle_paths) and len(cycle_paths) < 10
+        and all(len(path["path"]) == path["hops"] + 1
+                and len(set(path["path"])) == len(path["path"])
+                and path["hops"] <= 3 for path in cycle_paths),
+    )
+    check(
+        "intro_paths_deterministic_ordering",
+        intro_crm.intro_paths("Rank Target", max_hops=3)
+        == intro_crm.intro_paths("Rank Target", max_hops=3),
+    )
+    check(
+        "intro_paths_explanations",
+        bool(rank_paths) and all(isinstance(path["explanation"], str)
+                                 and path["explanation"].strip() for path in rank_paths),
+    )
+
+    try:
+        import mcp_server as _intro_mcp
+        original_intro_mcp_db = _intro_mcp.DB_PATH
+        _intro_mcp.DB_PATH = intro_db
+        intro_tool_names = {tool["name"] for tool in _intro_mcp.TOOLS}
+        intro_mcp_json = _intro_mcp.handle_tool_call("crm_intro_paths", {
+            "target_identifier": "Two Target",
+            "max_hops": 2,
+        })
+        _intro_mcp.DB_PATH = original_intro_mcp_db
+        intro_mcp_paths = __import__("json").loads(intro_mcp_json)
+        check(
+            "intro_paths_mcp_tool",
+            "crm_intro_paths" in intro_tool_names
+            and any(path["path"][-1] == "Two Target" for path in intro_mcp_paths),
+        )
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("intro_paths_mcp_tool", False)
+
+    intro_crm.close()
+
     for roundtrip_crm in (
         roundtrip_source, roundtrip_target, merge_crm, csv_roundtrip_crm,
         odd_csv_crm, malformed_csv_crm, multi_vcard_crm, folded_vcard_crm,
