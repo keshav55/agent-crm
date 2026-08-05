@@ -20,6 +20,7 @@ Usage:
     python crm.py stats
 """
 
+import ast
 import sqlite3
 import argparse
 import csv
@@ -2085,6 +2086,15 @@ class CRM:
         "activity_frequency",
         "source",
         "historical_win_rate",
+    )
+    NEXT_ACTION_SIGNAL_NAMES = (
+        "overdue_reminder",
+        "due_reminder",
+        "cadence_overdue",
+        "low_relationship_health",
+        "stale_open_deal",
+        "one_sided_messaging",
+        "high_probability_quiet",
     )
     DEFAULT_FORECAST_WEIGHTS = {
         "stage": 0.45,
@@ -5659,6 +5669,233 @@ class CRM:
         ))
         return actions[:limit]
 
+    def propose_ticks(self, benchmark_path="benchmark.py", crm_path="crm.py",
+                      roadmap_path="roadmap.md"):
+        """Propose deterministic roadmap ticks from code, data, and cached perf gaps."""
+        benchmark_file = Path(benchmark_path)
+        crm_file = Path(crm_path)
+        roadmap_file = Path(roadmap_path)
+
+        crm_source = crm_file.read_text(encoding="utf-8")
+        benchmark_source = benchmark_file.read_text(encoding="utf-8")
+        crm_tree = ast.parse(crm_source, filename=str(crm_file))
+        crm_class = next(
+            (
+                node for node in crm_tree.body
+                if isinstance(node, ast.ClassDef) and node.name == "CRM"
+            ),
+            None,
+        )
+        if crm_class is None:
+            raise ValueError(f"No CRM class found in {crm_file}")
+
+        ranked_proposals = []
+
+        def add_proposal(rank, title, rationale, kind, evidence):
+            ranked_proposals.append((rank, {
+                "title": title,
+                "rationale": rationale,
+                "kind": kind,
+                "evidence": evidence,
+            }))
+
+        public_methods = sorted({
+            node.name for node in crm_class.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not node.name.startswith("_")
+        })
+        for method_name in public_methods:
+            reference_count = len(re.findall(
+                rf"\b{re.escape(method_name)}\b", benchmark_source
+            ))
+            if reference_count == 0:
+                add_proposal(
+                    0,
+                    f"Benchmark {method_name} capability",
+                    f"Add focused benchmark cases for CRM.{method_name}().",
+                    "untested capability",
+                    (f"{crm_file}: public CRM method {method_name}; "
+                     f"{benchmark_file}: {reference_count} name references"),
+                )
+
+        action_limit = max(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM contacts WHERE archived = 0"
+            ).fetchone()[0],
+            10,
+        )
+        actions = self.next_actions(limit=action_limit)
+        forecast_rows = self.forecast()["contacts"]
+        known_action_signals = set(self.NEXT_ACTION_SIGNAL_NAMES)
+        known_forecast_signals = set(self.FORECAST_SIGNAL_NAMES)
+        fired_action_signals = {
+            signal.get("name")
+            for action in actions
+            for signal in action.get("signals", [])
+            if signal.get("name") in known_action_signals
+        }
+        fired_forecast_signals = {
+            signal.get("name")
+            for forecast_row in forecast_rows
+            for signal in forecast_row.get("signals", [])
+            if signal.get("name") in known_forecast_signals
+        }
+
+        signal_groups = (
+            ("next_actions", self.NEXT_ACTION_SIGNAL_NAMES,
+             fired_action_signals, len(actions)),
+            ("forecast", self.FORECAST_SIGNAL_NAMES,
+             fired_forecast_signals, len(forecast_rows)),
+        )
+        for source_name, known_signals, fired_signals, output_count in signal_groups:
+            for signal_name in sorted(set(known_signals) - fired_signals):
+                add_proposal(
+                    1,
+                    f"Activate {signal_name} signal",
+                    (f"Inspect or seed representative CRM records for {signal_name}. "
+                     "This gap is data-dependent and is not evidence of a code bug."),
+                    "signal never fires on this data",
+                    (f"Current connected DB: {source_name} returned {output_count} "
+                     f"records and emitted 0 {signal_name} signals"),
+                )
+
+        cache_candidates = (
+            Path(f"{benchmark_file}.results"),
+            Path(f"{benchmark_file}.out"),
+            benchmark_file.with_name(f"{benchmark_file.stem}.results"),
+            benchmark_file.with_name(f"{benchmark_file.stem}.results.txt"),
+            benchmark_file.with_name(f"{benchmark_file.stem}_results.txt"),
+            benchmark_file.with_name("benchmark-results.txt"),
+            benchmark_file.with_name("benchmark_results.txt"),
+            benchmark_file.with_name("benchmark.out"),
+        )
+        cached_results = next((path for path in cache_candidates if path.is_file()), None)
+        if cached_results:
+            cached_source = cached_results.read_text(encoding="utf-8")
+            perf_sections = re.split(
+                r"(?=^PERFORMANCE TIMINGS\b)", cached_source, flags=re.MULTILINE
+            )
+            timing_pattern = re.compile(
+                r"^\s*([A-Za-z0-9_.-]+)\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s+"
+                r"limit\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s+(PASS|FAIL)\s*$",
+                re.MULTILINE,
+            )
+            perf_runs = []
+            for section in perf_sections:
+                timings = {
+                    match.group(1): {
+                        "elapsed_ms": float(match.group(2)),
+                        "threshold_ms": float(match.group(3)),
+                        "status": match.group(4),
+                    }
+                    for match in timing_pattern.finditer(section)
+                }
+                if timings:
+                    perf_runs.append(timings)
+
+            if perf_runs:
+                current_timings = perf_runs[-1]
+                prior_timings = perf_runs[-2] if len(perf_runs) > 1 else {}
+                for operation_name, timing in sorted(current_timings.items()):
+                    elapsed_ms = timing["elapsed_ms"]
+                    threshold_ms = timing["threshold_ms"]
+                    utilization = elapsed_ms / threshold_ms if threshold_ms else float("inf")
+                    prior = prior_timings.get(operation_name)
+                    slowing = bool(
+                        prior and prior["elapsed_ms"] > 0
+                        and elapsed_ms > prior["elapsed_ms"]
+                    )
+                    if timing["status"] != "FAIL" and utilization < 0.8 and not slowing:
+                        continue
+                    trend_detail = ""
+                    if prior:
+                        trend_detail = f"; prior {prior['elapsed_ms']:.3f} ms"
+                    add_proposal(
+                        2,
+                        f"Restore {operation_name} performance headroom",
+                        (f"Profile {operation_name} before it reaches or exceeds "
+                         "the benchmark limit."),
+                        "performance trend",
+                        (f"{cached_results}: current {elapsed_ms:.3f} ms / "
+                         f"{threshold_ms:.3f} ms limit ({utilization:.0%})"
+                         f"{trend_detail}"),
+                    )
+
+        roadmap_source = (
+            roadmap_file.read_text(encoding="utf-8") if roadmap_file.is_file() else ""
+        )
+        tick_pattern = re.compile(
+            r"^###\s+(?:\[[ xX]\]\s+)?([A-Za-z0-9-]+)\.\s+(.+?)\s*$",
+            re.MULTILINE,
+        )
+        existing_ticks = tick_pattern.findall(roadmap_source)
+        generic_title_words = {
+            "activate", "add", "benchmark", "capability", "coverage", "exercise",
+            "headroom", "improve", "performance", "restore", "signal", "test", "tests",
+        }
+
+        def title_words(title):
+            words = set(re.findall(r"[a-z0-9]+", title.lower().replace("_", " ")))
+            specific_words = words - generic_title_words
+            return specific_words or words
+
+        existing_title_words = [title_words(title) for _, title in existing_ticks]
+        proposals = []
+        for _, proposal in sorted(
+            ranked_proposals,
+            key=lambda item: (item[0], item[1]["title"].lower()),
+        ):
+            proposal_words = title_words(proposal["title"])
+            if any(proposal_words <= tick_words for tick_words in existing_title_words):
+                continue
+            proposals.append(proposal)
+
+        tick_number_values = {
+            word: number for number, word in enumerate((
+                "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+                "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen",
+                "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen",
+            ))
+        }
+        existing_numbers = []
+        for ordinal, _ in existing_ticks:
+            if ordinal.isdigit():
+                existing_numbers.append(int(ordinal))
+            elif ordinal.title() in tick_number_values:
+                existing_numbers.append(tick_number_values[ordinal.title()])
+        first_tick_number = max(existing_numbers, default=0) + 1
+
+        def tick_number_word(number):
+            small = (
+                "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+                "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen",
+                "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen",
+            )
+            tens = {20: "Twenty", 30: "Thirty", 40: "Forty", 50: "Fifty",
+                    60: "Sixty", 70: "Seventy", 80: "Eighty", 90: "Ninety"}
+            if number < len(small):
+                return small[number]
+            if number < 100:
+                base = number - number % 10
+                return tens[base] if number == base else f"{tens[base]}-{small[number % 10]}"
+            return str(number)
+
+        if proposals:
+            markdown_lines = ["## Wave three — self-proposed", ""]
+            for offset, proposal in enumerate(proposals):
+                ordinal = tick_number_word(first_tick_number + offset)
+                markdown_lines.extend((
+                    f"### {ordinal}. {proposal['title']}",
+                    proposal["rationale"],
+                    f"Kind: {proposal['kind']}. Evidence: {proposal['evidence']}.",
+                    "",
+                ))
+            markdown = "\n".join(markdown_lines).rstrip()
+        else:
+            markdown = "<!-- No new roadmap ticks proposed. -->"
+
+        return {"proposals": proposals, "markdown": markdown}
+
     def suggest_status(self, identifier):
         """Suggest what status a contact should be based on activity patterns."""
         contact = self.get_contact(identifier)
@@ -8173,6 +8410,8 @@ def main():
 
     sub.add_parser("calibration", help="Forecast Brier score, reliability, and learned weights")
 
+    sub.add_parser("propose", help="Propose the CRM's next roadmap ticks")
+
     p_today = sub.add_parser("today", help="Rank the best CRM actions to do today")
     p_today.add_argument("--limit", "-n", type=int, default=10, help="Maximum actions to show")
 
@@ -8961,6 +9200,9 @@ def main():
         else:
             fmt_table(rows, ["name", "company", "status", "probability", "deal_value", "weighted_value"])
         print(f"\n  Weighted Pipeline: ${fc['weighted_pipeline']:,.0f}")
+
+    elif args.command == "propose":
+        print(crm.propose_ticks()["markdown"])
 
     elif args.command == "calibration":
         report = crm.calibration_report()

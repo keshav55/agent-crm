@@ -83,7 +83,7 @@ scoring, auto-merge above a threshold with full undo (merge log in facts),
 entity-key canonicalization across name/email variants, and a `doctor`
 command that finds and fixes inconsistencies in one pass.
 
-### Eleven. Self-proposing roadmap
+### [x] Eleven. Self-proposing roadmap
 `propose_ticks()` — the CRM introspects itself: which public methods have no
 benchmark coverage, which next_actions signals never fire on real data, which
 CLI commands error most, where perf timings trend worse. Output: ranked

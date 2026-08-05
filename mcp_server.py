@@ -219,6 +219,11 @@ TOOLS = [
         },
     },
     {
+        "name": "crm_propose_ticks",
+        "description": "Propose deterministic roadmap ticks from benchmark coverage, live CRM signals, and cached performance timings",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "crm_context_for_agent",
         "description": "Get context string an AI agent needs — either for a specific contact or an executive summary",
         "inputSchema": {
@@ -791,6 +796,9 @@ def handle_tool_call(name, arguments):
         elif name == "crm_next_actions":
             actions = crm.next_actions(limit=arguments.get("limit", 10))
             return json.dumps(actions, default=str, indent=2)
+
+        elif name == "crm_propose_ticks":
+            return json.dumps(crm.propose_ticks(), default=str, indent=2)
 
         elif name == "crm_context_for_agent":
             ctx = crm.context_for_agent(arguments.get("identifier"))

@@ -11,7 +11,9 @@ Each test = 1 point. Bonus points for performance thresholds.
 import os
 import json
 import random
+import re
 import sqlite3
+import subprocess
 import sys
 import time
 import tempfile
@@ -5934,6 +5936,203 @@ def run_benchmarks():
         check("calibration_mcp_tool", False)
 
     learned_crm.close()
+
+    # ── 85. Self-Proposing Roadmap (12 tests) ──
+
+    proposal_dir = tempfile.mkdtemp()
+    proposal_crm_path = os.path.join(proposal_dir, "synthetic_crm.py")
+    proposal_benchmark_path = os.path.join(proposal_dir, "synthetic_benchmark.py")
+    proposal_roadmap_path = os.path.join(proposal_dir, "roadmap.md")
+    with open(proposal_crm_path, "w", encoding="utf-8") as synthetic_crm_file:
+        synthetic_crm_file.write(
+            "class CRM:\n"
+            "    def covered(self):\n"
+            "        return True\n"
+            "    def uncovered_capability(self):\n"
+            "        return True\n"
+            "    def _private_helper(self):\n"
+            "        return True\n"
+        )
+    with open(proposal_benchmark_path, "w", encoding="utf-8") as synthetic_benchmark_file:
+        synthetic_benchmark_file.write("crm.covered()\n")
+    with open(proposal_roadmap_path, "w", encoding="utf-8") as synthetic_roadmap_file:
+        synthetic_roadmap_file.write(
+            "# Roadmap\n\n### Twelve. Existing roadmap item\nAlready planned.\n"
+        )
+
+    proposal_crm = CRM(os.path.join(proposal_dir, "empty.db"))
+    proposal_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    proposal_titles = [item["title"] for item in proposal_output["proposals"]]
+    coverage_proposals = [
+        item for item in proposal_output["proposals"]
+        if item["kind"] == "untested capability"
+    ]
+
+    # 85a. AST coverage finds a public method with zero benchmark references.
+    check(
+        "propose_ticks_untested_method",
+        [item["title"] for item in coverage_proposals]
+        == ["Benchmark uncovered_capability capability"],
+    )
+
+    # 85b. Covered and private methods are not reported as coverage gaps.
+    check(
+        "propose_ticks_public_methods_only",
+        all("covered" not in title or "uncovered_capability" in title
+            for title in proposal_titles)
+        and all("private_helper" not in title for title in proposal_titles),
+    )
+
+    # 85c. Data-dependent signal gaps can only use names declared by CRM.
+    signal_proposals = [
+        item for item in proposal_output["proposals"]
+        if item["kind"] == "signal never fires on this data"
+    ]
+    proposed_signal_names = {
+        item["title"][len("Activate "):-len(" signal")]
+        for item in signal_proposals
+    }
+    known_signal_names = set(
+        CRM.NEXT_ACTION_SIGNAL_NAMES + CRM.FORECAST_SIGNAL_NAMES
+    )
+    check(
+        "propose_ticks_known_signals_only",
+        bool(proposed_signal_names)
+        and proposed_signal_names <= known_signal_names,
+    )
+
+    # 85d. Two scans of unchanged sources and data are byte-for-byte stable.
+    repeated_proposal_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    check("propose_ticks_deterministic", proposal_output == repeated_proposal_output)
+
+    # 85e. Markdown uses the same ordinal tick-heading shape as roadmap.md.
+    check(
+        "propose_ticks_markdown_format",
+        bool(re.search(
+            r"(?m)^### Thirteen\. .+\n.+\nKind: .+ Evidence: .+\.$",
+            proposal_output["markdown"],
+        )),
+    )
+
+    # 85f. An empty connected DB still produces a complete structured response.
+    check(
+        "propose_ticks_empty_db",
+        set(proposal_output) == {"proposals", "markdown"}
+        and isinstance(proposal_output["proposals"], list)
+        and isinstance(proposal_output["markdown"], str),
+    )
+
+    # 85g. Every ranked item has exactly the public contract and usable evidence.
+    check(
+        "propose_ticks_evidence",
+        bool(proposal_output["proposals"])
+        and all(
+            set(item) == {"title", "rationale", "kind", "evidence"}
+            and all(isinstance(item[key], str) and item[key].strip()
+                    for key in item)
+            for item in proposal_output["proposals"]
+        ),
+    )
+
+    # 85h. Stable kind priority makes the output a ranked list, not a set dump.
+    proposal_kind_rank = {
+        "untested capability": 0,
+        "signal never fires on this data": 1,
+        "performance trend": 2,
+    }
+    output_ranks = [
+        proposal_kind_rank[item["kind"]]
+        for item in proposal_output["proposals"]
+    ]
+    check(
+        "propose_ticks_ranked",
+        output_ranks == sorted(output_ranks),
+    )
+
+    # 85i. Existing tick title words suppress the matching proposal.
+    with open(proposal_roadmap_path, "w", encoding="utf-8") as synthetic_roadmap_file:
+        synthetic_roadmap_file.write(
+            "# Roadmap\n\n"
+            "### Thirteen. Benchmark uncovered capability\nAlready planned.\n"
+        )
+    deduped_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    check(
+        "propose_ticks_roadmap_dedupe",
+        "Benchmark uncovered_capability capability"
+        not in [item["title"] for item in deduped_output["proposals"]],
+    )
+
+    # 85j. A cached PERF block is parsed without importing or running the benchmark.
+    cached_benchmark_path = os.path.join(proposal_dir, "benchmark_results.txt")
+    with open(cached_benchmark_path, "w", encoding="utf-8") as cached_benchmark_file:
+        cached_benchmark_file.write(
+            "PERFORMANCE TIMINGS (seed=1, fixture):\n"
+            "  slow_operation                  9.000 ms  limit 10.000 ms  PASS\n"
+        )
+    perf_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    performance_proposals = [
+        item for item in perf_output["proposals"]
+        if item["kind"] == "performance trend"
+    ]
+    check(
+        "propose_ticks_cached_perf",
+        len(performance_proposals) == 1
+        and "9.000 ms / 10.000 ms" in performance_proposals[0]["evidence"],
+    )
+
+    # 85k. MCP advertises and serves the same structured proposal contract.
+    try:
+        import mcp_server
+        original_proposal_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = os.path.join(proposal_dir, "mcp-empty.db")
+        proposal_tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        proposal_mcp_output = json.loads(
+            mcp_server.handle_tool_call("crm_propose_ticks", {})
+        )
+        mcp_server.DB_PATH = original_proposal_mcp_db
+        check(
+            "propose_ticks_mcp_tool",
+            "crm_propose_ticks" in proposal_tool_names
+            and set(proposal_mcp_output) == {"proposals", "markdown"},
+        )
+    except (AttributeError, TypeError, KeyError, json.JSONDecodeError):
+        check("propose_ticks_mcp_tool", False)
+
+    # 85l. The CLI prints a paste-ready tick block against an empty temp DB.
+    cli_env = os.environ.copy()
+    cli_env["CRM_DB"] = os.path.join(proposal_dir, "cli-empty.db")
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    cli_proposal = subprocess.run(
+        [sys.executable, os.path.join(repo_dir, "crm.py"), "propose"],
+        cwd=repo_dir,
+        env=cli_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    check(
+        "propose_ticks_cli",
+        cli_proposal.returncode == 0
+        and bool(re.search(r"(?m)^### [A-Za-z-]+\. .+$", cli_proposal.stdout)),
+    )
+    proposal_crm.close()
 
     cadence_crm.close()
 
