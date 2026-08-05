@@ -47,7 +47,7 @@ chat.db / AddressBook snapshots) so ingest logic gets scored too. ~15 tests.
 
 ## Next ticks (data loop)
 
-### Six. Experiment outcome tracking
+### [x] Six. Experiment outcome tracking
 `evolve()` proposes experiments; nothing yet closes the loop on whether past
 experiments worked. Store proposal → result → verdict in the facts table and
 have the next `evolve()` run read its own track record first. This is the tick

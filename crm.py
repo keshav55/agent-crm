@@ -3374,6 +3374,191 @@ class CRM:
 
     # --- Self-Improvement Engine ---
 
+    @staticmethod
+    def _experiment_slug(name):
+        """Convert an experiment name into a stable, URL-friendly slug."""
+        slug = re.sub(r"[^a-z0-9]+", "-", str(name).strip().lower()).strip("-")
+        if not slug:
+            raise ValueError("experiment name must contain at least one letter or number")
+        return slug
+
+    def log_experiment(self, name, hypothesis, metric, baseline_value):
+        """Start an experiment and persist its definition in the facts table."""
+        if name is None or not str(name).strip():
+            raise ValueError("experiment name must be non-empty")
+
+        base_slug = self._experiment_slug(name)
+        slug = base_slug
+        suffix = 2
+        while self.conn.execute(
+            "SELECT 1 FROM facts WHERE entity = ? AND source = 'evolve' LIMIT 1",
+            (f"experiment:{slug}",),
+        ).fetchone():
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+
+        entity = f"experiment:{slug}"
+        self.observe_many([
+            (entity, "name", str(name).strip()),
+            (entity, "hypothesis", hypothesis),
+            (entity, "metric", metric),
+            (entity, "baseline_value", baseline_value),
+            (entity, "status", "running"),
+            (entity, "started_at", date.today().isoformat()),
+        ], source="evolve")
+        return slug
+
+    def conclude_experiment(self, slug_or_name, result_value, verdict=None):
+        """Complete an experiment, deriving its verdict when values are numeric.
+
+        Returns the completed experiment record, or ``None`` when no matching
+        experiment exists. Non-numeric comparisons require an explicit verdict.
+        """
+        identifier = str(slug_or_name).strip()
+        if not identifier:
+            return None
+
+        entity = None
+        if identifier.startswith("experiment:"):
+            candidate = identifier
+            if self.conn.execute(
+                "SELECT 1 FROM facts WHERE entity = ? AND source = 'evolve' LIMIT 1",
+                (candidate,),
+            ).fetchone():
+                entity = candidate
+        else:
+            # A human-facing name may map to multiple runs; conclude the newest.
+            row = self.conn.execute(
+                """SELECT entity, MAX(rowid) AS latest_rowid FROM facts
+                   WHERE entity LIKE 'experiment:%' AND source = 'evolve'
+                     AND key = 'name' AND LOWER(value) = LOWER(?)
+                   GROUP BY entity ORDER BY latest_rowid DESC LIMIT 1""",
+                (identifier,),
+            ).fetchone()
+            if row:
+                entity = row["entity"]
+            else:
+                candidates = [identifier]
+                try:
+                    candidates.append(self._experiment_slug(identifier))
+                except ValueError:
+                    pass
+                for candidate_slug in candidates:
+                    candidate = f"experiment:{candidate_slug}"
+                    if self.conn.execute(
+                        "SELECT 1 FROM facts WHERE entity = ? AND source = 'evolve' LIMIT 1",
+                        (candidate,),
+                    ).fetchone():
+                        entity = candidate
+                        break
+
+        if entity is None:
+            return None
+
+        normalized_verdict = None
+        if verdict is not None:
+            normalized_verdict = str(verdict).strip().lower()
+            if normalized_verdict not in {"win", "loss", "neutral"}:
+                raise ValueError("verdict must be one of: win, loss, neutral")
+        else:
+            baseline = self.facts_about(entity).get("baseline_value", {}).get("value")
+            try:
+                baseline_number = float(str(baseline).strip())
+                result_number = float(str(result_value).strip())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "explicit verdict required when baseline_value and result_value are not numeric"
+                ) from None
+            if baseline_number != baseline_number or result_number != result_number:
+                raise ValueError(
+                    "explicit verdict required when baseline_value and result_value are not numeric"
+                )
+            if result_number > baseline_number:
+                normalized_verdict = "win"
+            elif result_number < baseline_number:
+                normalized_verdict = "loss"
+            else:
+                normalized_verdict = "neutral"
+
+        self.observe_many([
+            (entity, "result_value", result_value),
+            (entity, "verdict", normalized_verdict),
+            (entity, "status", "completed"),
+            (entity, "concluded_at", date.today().isoformat()),
+        ], source="evolve")
+
+        slug = entity.split(":", 1)[1]
+        return next(
+            (experiment for experiment in self.experiment_history()
+             if experiment["slug"] == slug),
+            None,
+        )
+
+    def experiment_history(self, status=None):
+        """List experiments with their definitions, outcomes, and dates.
+
+        All rows are loaded in one query and reduced deterministically to the
+        latest value for each fact key.
+        """
+        rows = self.conn.execute(
+            """SELECT rowid, entity, key, value, observed_at FROM facts
+               WHERE entity LIKE 'experiment:%' AND source = 'evolve'
+               ORDER BY observed_at DESC, rowid DESC"""
+        ).fetchall()
+
+        grouped = {}
+        for row in rows:
+            entity = row["entity"]
+            group = grouped.setdefault(entity, {
+                "facts": {},
+                "first_seen": row["observed_at"],
+                "last_seen": row["observed_at"],
+                "latest_rowid": row["rowid"],
+            })
+            group["first_seen"] = min(group["first_seen"], row["observed_at"])
+            group["last_seen"] = max(group["last_seen"], row["observed_at"])
+            group["latest_rowid"] = max(group["latest_rowid"], row["rowid"])
+            if row["key"] not in group["facts"]:
+                group["facts"][row["key"]] = row["value"]
+
+        experiments = []
+        wanted_status = str(status).strip().lower() if status is not None else None
+        for entity, group in grouped.items():
+            facts = group["facts"]
+            current_status = facts.get("status", "unknown")
+            if wanted_status and str(current_status).lower() != wanted_status:
+                continue
+
+            baseline = facts.get("baseline_value", facts.get("baseline"))
+            result_value = facts.get("result_value", facts.get("result"))
+            experiment = {
+                "id": entity,
+                "slug": entity.split(":", 1)[1],
+                "name": facts.get("name") or entity.split(":", 1)[1],
+                "hypothesis": facts.get("hypothesis") or facts.get("proposal"),
+                "metric": facts.get("metric") or facts.get("measure"),
+                "baseline_value": baseline,
+                "baseline": baseline,
+                "result_value": result_value,
+                "result": result_value,
+                "verdict": facts.get("verdict"),
+                "status": current_status,
+                "started_at": facts.get("started_at") or group["first_seen"],
+                "concluded_at": facts.get("concluded_at"),
+                # Legacy evolve() fields remain available to existing callers.
+                "bottleneck": facts.get("bottleneck"),
+                "proposal": facts.get("proposal") or facts.get("hypothesis"),
+                "measure": facts.get("measure") or facts.get("metric"),
+                "conclusion": facts.get("conclusion"),
+                "_latest_rowid": group["latest_rowid"],
+            }
+            experiments.append(experiment)
+
+        experiments.sort(key=lambda experiment: (-experiment["_latest_rowid"], experiment["id"]))
+        for experiment in experiments:
+            del experiment["_latest_rowid"]
+        return experiments
+
     def evolve(self):
         """Run one self-improvement cycle. Analyzes CRM data, identifies the
         biggest opportunity, and proposes a specific experiment.
@@ -3381,6 +3566,19 @@ class CRM:
         Returns dict with analysis, proposal, and tracking info.
         Stores the experiment in the facts table for persistence.
         """
+        history = self.experiment_history()
+        wins = [experiment for experiment in history if experiment["verdict"] == "win"]
+        losses = [experiment for experiment in history if experiment["verdict"] == "loss"]
+        running = [experiment for experiment in history
+                   if experiment["status"] in {"running", "active", "proposed"}]
+        decided = len(wins) + len(losses)
+        experiment_track_record = {
+            "wins": wins,
+            "losses": losses,
+            "running": running,
+            "win_rate": round(len(wins) / decided * 100, 1) if decided else 0.0,
+        }
+
         stats = self.stats()
         pipeline = self.pipeline()
         wl = self.win_loss_analysis()
@@ -3402,6 +3600,7 @@ class CRM:
                 "change": f"{len(stale)} contacts stale (>{stale_pct:.0f}%). Re-engage top 10 by deal value with personalized check-ins.",
                 "measure": "Reply rate > 20% within 7 days",
                 "batch_size": min(10, len(stale)),
+                "baseline_value": 0,
             }
 
         # Check 2: Low win rate
@@ -3413,6 +3612,7 @@ class CRM:
                 "change": f"Win rate is {wl['win_rate']:.0f}%. Focus outreach on '{top_source}' source which produces most wins.",
                 "measure": "Win rate > 40% over next 10 deals",
                 "batch_size": 10,
+                "baseline_value": wl["win_rate"],
             }
 
         # Check 3: No activity diversity
@@ -3426,6 +3626,9 @@ class CRM:
                     "change": f"Only {types_used} activity types used. Add {', '.join(missing)} to the mix.",
                     "measure": "Contacts with 3+ activity types advance 50% faster",
                     "batch_size": 5,
+                    "baseline_value": max(
+                        (activity["effectiveness_rate"] for activity in eff), default=0
+                    ),
                 }
 
         # Check 4: Pipeline imbalance (too many prospects, too few advanced)
@@ -3440,6 +3643,7 @@ class CRM:
                     "change": f"{prospect_count} prospects but 0 advanced. Focus on converting top 5 prospects to 'contacted' this week.",
                     "measure": "5 prospects advance to contacted within 7 days",
                     "batch_size": 5,
+                    "baseline_value": advanced,
                 }
 
         # Default: pipeline is healthy
@@ -3450,14 +3654,23 @@ class CRM:
                 "change": "Pipeline looks healthy. Focus on closing existing advanced deals.",
                 "measure": "Close 1 deal this week",
                 "batch_size": 0,
+                "baseline_value": 0,
             }
 
-        # Store experiment in facts table
-        experiment_id = f"experiment:{date.today().isoformat()}_{proposal['experiment']}"
-        self.observe(experiment_id, "bottleneck", bottleneck, source="evolve")
-        self.observe(experiment_id, "proposal", proposal["change"], source="evolve")
-        self.observe(experiment_id, "measure", proposal["measure"], source="evolve")
-        self.observe(experiment_id, "status", "proposed", source="evolve")
+        # Store the new running experiment after reading the prior track record.
+        slug = self.log_experiment(
+            f"{date.today().isoformat()} {proposal['experiment']}",
+            proposal["change"],
+            proposal["measure"],
+            proposal["baseline_value"],
+        )
+        experiment_id = f"experiment:{slug}"
+        self.observe_many([
+            (experiment_id, "bottleneck", bottleneck),
+            (experiment_id, "proposal", proposal["change"]),
+            (experiment_id, "measure", proposal["measure"]),
+            (experiment_id, "batch_size", proposal["batch_size"]),
+        ], source="evolve")
 
         return {
             "bottleneck": bottleneck,
@@ -3471,35 +3684,15 @@ class CRM:
                     "at_risk": len(hc["at_risk"]),
                     "cold": len(hc["cold"]),
                 },
+                "experiment_track_record": experiment_track_record,
             },
             "proposal": proposal,
             "experiment_id": experiment_id,
         }
 
     def experiments(self, status=None):
-        """List all experiments tracked in the facts table."""
-        rows = self.conn.execute(
-            """SELECT DISTINCT entity FROM facts
-               WHERE entity LIKE 'experiment:%'
-               ORDER BY observed_at DESC"""
-        ).fetchall()
-        results = []
-        for r in rows:
-            entity = r["entity"]
-            facts = self.facts_about(entity)
-            exp = {
-                "id": entity,
-                "bottleneck": facts.get("bottleneck", {}).get("value"),
-                "proposal": facts.get("proposal", {}).get("value"),
-                "measure": facts.get("measure", {}).get("value"),
-                "status": facts.get("status", {}).get("value", "unknown"),
-                "result": facts.get("result", {}).get("value"),
-                "conclusion": facts.get("conclusion", {}).get("value"),
-            }
-            if status and exp["status"] != status:
-                continue
-            results.append(exp)
-        return results
+        """Backward-compatible alias for :meth:`experiment_history`."""
+        return self.experiment_history(status=status)
 
     def win_patterns(self):
         """Analyze what closed deals have in common: sources, activity types,
@@ -6281,7 +6474,21 @@ def main():
 
     # self-improvement
     sub.add_parser("evolve", help="Run one self-improvement cycle")
-    sub.add_parser("experiments", help="List past experiments")
+    p_experiments = sub.add_parser("experiments", help="List past experiments")
+    p_experiments.add_argument("--status", choices=["running", "completed"],
+                               help="Filter by experiment status")
+
+    p_experiment = sub.add_parser("experiment", help="Log or conclude an experiment")
+    experiment_sub = p_experiment.add_subparsers(dest="experiment_command", required=True)
+    p_experiment_log = experiment_sub.add_parser("log", help="Start a new experiment")
+    p_experiment_log.add_argument("name")
+    p_experiment_log.add_argument("hypothesis")
+    p_experiment_log.add_argument("metric")
+    p_experiment_log.add_argument("baseline_value")
+    p_experiment_conclude = experiment_sub.add_parser("conclude", help="Complete an experiment")
+    p_experiment_conclude.add_argument("slug_or_name")
+    p_experiment_conclude.add_argument("result_value")
+    p_experiment_conclude.add_argument("--verdict", choices=["win", "loss", "neutral"])
     sub.add_parser("win-patterns", help="What do closed deals have in common")
     sub.add_parser("loss-patterns", help="What do lost deals have in common")
     sub.add_parser("dead", help="Find contacts that should be marked as lost")
@@ -6784,17 +6991,41 @@ def main():
         print(f"  Experiment ID: {result['experiment_id']}\n")
 
     elif args.command == "experiments":
-        exps = crm.experiments()
+        exps = crm.experiment_history(status=args.status)
         if not exps:
             print("  No experiments recorded")
         else:
             for e in exps:
-                status = e["status"] or "unknown"
-                print(f"  [{status.upper()}] {e['id']}")
-                if e.get("proposal"):
-                    print(f"    {e['proposal']}")
-                if e.get("result"):
-                    print(f"    Result: {e['result']}")
+                label = e["verdict"] or e["status"] or "unknown"
+                print(f"  [{label.upper()}] {e['name']} ({e['slug']})")
+                print(f"    Hypothesis: {e['hypothesis'] or '-'}")
+                print(f"    Metric: {e['metric'] or '-'}")
+                outcome = e["result_value"] if e["result_value"] is not None else "running"
+                print(f"    Baseline: {e['baseline_value']} | Result: {outcome}")
+                dates = e["started_at"]
+                if e["concluded_at"]:
+                    dates += f" → {e['concluded_at']}"
+                print(f"    Dates: {dates}")
+
+    elif args.command == "experiment":
+        if args.experiment_command == "log":
+            slug = crm.log_experiment(
+                args.name, args.hypothesis, args.metric, args.baseline_value
+            )
+            print(f"  Logged experiment: {slug}")
+        elif args.experiment_command == "conclude":
+            try:
+                experiment = crm.conclude_experiment(
+                    args.slug_or_name, args.result_value, verdict=args.verdict
+                )
+            except ValueError as exc:
+                print(f"  Error: {exc}", file=sys.stderr)
+                return
+            if experiment is None:
+                print(f"  Experiment not found: {args.slug_or_name}")
+            else:
+                print(f"  [{experiment['verdict'].upper()}] {experiment['name']}: "
+                      f"{experiment['baseline_value']} → {experiment['result_value']}")
 
     elif args.command == "win-patterns":
         wp = crm.win_patterns()

@@ -507,9 +507,55 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "crm_log_experiment",
+        "description": "Start a GTM experiment with a hypothesis, metric, and baseline",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Human-readable experiment name"},
+                "hypothesis": {"type": "string", "description": "Expected outcome and rationale"},
+                "metric": {"type": "string", "description": "Metric used to judge the experiment"},
+                "baseline_value": {
+                    "type": ["string", "number"],
+                    "description": "Metric value before the experiment",
+                },
+            },
+            "required": ["name", "hypothesis", "metric", "baseline_value"],
+        },
+    },
+    {
+        "name": "crm_conclude_experiment",
+        "description": "Complete an experiment and record its result and verdict",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug_or_name": {"type": "string", "description": "Experiment slug or name"},
+                "result_value": {
+                    "type": ["string", "number"],
+                    "description": "Observed metric value",
+                },
+                "verdict": {
+                    "type": "string",
+                    "enum": ["win", "loss", "neutral"],
+                    "description": "Required when baseline and result are not numeric",
+                },
+            },
+            "required": ["slug_or_name", "result_value"],
+        },
+    },
+    {
         "name": "crm_experiments",
         "description": "List all past CRM experiments with status and results",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "completed"],
+                    "description": "Optional experiment status filter",
+                },
+            },
+        },
     },
     {
         "name": "crm_win_patterns",
@@ -800,8 +846,31 @@ def handle_tool_call(name, arguments):
         elif name == "crm_evolve":
             return json.dumps(crm.evolve(), default=str, indent=2)
 
+        elif name == "crm_log_experiment":
+            slug = crm.log_experiment(
+                arguments["name"],
+                arguments["hypothesis"],
+                arguments["metric"],
+                arguments["baseline_value"],
+            )
+            return json.dumps({"slug": slug}, indent=2)
+
+        elif name == "crm_conclude_experiment":
+            experiment = crm.conclude_experiment(
+                arguments["slug_or_name"],
+                arguments["result_value"],
+                verdict=arguments.get("verdict"),
+            )
+            if experiment is None:
+                return f"Experiment not found: {arguments['slug_or_name']}"
+            return json.dumps(experiment, default=str, indent=2)
+
         elif name == "crm_experiments":
-            return json.dumps(crm.experiments(), default=str, indent=2)
+            return json.dumps(
+                crm.experiment_history(status=arguments.get("status")),
+                default=str,
+                indent=2,
+            )
 
         elif name == "crm_win_patterns":
             return json.dumps(crm.win_patterns(), default=str, indent=2)

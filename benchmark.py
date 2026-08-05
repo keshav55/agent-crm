@@ -4013,6 +4013,168 @@ def run_benchmarks():
 
     actions_crm.close()
 
+    # ── 77. Experiment Outcome Tracking (14 tests) ──
+
+    experiment_dir = tempfile.mkdtemp()
+    experiment_db = os.path.join(experiment_dir, "experiments.db")
+    experiment_crm = CRM(experiment_db)
+
+    # 77a. logging returns a stable slug and writes running/evolve facts
+    try:
+        reply_slug = experiment_crm.log_experiment(
+            "Reply Rate Test", "Personalized copy raises replies", "reply rate", 10
+        )
+        reply_facts = experiment_crm.facts_about(f"experiment:{reply_slug}")
+        check("experiment_log_slug_source_status",
+              reply_slug == "reply-rate-test" and
+              reply_facts["status"]["value"] == "running" and
+              all(fact["source"] == "evolve" for fact in reply_facts.values()))
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_log_slug_source_status", False)
+
+    # 77b. history round-trips the complete experiment definition
+    try:
+        reply = experiment_crm.experiment_history()[0]
+        check("experiment_history_round_trip",
+              reply["slug"] == reply_slug and
+              reply["name"] == "Reply Rate Test" and
+              reply["hypothesis"] == "Personalized copy raises replies" and
+              reply["metric"] == "reply rate" and
+              reply["baseline_value"] == "10" and
+              reply["result_value"] is None and reply["verdict"] is None)
+    except (AttributeError, TypeError, KeyError, IndexError):
+        check("experiment_history_round_trip", False)
+
+    # 77c. running and completed records expose their lifecycle dates
+    try:
+        before = experiment_crm.experiment_history()[0]
+        experiment_crm.conclude_experiment(reply_slug, 15)
+        after = next(e for e in experiment_crm.experiment_history() if e["slug"] == reply_slug)
+        check("experiment_history_dates",
+              bool(before["started_at"]) and before["concluded_at"] is None and
+              bool(after["started_at"]) and bool(after["concluded_at"]))
+    except (AttributeError, TypeError, KeyError, IndexError):
+        check("experiment_history_dates", False)
+
+    # 77d. a numeric improvement derives a win
+    try:
+        won = experiment_crm.conclude_experiment(reply_slug, 15)
+        check("experiment_conclude_win",
+              won["verdict"] == "win" and won["status"] == "completed" and
+              won["result_value"] == "15")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_win", False)
+
+    # 77e. a numeric decline derives a loss
+    try:
+        loss_slug = experiment_crm.log_experiment("Lower Result", "Test a decline", "score", 10)
+        lost = experiment_crm.conclude_experiment(loss_slug, 5)
+        check("experiment_conclude_loss", lost["verdict"] == "loss")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_loss", False)
+
+    # 77f. an unchanged numeric result derives neutral
+    try:
+        neutral_slug = experiment_crm.log_experiment("Same Result", "Test parity", "score", 10)
+        neutral = experiment_crm.conclude_experiment(neutral_slug, "10.0")
+        check("experiment_conclude_neutral", neutral["verdict"] == "neutral")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_neutral", False)
+
+    # 77g. an explicit verdict wins over numeric comparison
+    try:
+        explicit_slug = experiment_crm.log_experiment("Guardrail Result", "Guardrail matters", "score", 10)
+        explicit = experiment_crm.conclude_experiment(explicit_slug, 20, verdict="loss")
+        check("experiment_explicit_verdict", explicit["verdict"] == "loss")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_explicit_verdict", False)
+
+    # 77h. non-numeric comparison requires an explicit verdict
+    try:
+        text_slug = experiment_crm.log_experiment("Qualitative Test", "Users prefer it", "preference", "old")
+        raised = False
+        try:
+            experiment_crm.conclude_experiment(text_slug, "new")
+        except ValueError:
+            raised = True
+        check("experiment_nonnumeric_requires_verdict", raised)
+    except (AttributeError, TypeError, KeyError):
+        check("experiment_nonnumeric_requires_verdict", False)
+
+    # 77i. status filters separate running work from completed history
+    try:
+        running_history = experiment_crm.experiment_history(status="running")
+        completed_history = experiment_crm.experiment_history(status="completed")
+        check("experiment_status_filter",
+              {e["slug"] for e in running_history} == {text_slug} and
+              all(e["status"] == "completed" for e in completed_history) and
+              len(completed_history) == 4)
+    except (AttributeError, TypeError, KeyError):
+        check("experiment_status_filter", False)
+
+    # 77j. evolve reads the prior outcomes into a track record before logging
+    try:
+        evolved = experiment_crm.evolve()
+        track = evolved["analysis"]["experiment_track_record"]
+        check("evolve_experiment_track_record",
+              set(track) == {"wins", "losses", "running", "win_rate"} and
+              len(track["wins"]) == 1 and len(track["losses"]) == 2 and
+              len(track["running"]) == 1 and track["win_rate"] == 33.3)
+    except (AttributeError, TypeError, KeyError):
+        check("evolve_experiment_track_record", False)
+
+    # 77k. concluding an unknown slug is a handled miss
+    try:
+        check("experiment_unknown_slug",
+              experiment_crm.conclude_experiment("does-not-exist", 1) is None and
+              experiment_crm.conclude_experiment("???", 1) is None)
+    except (AttributeError, TypeError, ValueError):
+        check("experiment_unknown_slug", False)
+
+    # 77l. conclusion accepts the original human-facing name
+    try:
+        name_slug = experiment_crm.log_experiment("Resolve By Name", "Names resolve", "score", 1)
+        by_name = experiment_crm.conclude_experiment("Resolve By Name", 2)
+        check("experiment_conclude_by_name",
+              by_name["slug"] == name_slug and by_name["verdict"] == "win")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_by_name", False)
+
+    # 77m. unchanged facts produce deterministic history
+    try:
+        first_history = experiment_crm.experiment_history()
+        second_history = experiment_crm.experiment_history()
+        check("experiment_history_deterministic", first_history == second_history)
+    except (AttributeError, TypeError):
+        check("experiment_history_deterministic", False)
+
+    # 77n. MCP registers and serves log, conclude, and history tools
+    try:
+        import mcp_server
+        original_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = os.path.join(experiment_dir, "mcp-experiments.db")
+        mcp_names = {tool["name"] for tool in mcp_server.TOOLS}
+        logged_json = mcp_server.handle_tool_call("crm_log_experiment", {
+            "name": "MCP Test",
+            "hypothesis": "MCP round trip",
+            "metric": "score",
+            "baseline_value": 1,
+        })
+        concluded_json = mcp_server.handle_tool_call("crm_conclude_experiment", {
+            "slug_or_name": "mcp-test",
+            "result_value": 2,
+        })
+        history_json = mcp_server.handle_tool_call("crm_experiments", {"status": "completed"})
+        mcp_server.DB_PATH = original_mcp_db
+        check("experiment_mcp_tools",
+              {"crm_log_experiment", "crm_conclude_experiment", "crm_experiments"}.issubset(mcp_names) and
+              '"slug": "mcp-test"' in logged_json and '"verdict": "win"' in concluded_json and
+              '"status": "completed"' in history_json)
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_mcp_tools", False)
+
+    experiment_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
