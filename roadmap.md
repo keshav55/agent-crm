@@ -110,3 +110,9 @@ Add focused benchmark cases for `CRM.network_summary()`; proposed by `propose_ti
 
 ### [x] Fifteen. Benchmark unified_search capability
 Add focused benchmark cases for `CRM.unified_search()`; proposed by `propose_ticks()` and now covered.
+
+### Candidates from independent review (2026-08-06)
+- Queue learning trains only the primary signal per surfaced item; co-firing
+  supporting signals never earn outcome credit.
+- evolve() reports losing experiments but can re-propose the same bottleneck;
+  proposals should exclude recently-failed hypotheses.
