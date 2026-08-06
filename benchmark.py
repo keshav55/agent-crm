@@ -302,6 +302,373 @@ def make_mail_fixture_records():
     ]
 
 
+MCP_SWEEP_BATCHES = (
+    ("contact_crud", (
+        "crm_add_contact", "crm_list_contacts", "crm_view_contact",
+        "crm_update_contact", "crm_log_activity", "crm_search",
+    )),
+    ("contact_intelligence", (
+        "crm_score_contact", "crm_enrich", "crm_unified_search",
+        "crm_recent_contacts", "crm_contact_summary", "crm_contact_360",
+        "crm_quick_add", "crm_compare_contacts",
+    )),
+    ("graph_context", (
+        "crm_observe", "crm_facts_about", "crm_context_for_agent",
+        "crm_search_graph", "crm_query",
+    )),
+    ("pipeline_analytics", (
+        "crm_pipeline", "crm_forecast", "crm_calibration", "crm_stats",
+        "crm_dashboard", "crm_weekly_digest", "crm_source_attribution",
+        "crm_pipeline_health_score", "crm_period_comparison",
+    )),
+    ("data_exchange", (
+        "crm_export_full", "crm_import_csv", "crm_ingest", "crm_doctor",
+    )),
+    ("relationships", (
+        "crm_find_intros", "crm_intro_paths", "crm_relationship_health",
+        "crm_network_summary", "crm_touch_plan", "crm_company_summary",
+        "crm_relationship_score",
+    )),
+    ("deals", (
+        "crm_add_deal", "crm_update_deal", "crm_close_deal",
+        "crm_list_deals", "crm_deal_pipeline", "crm_deal_velocity_report",
+        "crm_win_patterns", "crm_optimal_cadence", "crm_tuned_cadence",
+        "crm_dead_pipeline",
+    )),
+    ("hygiene_lifecycle", (
+        "crm_merge_contacts", "crm_auto_merge", "crm_suggest_merges",
+        "crm_archive_contact", "crm_unarchive_contact",
+        "crm_delete_contacts", "crm_detect_churning",
+    )),
+    ("actions_fields", (
+        "crm_next_actions", "crm_queue_stats", "crm_set_reminder",
+        "crm_due_reminders", "crm_set_field", "crm_get_fields",
+    )),
+    ("learning_experiments", (
+        "crm_propose_ticks", "crm_evolve", "crm_log_experiment",
+        "crm_conclude_experiment", "crm_experiments",
+    )),
+)
+
+MCP_SWEEP_PLAIN_TEXT_TOOLS = {
+    "crm_add_contact", "crm_log_activity", "crm_observe", "crm_pipeline",
+    "crm_context_for_agent", "crm_add_deal", "crm_archive_contact",
+    "crm_unarchive_contact", "crm_delete_contacts", "crm_contact_summary",
+    "crm_set_reminder", "crm_set_field", "crm_quick_add",
+}
+
+# These JSON tools have fixture rows that make an empty collection a regression.
+MCP_SWEEP_ALLOW_EMPTY_JSON = {"crm_detect_churning"}
+
+
+def make_mcp_sweep_fixture():
+    """Seed a small, isolated CRM that exercises every MCP tool category."""
+    fixture_dir = tempfile.mkdtemp()
+    db_path = os.path.join(fixture_dir, "mcp-sweep.db")
+    csv_path = os.path.join(fixture_dir, "mcp-import.csv")
+    crm = CRM(db_path)
+
+    contacts = (
+        ("Fixture Alice", "alice@mcp-sweep.test", "Acme Labs", "CTO",
+         "$120K", "active_customer", "referral", "Primary fixture", "enterprise"),
+        ("Fixture Bob", "bob@mcp-sweep.test", "Acme Labs", "VP Sales",
+         "$80K", "proposal_drafted", "event", "Pipeline fixture", "enterprise"),
+        ("Fixture Target", "target@mcp-sweep.test", "Target Co", "CEO",
+         "$50K", "contacted", "intro", "Introduction target", "target"),
+        ("Fixture Merge", "merge@mcp-sweep.test", "Acme Labs", "CTO",
+         "$120K", "prospect", "referral", "Merge fixture", "enterprise"),
+        ("Fixture Archive", "archive@mcp-sweep.test", "Archive Co", "VP",
+         "$10K", "prospect", "fixture", "Archive fixture", "fixture"),
+        ("Fixture Delete", "delete@mcp-sweep.test", "Delete Co", "VP",
+         "$10K", "prospect", "fixture", "Delete fixture", "fixture"),
+        ("Fixture Duplicate", "duplicate.one@mcp-sweep.test", "Duplicate Co", "VP",
+         "$15K", "prospect", "fixture", "Rich duplicate", "fixture"),
+        ("Fixture Duplicate", "duplicate.two@mcp-sweep.test", "Duplicate Co", None,
+         None, "prospect", "fixture", None, None),
+    )
+    for (name, email, company, title, deal_size, status, source, notes,
+         tags) in contacts:
+        crm.add_contact(
+            name, email=email, company=company, title=title,
+            deal_size=deal_size, status=status, source=source,
+            notes=notes, tags=tags,
+        )
+
+    crm.log_activity("alice@mcp-sweep.test", "email", "Fixture recent email")
+    crm.log_activity("alice@mcp-sweep.test", "meeting", "Fixture discovery meeting")
+    crm.log_activity("bob@mcp-sweep.test", "proposal", "Fixture proposal")
+    alice = crm.get_contact("alice@mcp-sweep.test")
+    bob = crm.get_contact("bob@mcp-sweep.test")
+    old_timestamp = (datetime.now() - timedelta(days=90)).isoformat(sep=" ")
+    old_day = (datetime.now().date() - timedelta(days=90)).isoformat()
+    recent_day = (datetime.now().date() - timedelta(days=10)).isoformat()
+    with crm.conn:
+        crm.conn.execute(
+            "UPDATE contacts SET last_contacted = ? WHERE id = ?",
+            (recent_day, alice["id"]),
+        )
+        crm.conn.execute(
+            "UPDATE contacts SET last_contacted = ? WHERE id = ?",
+            (old_day, bob["id"]),
+        )
+        crm.conn.execute(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (bob["id"], "email", "Old fixture email", old_timestamp),
+        )
+
+    crm.observe("contact:fixture alice", "role", "buyer", source="fixture")
+    crm.observe(
+        "contact:fixture alice", "knows", "contact:fixture target",
+        source="fixture",
+    )
+    crm.observe(
+        "contact:fixture alice", "imessage_total", "42", source="imessage"
+    )
+    crm.observe(
+        "contact:fixture alice", "message_intensity", "high", source="imessage"
+    )
+    crm.observe(
+        "contact:fixture target", "company", "Target Co", source="fixture"
+    )
+
+    crm.add_deal(
+        "alice@mcp-sweep.test", "Open Fixture Deal", value="$120K",
+        stage="negotiation", notes="open",
+    )
+    crm.add_deal(
+        "bob@mcp-sweep.test", "Update Fixture Deal", value="$80K",
+        stage="proposal", notes="update",
+    )
+    update_deal_id = crm.conn.execute(
+        "SELECT id FROM deals WHERE name = 'Update Fixture Deal'"
+    ).fetchone()[0]
+    crm.add_deal(
+        "bob@mcp-sweep.test", "Close Fixture Deal", value="$25K",
+        stage="qualification", notes="close",
+    )
+    close_deal_id = crm.conn.execute(
+        "SELECT id FROM deals WHERE name = 'Close Fixture Deal'"
+    ).fetchone()[0]
+    crm.set_reminder(
+        "alice@mcp-sweep.test",
+        (datetime.now().date() - timedelta(days=1)).isoformat(),
+        "Fixture overdue reminder",
+    )
+    crm.set_field("alice@mcp-sweep.test", "account_tier", "strategic")
+    experiment_slug = crm.log_experiment(
+        "Fixture Conclusion", "Fixture hypothesis", "conversion_rate", 10
+    )
+    crm.close()
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as csv_file:
+        csv_file.write(
+            "name,email,company\n"
+            "Fixture Imported,imported@mcp-sweep.test,Import Co\n"
+        )
+
+    return {
+        "db_path": db_path,
+        "csv_path": csv_path,
+        "update_deal_id": update_deal_id,
+        "close_deal_id": close_deal_id,
+        "experiment_slug": experiment_slug,
+    }
+
+
+def mcp_sweep_schema_value(property_name, property_schema, fixture):
+    """Choose one deterministic, schema-valid value for a sweep argument."""
+    if "default" in property_schema:
+        return property_schema["default"]
+    if property_schema.get("enum"):
+        return property_schema["enum"][0]
+
+    fixture_strings = {
+        "identifier": "alice@mcp-sweep.test",
+        "email": "alice@mcp-sweep.test",
+        "name": "MCP Sweep Fixture",
+        "term": "Fixture",
+        "entity": "contact:fixture alice",
+        "key": "role",
+        "value": "buyer",
+        "type": "email",
+        "summary": "MCP sweep activity",
+        "query": "enterprise",
+        "target": "Target Co",
+        "target_identifier": "target@mcp-sweep.test",
+        "company": "Acme Labs",
+        "note": "MCP sweep reminder",
+        "field_name": "sweep_field",
+        "field_value": "sweep_value",
+        "hypothesis": "Fixture improves coverage",
+        "metric": "coverage",
+        "slug_or_name": fixture["experiment_slug"],
+        "text": "Sweep Quick, CTO at Quick Co, quick@mcp-sweep.test",
+        "contact_a": "alice@mcp-sweep.test",
+        "contact_b": "bob@mcp-sweep.test",
+        "keep": "alice@mcp-sweep.test",
+        "merge": "merge@mcp-sweep.test",
+        "path": fixture["csv_path"],
+    }
+    property_type = property_schema.get("type")
+    if isinstance(property_type, list):
+        property_type = property_type[0]
+    if property_type == "string":
+        return fixture_strings.get(property_name, "fixture")
+    if property_type == "integer":
+        return {"limit": 5, "max_hops": 3}.get(property_name, 30)
+    if property_type == "number":
+        return 1
+    if property_type == "boolean":
+        return False
+    if property_type == "array":
+        return ["alice@mcp-sweep.test"]
+    if property_type == "object":
+        return {}
+    raise ValueError(
+        f"unsupported schema for {property_name}: {property_schema!r}"
+    )
+
+
+def mcp_sweep_arguments(tool, fixture):
+    """Derive minimal useful arguments from a tool's advertised input schema."""
+    schema = tool.get("inputSchema", {})
+    required = set(schema.get("required", ()))
+    arguments = {}
+    for property_name, property_schema in schema.get("properties", {}).items():
+        include = (
+            property_name in required
+            or "default" in property_schema
+            or "enum" in property_schema
+            or property_name in {
+                "limit", "days", "max_hops", "include_future_days",
+                "stale_days",
+            }
+        )
+        if include:
+            arguments[property_name] = mcp_sweep_schema_value(
+                property_name, property_schema, fixture
+            )
+
+    overrides = {
+        "crm_add_contact": {"name": "Sweep Added Contact"},
+        "crm_import_csv": {"path": fixture["csv_path"]},
+        "crm_search_graph": {"query": "buyer"},
+        # The connector dispatch is covered with a stub below; existing ingest
+        # fixture tests exercise the real source transforms independently.
+        "crm_ingest": {"source": "contacts"},
+        "crm_add_deal": {
+            "identifier": "alice@mcp-sweep.test", "name": "Sweep Added Deal"
+        },
+        "crm_update_deal": {"deal_id": fixture["update_deal_id"]},
+        "crm_close_deal": {"deal_id": fixture["close_deal_id"]},
+        "crm_merge_contacts": {
+            "keep": "alice@mcp-sweep.test", "merge": "merge@mcp-sweep.test"
+        },
+        "crm_archive_contact": {"identifier": "archive@mcp-sweep.test"},
+        "crm_unarchive_contact": {"identifier": "archive@mcp-sweep.test"},
+        "crm_delete_contacts": {"identifiers": ["delete@mcp-sweep.test"]},
+        "crm_log_experiment": {
+            "name": "Sweep Logged Experiment",
+            "hypothesis": "Fixture improves coverage",
+            "metric": "coverage",
+            "baseline_value": 1,
+        },
+        "crm_conclude_experiment": {
+            "slug_or_name": fixture["experiment_slug"], "result_value": 2
+        },
+        "crm_quick_add": {
+            "text": "Sweep Quick, CTO at Quick Co, quick@mcp-sweep.test"
+        },
+    }
+    arguments.update(overrides.get(tool["name"], {}))
+    return arguments
+
+
+def mcp_sweep_output_error(tool_name, output):
+    """Return why a tool response is invalid, or None when it is usable."""
+    if not isinstance(output, str) or not output.strip():
+        return "empty/non-string response"
+    bad_plain_markers = (
+        "Not found:", "Contact not found:", "One or both contacts not found",
+        "Could not parse", "Unknown tool:",
+    )
+    if any(marker in output for marker in bad_plain_markers):
+        return "fixture lookup failed"
+    if tool_name in MCP_SWEEP_PLAIN_TEXT_TOOLS:
+        return None
+    try:
+        parsed = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return f"invalid JSON ({exc})"
+    if not parsed and tool_name not in MCP_SWEEP_ALLOW_EMPTY_JSON:
+        return "unexpected empty JSON"
+    return None
+
+
+def run_mcp_tool_sweep():
+    """Call every registered MCP tool once, reported as ten category checks."""
+    import mcp_server
+
+    fixture = make_mcp_sweep_fixture()
+    registered_tools = list(mcp_server.TOOLS)
+    registered_names = [tool.get("name") for tool in registered_tools]
+    assignment = {}
+    coverage_errors = []
+    for batch_name, expected_names in MCP_SWEEP_BATCHES:
+        for tool_name in expected_names:
+            if tool_name in assignment:
+                coverage_errors.append(f"duplicate category:{tool_name}")
+            assignment[tool_name] = batch_name
+    stale_assignments = sorted(set(assignment) - set(registered_names))
+    if stale_assignments:
+        coverage_errors.append(f"not registered:{','.join(stale_assignments)}")
+    duplicate_registrations = sorted({
+        name for name in registered_names if registered_names.count(name) > 1
+    })
+    if duplicate_registrations:
+        coverage_errors.append(
+            f"registered twice:{','.join(duplicate_registrations)}"
+        )
+
+    tools_by_batch = {batch_name: [] for batch_name, _ in MCP_SWEEP_BATCHES}
+    first_batch = MCP_SWEEP_BATCHES[0][0]
+    for tool in registered_tools:
+        batch_name = assignment.get(tool.get("name"))
+        if batch_name is None:
+            coverage_errors.append(f"uncategorized:{tool.get('name')}")
+            batch_name = first_batch
+        tools_by_batch[batch_name].append(tool)
+
+    original_db_path = mcp_server.DB_PATH
+    original_ingest_contacts = CRM.ingest_macos_contacts
+    mcp_server.DB_PATH = fixture["db_path"]
+    CRM.ingest_macos_contacts = lambda self: (1, 1)
+    try:
+        for batch_index, (batch_name, _) in enumerate(MCP_SWEEP_BATCHES):
+            batch_errors = list(coverage_errors) if batch_index == 0 else []
+            for tool in tools_by_batch[batch_name]:
+                tool_name = tool["name"]
+                try:
+                    arguments = mcp_sweep_arguments(tool, fixture)
+                    output = mcp_server.handle_tool_call(tool_name, arguments)
+                    output_error = mcp_sweep_output_error(tool_name, output)
+                    if output_error:
+                        batch_errors.append(f"{tool_name}:{output_error}")
+                except Exception as exc:
+                    batch_errors.append(
+                        f"{tool_name}:{type(exc).__name__}:{exc}"
+                    )
+            detail = "|".join(batch_errors[:3])
+            check(
+                f"mcp_sweep_{batch_name}" + (f"[{detail}]" if detail else ""),
+                not batch_errors,
+            )
+    finally:
+        CRM.ingest_macos_contacts = original_ingest_contacts
+        mcp_server.DB_PATH = original_db_path
+
+
 def run_benchmarks():
     global PASS, FAIL
 
@@ -6634,6 +7001,9 @@ def run_benchmarks():
               learned_queue_crm.queue_stats() == learned_queue_crm.queue_stats())
     except (AttributeError, TypeError):
         check("queue_stats_deterministic", False)
+
+    # ── 90. Full MCP registered-tool sweep (10 category checks) ──
+    run_mcp_tool_sweep()
 
     learned_queue_crm.close()
 
