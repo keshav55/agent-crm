@@ -557,6 +557,23 @@ class CRM:
         drop = payload["pre_merge"]["contacts"]["drop"]
         moved = payload["moved_row_ids"]
 
+        for contact in (keep, drop):
+            email = contact.get("email")
+            if not email:
+                continue
+            email_owner = self.conn.execute(
+                """SELECT id FROM contacts
+                   WHERE email = ? AND id NOT IN (?, ?) LIMIT 1""",
+                (email, keep["id"], drop["id"]),
+            ).fetchone()
+            if email_owner:
+                return {
+                    "error": (
+                        f"Cannot undo merge {raw_id}: email {email!r} "
+                        "is now taken"
+                    )
+                }
+
         with self.conn:
             current_keep = self.conn.execute(
                 "SELECT id FROM contacts WHERE id = ?", (keep["id"],)
@@ -1373,11 +1390,20 @@ class CRM:
 
                         if existing:
                             target_id = existing["id"]
-                            assignments = ", ".join(f"{column} = ?" for column in mutable_contact_columns)
-                            self.conn.execute(
-                                f"UPDATE contacts SET {assignments} WHERE id = ?",
-                                tuple(row.get(column) for column in mutable_contact_columns) + (target_id,),
-                            )
+                            incoming_updates = {
+                                column: row.get(column)
+                                for column in mutable_contact_columns
+                                if row.get(column) is not None
+                                and row.get(column) != ""
+                            }
+                            if incoming_updates:
+                                assignments = ", ".join(
+                                    f"{column} = ?" for column in incoming_updates
+                                )
+                                self.conn.execute(
+                                    f"UPDATE contacts SET {assignments} WHERE id = ?",
+                                    tuple(incoming_updates.values()) + (target_id,),
+                                )
                             updated_contacts += 1
                         else:
                             placeholders = ", ".join("?" for _ in mutable_contact_columns)

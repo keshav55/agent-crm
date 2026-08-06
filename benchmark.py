@@ -38,9 +38,9 @@ PERFORMANCE_THRESHOLDS_MS = {
     "get_contact_email": 1.0,
     "get_contact_partial_name": 1.0,
     "pipeline": 2.0,
-    "next_actions_10": 3000.0,
+    "next_actions_10": 1200.0,
     "forecast": 600.0,
-    "intro_paths": 5000.0,
+    "intro_paths": 2000.0,
     "export_full": 40.0,
 }
 
@@ -3466,7 +3466,7 @@ def run_benchmarks():
 
     sm_crm.close()
 
-    # ── 52d. Autonomous Data Hygiene (14 tests) ──
+    # ── 52d. Autonomous Data Hygiene (16 tests) ──
 
     confidence_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-confidence.db"))
     confidence_crm.add_contact(
@@ -3657,6 +3657,69 @@ def run_benchmarks():
         check("hygiene_undo_restores_row_ownership_exactly", False)
     hygiene_merge_crm.close()
 
+    clean_undo_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-undo-clean.db"))
+    clean_undo_crm.add_contact("Clean Keep", email="keep@undo.test")
+    clean_undo_crm.add_contact("Clean Drop", email="drop@undo.test")
+    clean_contacts_before = [dict(row) for row in clean_undo_crm.conn.execute(
+        "SELECT * FROM contacts ORDER BY id"
+    ).fetchall()]
+    try:
+        clean_merge = clean_undo_crm.merge_contacts(
+            "keep@undo.test", "drop@undo.test"
+        )
+        clean_undo = clean_undo_crm.undo_merge(clean_merge["merge_id"])
+        clean_contacts_after = [dict(row) for row in clean_undo_crm.conn.execute(
+            "SELECT * FROM contacts ORDER BY id"
+        ).fetchall()]
+        check(
+            "hygiene_undo_clean_regression",
+            clean_undo["restored"]
+            and clean_contacts_after == clean_contacts_before,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_undo_clean_regression", False)
+    clean_undo_crm.close()
+
+    conflict_undo_crm = CRM(
+        os.path.join(tempfile.mkdtemp(), "hygiene-undo-conflict.db")
+    )
+    conflict_undo_crm.add_contact("Conflict Keep", email="keep@conflict.test")
+    conflict_undo_crm.add_contact("Conflict Drop", email="reused@conflict.test")
+    try:
+        conflict_merge = conflict_undo_crm.merge_contacts(
+            "keep@conflict.test", "reused@conflict.test"
+        )
+        conflict_undo_crm.add_contact(
+            "New Email Owner", email="reused@conflict.test"
+        )
+        conflict_tables = (
+            "contacts", "activity", "deals", "reminders", "custom_fields",
+            "facts",
+        )
+        conflict_before = {
+            table: [dict(row) for row in conflict_undo_crm.conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+            ).fetchall()]
+            for table in conflict_tables
+        }
+        conflict_undo = conflict_undo_crm.undo_merge(conflict_merge["merge_id"])
+        conflict_after = {
+            table: [dict(row) for row in conflict_undo_crm.conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+            ).fetchall()]
+            for table in conflict_tables
+        }
+        check(
+            "hygiene_undo_email_conflict_transactional",
+            isinstance(conflict_undo, dict)
+            and "reused@conflict.test" in conflict_undo.get("error", "")
+            and "taken" in conflict_undo["error"]
+            and conflict_after == conflict_before,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_undo_email_conflict_transactional", False)
+    conflict_undo_crm.close()
+
     dry_merge_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-dry.db"))
     dry_merge_crm.add_contact("Dry One", email="dry@merge.test")
     dry_merge_crm.add_contact("Dry Two", email="DRY@MERGE.TEST")
@@ -3762,8 +3825,8 @@ def run_benchmarks():
     )
     with doctor_fix_crm.conn:
         doctor_fix_crm.conn.execute(
-            "UPDATE contacts SET email = ? WHERE id = ?",
-            (" Fix@Doctor.TEST ", fix_contact_id),
+            "UPDATE contacts SET email = ?, status = ? WHERE id = ?",
+            (" Fix@Doctor.TEST ", "impossible", fix_contact_id),
         )
         doctor_fix_crm.conn.execute(
             "INSERT INTO activity (contact_id, type, summary) VALUES (777, 'note', 'orphan')"
@@ -3775,7 +3838,12 @@ def run_benchmarks():
             """INSERT INTO reminders (contact_id, due_date, note)
                VALUES (777, '2026-08-20', 'orphan')"""
         )
+        doctor_fix_crm.conn.execute(
+            """INSERT INTO facts (entity, key, value, source)
+               VALUES ('contact:missing-fix', 'role', 'ghost', 'seed')"""
+        )
     try:
+        before_fix_report = doctor_fix_crm.doctor()
         fixed_report = doctor_fix_crm.doctor(fix=True)
         second_report = doctor_fix_crm.doctor()
         normalized_email = doctor_fix_crm.conn.execute(
@@ -3785,15 +3853,31 @@ def run_benchmarks():
             "SELECT archived, source FROM contacts WHERE id = 777"
         ).fetchone()
         check(
-            "hygiene_doctor_fix_then_clean",
-            fixed_report["clean"] and second_report["clean"]
+            "hygiene_doctor_fix_repairs_safe_subset_only",
+            before_fix_report["invalid_statuses"][0]["status"] == "impossible"
+            and before_fix_report["unresolved_facts"] == ["contact:missing-fix"]
+            and all(len(before_fix_report["orphans"][table]) == 1
+                    for table in ("activity", "deals", "reminders"))
+            and len(before_fix_report["bad_emails"]) == 1
+            and not fixed_report["clean"] and fixed_report["issue_count"] == 2
+            and fixed_report["invalid_statuses"]
+            == before_fix_report["invalid_statuses"]
+            and fixed_report["unresolved_facts"] == ["contact:missing-fix"]
+            and all(not fixed_report["orphans"][table]
+                    for table in ("activity", "deals", "reminders"))
+            and not fixed_report["bad_emails"]
+            and second_report["issue_count"] == 2
+            and second_report["invalid_statuses"]
+            == fixed_report["invalid_statuses"]
+            and second_report["unresolved_facts"]
+            == fixed_report["unresolved_facts"]
             and normalized_email == "fix@doctor.test"
             and recovered["archived"] == 1 and recovered["source"] == "doctor"
             and len(fixed_report["fixed"]["emails_normalized"]) == 1
             and len(fixed_report["fixed"]["orphan_contacts_created"]) == 1,
         )
     except (AttributeError, IndexError, KeyError, TypeError, sqlite3.Error):
-        check("hygiene_doctor_fix_then_clean", False)
+        check("hygiene_doctor_fix_repairs_safe_subset_only", False)
     doctor_fix_crm.close()
 
     # ── 53. Relationship Score (4 tests) ──
@@ -5148,7 +5232,7 @@ def run_benchmarks():
 
     experiment_crm.close()
 
-    # ── 78. Full Import/Export Round-Trip (16 tests) ──
+    # ── 78. Full Import/Export Round-Trip (18 tests) ──
 
     roundtrip_dir = tempfile.mkdtemp()
     roundtrip_source = CRM(os.path.join(roundtrip_dir, "source.db"))
@@ -5377,6 +5461,38 @@ def run_benchmarks():
         )
     except (AttributeError, TypeError, KeyError, ValueError):
         check("roundtrip_mcp_tools", False)
+
+    preserve_payload = json.loads(json.dumps(full_export))
+    for contact_row in preserve_payload["contacts"]:
+        if contact_row.get("email") == "alice@roundtrip.test":
+            contact_row.pop("notes")
+        elif contact_row.get("name") == "Exact Name Bob":
+            contact_row["notes"] = None
+    preserve_merge_crm = CRM(os.path.join(roundtrip_dir, "preserve-merge.db"))
+    preserve_merge_crm.add_contact(
+        "Local Alice", email="alice@roundtrip.test", notes="KEEP OMITTED"
+    )
+    preserve_merge_crm.add_contact(
+        "Exact Name Bob", notes="KEEP EXPLICIT NULL"
+    )
+    preserve_merge_result = preserve_merge_crm.import_full(
+        preserve_payload, merge=True
+    )
+
+    # 78q-r. missing and explicit-null import fields preserve populated local data
+    check(
+        "full_merge_preserves_omitted_local_field",
+        "error" not in preserve_merge_result
+        and preserve_merge_crm.get_contact("alice@roundtrip.test")["notes"]
+        == "KEEP OMITTED",
+    )
+    check(
+        "full_merge_preserves_explicit_null_local_field",
+        "error" not in preserve_merge_result
+        and preserve_merge_crm.get_contact("Exact Name Bob")["notes"]
+        == "KEEP EXPLICIT NULL",
+    )
+    preserve_merge_crm.close()
 
     # ── 79. Multi-hop introduction paths (11 tests) ──
     intro_dir = tempfile.mkdtemp()
