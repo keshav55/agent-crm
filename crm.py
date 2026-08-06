@@ -40,6 +40,20 @@ SCHEMA_VERSION = 1
 # Simple email regex: local@domain.tld — rejects obviously bogus values
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
+FREE_MAIL_DOMAINS = {
+    "aol.com",
+    "gmail.com",
+    "hotmail.com",
+    "icloud.com",
+    "live.com",
+    "me.com",
+    "msn.com",
+    "outlook.com",
+    "proton.me",
+    "protonmail.com",
+    "yahoo.com",
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2179,6 +2193,7 @@ class CRM:
         "historical_win_rate": 0.10,
     }
     FORECAST_LEARNING_MIN_OUTCOMES = 20
+    FORECAST_LEARNING_BLEND_OUTCOMES = 10
     FORECAST_LEARNING_ITERATIONS = 800
     FORECAST_LEARNING_RATE = 0.3
     FORECAST_LEARNING_SEED = 9
@@ -2504,18 +2519,31 @@ class CRM:
         source_score = ((source_wins + 1) / (source_sample + 2)
                         if source_sample else historical_score)
 
-        weights_source = "learned" if weight_model else "default"
-        weights = (weight_model["weights"] if weight_model
+        blend_alpha = 0.0
+        if weight_model:
+            outcome_count = weight_model.get(
+                "outcome_count",
+                self.FORECAST_LEARNING_MIN_OUTCOMES
+                + self.FORECAST_LEARNING_BLEND_OUTCOMES,
+            )
+            blend_alpha = min(max(
+                (outcome_count - self.FORECAST_LEARNING_MIN_OUTCOMES)
+                / self.FORECAST_LEARNING_BLEND_OUTCOMES,
+                0.0,
+            ), 1.0)
+        weights_source = "learned" if blend_alpha > 0 else "default"
+        weights = (weight_model["weights"] if blend_alpha > 0
                    else self.DEFAULT_FORECAST_WEIGHTS)
+        raw_signal_values = [
+            ("stage", status, stage_score),
+            ("activity_recency", days_since_activity, recency_score),
+            ("activity_frequency", recent_activity_count, frequency_score),
+            ("source", source, source_score),
+            ("historical_win_rate", round(historical_score, 4), historical_score),
+        ]
         signal_values = [
-            ("stage", status, weights["stage"], stage_score),
-            ("activity_recency", days_since_activity,
-             weights["activity_recency"], recency_score),
-            ("activity_frequency", recent_activity_count,
-             weights["activity_frequency"], frequency_score),
-            ("source", source, weights["source"], source_score),
-            ("historical_win_rate", round(historical_score, 4),
-             weights["historical_win_rate"], historical_score),
+            (name, value, weights[name], score)
+            for name, value, score in raw_signal_values
         ]
         signals = [{
             "name": name,
@@ -2523,20 +2551,32 @@ class CRM:
             "weight": weight,
             "effect": round(weight * score, 4),
         } for name, value, weight, score in signal_values]
-        linear_score = sum(weight * score for _, _, weight, score in signal_values)
+        default_probability = min(max(sum(
+            round(self.DEFAULT_FORECAST_WEIGHTS[name] * score, 4)
+            for name, _, score in raw_signal_values
+        ), 0.0), 1.0)
         if weight_model:
+            linear_score = sum(
+                weight_model["weights"][name] * score
+                for name, _, score in raw_signal_values
+            )
             logit = weight_model["intercept"] + linear_score
             if logit >= 0:
-                probability = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
+                learned_probability = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
             else:
                 exp_logit = math.exp(max(logit, -60.0))
-                probability = exp_logit / (1.0 + exp_logit)
+                learned_probability = exp_logit / (1.0 + exp_logit)
+            probability = (
+                default_probability * (1.0 - blend_alpha)
+                + learned_probability * blend_alpha
+            )
         else:
-            probability = min(max(sum(signal["effect"] for signal in signals), 0.0), 1.0)
+            probability = default_probability
         probability = round(probability, 4)
 
         return {
             "probability": probability,
+            "blend_alpha": round(blend_alpha, 4),
             "signals": signals,
             "contact": contact,
             "status": status,
@@ -2728,7 +2768,10 @@ class CRM:
 
     def calibration_report(self):
         """Score past forecasts against closed outcomes with Brier calibration."""
-        predictions = self._prediction_outcomes()
+        latest_by_contact = {}
+        for prediction in self._prediction_outcomes():
+            latest_by_contact[prediction["entity"]] = prediction
+        predictions = list(latest_by_contact.values())
         learned = self.learned_weights()
         stage_errors = {}
         reliability_groups = [list() for _ in range(10)]
@@ -2821,6 +2864,7 @@ class CRM:
                 "weighted_value": round(deal_value * scored["probability"], 2),
                 "signals": scored["signals"],
                 "weights_source": scored["weights_source"],
+                "blend_alpha": scored["blend_alpha"],
                 "contact": contact,
             })
 
@@ -2863,7 +2907,9 @@ class CRM:
             "weighted_pipeline": weighted_total,
             "closed_revenue": closed_revenue,
             "by_stage": by_stage,
-            "weights_source": "learned" if weight_model else "default",
+            "weights_source": (ranked[0]["weights_source"]
+                               if ranked else "default"),
+            "blend_alpha": (ranked[0]["blend_alpha"] if ranked else 0.0),
         }
 
     def find_duplicates(self):
@@ -3702,7 +3748,12 @@ class CRM:
                     reasons.append("exact email match")
                 if name_a and name_a == name_b:
                     if company_a and company_a == company_b:
-                        confidence = max(confidence, 0.88)
+                        emails_conflict = bool(
+                            email_a and email_b and email_a != email_b
+                        )
+                        confidence = max(
+                            confidence, 0.88 if emails_conflict else 0.90
+                        )
                         reasons.append("same normalized name + same company")
                     else:
                         confidence = max(confidence, 0.62)
@@ -6903,6 +6954,8 @@ class CRM:
                     add_edge(left, right, 0.60, "shared_company", group["label"] or company)
 
         for domain, group in sorted(domain_groups.items()):
+            if domain in FREE_MAIL_DOMAINS:
+                continue
             nodes = sorted(group, key=lambda node: (node_name(node).casefold(), node))
             for index, left in enumerate(nodes):
                 for right in nodes[index + 1:]:

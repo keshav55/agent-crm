@@ -3466,7 +3466,7 @@ def run_benchmarks():
 
     sm_crm.close()
 
-    # ── 52d. Autonomous Data Hygiene (16 tests) ──
+    # ── 52d. Autonomous Data Hygiene (18 tests) ──
 
     confidence_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-confidence.db"))
     confidence_crm.add_contact(
@@ -3776,6 +3776,51 @@ def run_benchmarks():
     except (AttributeError, KeyError, TypeError, sqlite3.Error):
         check("hygiene_auto_merge_threshold_respected", False)
     threshold_crm.close()
+
+    default_merge_crm = CRM(
+        os.path.join(tempfile.mkdtemp(), "hygiene-default-name-company.db")
+    )
+    default_merge_crm.add_contact(
+        "Default Dana", email="dana@default-merge.test", company="Default Co"
+    )
+    default_merge_crm.add_contact(
+        " default  dana ", company=" default co "
+    )
+    try:
+        default_name_company_merge = default_merge_crm.auto_merge(dry_run=False)
+        check(
+            "hygiene_auto_merge_name_company_missing_email_default",
+            default_name_company_merge["count"] == 1
+            and default_name_company_merge["merges"][0]["confidence"] == 0.9
+            and len(default_merge_crm.list_contacts()) == 1,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_name_company_missing_email_default", False)
+    default_merge_crm.close()
+
+    conflicting_email_merge_crm = CRM(
+        os.path.join(tempfile.mkdtemp(), "hygiene-conflicting-emails.db")
+    )
+    conflicting_email_merge_crm.add_contact(
+        "Conflict Casey", email="casey@first.test", company="Conflict Co"
+    )
+    conflicting_email_merge_crm.add_contact(
+        " conflict casey ", email="casey@second.test", company=" conflict co "
+    )
+    try:
+        conflicting_email_result = conflicting_email_merge_crm.auto_merge(
+            dry_run=False
+        )
+        conflicting_suggestion = conflicting_email_merge_crm.suggest_merges()[0]
+        check(
+            "hygiene_auto_merge_name_company_conflicting_emails_blocked",
+            conflicting_email_result["count"] == 0
+            and conflicting_suggestion["confidence"] == 0.88
+            and len(conflicting_email_merge_crm.list_contacts()) == 2,
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_name_company_conflicting_emails_blocked", False)
+    conflicting_email_merge_crm.close()
 
     doctor_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-doctor.db"))
     doctor_contact_id = doctor_crm.add_contact(
@@ -4753,7 +4798,7 @@ def run_benchmarks():
         probability = prob_crm.deal_probability("early@prob.com")
         check("deal_probability_keys", isinstance(probability, dict) and
               set(probability) == {"probability", "signals", "contact", "status",
-                                   "weights_source"})
+                                   "weights_source", "blend_alpha"})
     except (AttributeError, TypeError):
         check("deal_probability_keys", False)
 
@@ -5494,7 +5539,7 @@ def run_benchmarks():
     )
     preserve_merge_crm.close()
 
-    # ── 79. Multi-hop introduction paths (11 tests) ──
+    # ── 79. Multi-hop introduction paths (13 tests) ──
     intro_dir = tempfile.mkdtemp()
     intro_db = os.path.join(intro_dir, "intro-paths.db")
     intro_crm = CRM(intro_db)
@@ -5616,6 +5661,37 @@ def run_benchmarks():
         "intro_paths_explanations",
         bool(rank_paths) and all(isinstance(path["explanation"], str)
                                  and path["explanation"].strip() for path in rank_paths),
+    )
+
+    for name, email in (
+        ("Gmail Anchor", "gmail.anchor@gmail.com"),
+        ("Gmail Bridge", "gmail.bridge@gmail.com"),
+        ("Gmail Target", "gmail.target@gmail.com"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Gmail Anchor")
+    check(
+        "intro_paths_free_mail_domain_creates_no_path",
+        intro_crm.intro_paths("Gmail Target", max_hops=2) == [],
+    )
+
+    for name, email in (
+        ("Corporate Anchor", "anchor@connected-corp.example"),
+        ("Corporate Bridge", "bridge@connected-corp.example"),
+        ("Corporate Target", "target@connected-corp.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Corporate Anchor")
+    corporate_domain_paths = intro_crm.intro_paths(
+        "Corporate Target", max_hops=2
+    )
+    check(
+        "intro_paths_corporate_shared_domain_still_connects",
+        any(
+            path["path"]
+            == ["Corporate Anchor", "Corporate Bridge", "Corporate Target"]
+            for path in corporate_domain_paths
+        ),
     )
 
     try:
@@ -6199,7 +6275,7 @@ def run_benchmarks():
     )
     property_crm.close()
 
-    # ── 84. Forecast Calibration & Learned Weights (14 tests) ──
+    # ── 84. Forecast Calibration & Learned Weights (20 tests) ──
 
     prediction_crm = CRM(os.path.join(tempfile.mkdtemp(), "prediction-facts.db"))
     prediction_crm.add_contact(
@@ -6271,14 +6347,15 @@ def run_benchmarks():
 
     calibration_crm = CRM(os.path.join(tempfile.mkdtemp(), "calibration.db"))
 
-    def seed_closed_prediction(crm, index, probability, outcome, stage, scores):
+    def seed_closed_prediction(
+            crm, index, probability, outcome, stage, scores,
+            prior_probabilities=()):
         email = f"closed-{index}@calibration.test"
         crm.add_contact(
             f"Closed Calibration {index}", email=email, status="prospect",
             source="fixture",
         )
         entity = f"prediction:{email}"
-        observed_at = f"2026-01-{1 + index:02d} 12:00:00.000000"
         snapshot = {
             name: {
                 "value": stage if name == "stage" else scores[name],
@@ -6286,54 +6363,83 @@ def run_benchmarks():
             }
             for name in CRM.FORECAST_SIGNAL_NAMES
         }
+        prediction_rows = []
+        for rewrite_index, recorded_probability in enumerate(prior_probabilities):
+            observed_at = (
+                f"2026-01-{1 + index:02d} "
+                f"12:00:00.{rewrite_index:06d}"
+            )
+            prediction_rows.append(
+                (entity, "probability", str(recorded_probability), observed_at),
+            )
+        observed_at = (
+            f"2026-01-{1 + index:02d} "
+            f"12:00:00.{len(prior_probabilities):06d}"
+        )
+        prediction_rows.extend((
+            (entity, "probability", str(probability), observed_at),
+            (entity, "status", stage, observed_at),
+            (entity, "signals_snapshot", json.dumps(snapshot, sort_keys=True),
+             observed_at),
+        ))
         with crm.conn:
             crm.conn.executemany(
                 """INSERT INTO facts (entity, key, value, source, observed_at)
                    VALUES (?, ?, ?, 'forecast', ?)""",
-                (
-                    (entity, "probability", str(probability), observed_at),
-                    (entity, "status", stage, observed_at),
-                    (entity, "signals_snapshot", json.dumps(snapshot, sort_keys=True),
-                     observed_at),
-                ),
+                prediction_rows,
             )
         crm.update_contact(email, status=outcome)
 
     low_scores = {name: 0.1 for name in CRM.FORECAST_SIGNAL_NAMES}
     high_scores = {name: 0.9 for name in CRM.FORECAST_SIGNAL_NAMES}
     seed_closed_prediction(
-        calibration_crm, 0, 0.25, "active_customer", "prospect", low_scores
+        calibration_crm, 0, 0.6, "active_customer", "prospect", low_scores,
+        prior_probabilities=(0.1, 0.4),
     )
     seed_closed_prediction(
         calibration_crm, 1, 0.75, "lost", "proposal_drafted", high_scores
     )
     calibration = calibration_crm.calibration_report()
 
-    # 84f. ((.25 - 1)^2 + (.75 - 0)^2) / 2 = .5625 exactly.
+    # 84f-g. Three rewrites for one contact count once at the final value.
+    check(
+        "calibration_latest_prediction_per_contact",
+        calibration["scored_predictions"] == 2
+        and calibration["by_stage"]["prospect"]["count"] == 1,
+    )
+    check(
+        "calibration_latest_prediction_probability",
+        calibration["reliability"][1]["count"] == 0
+        and calibration["reliability"][4]["count"] == 0
+        and calibration["reliability"][6]["count"] == 1
+        and calibration["reliability"][6]["mean_prediction"] == 0.6,
+    )
+
+    # 84h. ((.6 - 1)^2 + (.75 - 0)^2) / 2 = .36125 exactly.
     check(
         "calibration_brier_exact",
         calibration["scored_predictions"] == 2
-        and calibration["brier_score"] == 0.5625,
+        and calibration["brier_score"] == 0.36125,
     )
 
-    # 84g. Brier errors are also grouped by the recorded prediction stage.
+    # 84i. Brier errors are also grouped by the recorded prediction stage.
     check(
         "calibration_stage_buckets",
         calibration["by_stage"]["prospect"]
-        == {"count": 1, "brier_score": 0.5625}
+        == {"count": 1, "brier_score": 0.16}
         and calibration["by_stage"]["proposal_drafted"]
         == {"count": 1, "brier_score": 0.5625},
     )
 
-    # 84h. Reliability deciles expose observed win rates for occupied buckets.
+    # 84j. Reliability deciles expose observed win rates for occupied buckets.
     check(
         "calibration_reliability_buckets",
-        calibration["reliability"][2]["predicted_decile"] == "20-30%"
-        and calibration["reliability"][2]["actual_win_rate"] == 1.0
+        calibration["reliability"][6]["predicted_decile"] == "60-70%"
+        and calibration["reliability"][6]["actual_win_rate"] == 1.0
         and calibration["reliability"][7]["actual_win_rate"] == 0.0,
     )
 
-    # 84i. Two closed outcomes are below the 20-outcome learning threshold.
+    # 84k. Two closed outcomes are below the 20-outcome learning threshold.
     check("learned_weights_minimum", calibration_crm.learned_weights() is None)
     calibration_crm.close()
 
@@ -6356,7 +6462,7 @@ def run_benchmarks():
 
     first_fit = learned_crm.learned_weights()
     second_fit = learned_crm.learned_weights()
-    # 84j. Fixed initialization and iterations make repeated fits identical.
+    # 84l. Fixed initialization and iterations make repeated fits identical.
     check(
         "learned_weights_deterministic",
         first_fit == second_fit and first_fit["outcome_count"] == 20,
@@ -6378,30 +6484,119 @@ def run_benchmarks():
             (winning_id, f"-{days} days"),
         )
     learned_crm.conn.commit()
+
+    gate_history = learned_crm.win_loss_analysis()
+    gate_contact = learned_crm.get_contact("winning@calibration.test")
+    gate_default = learned_crm._deal_probability_for_contact(
+        gate_contact, gate_history, weight_model=None
+    )
+    gate_prediction = learned_crm.deal_probability("winning@calibration.test")
+    gate_losing_prediction = learned_crm.deal_probability(
+        "losing@calibration.test"
+    )
+    check(
+        "deal_probability_blend_gate_is_default",
+        gate_prediction["blend_alpha"] == 0.0
+        and gate_prediction["weights_source"] == "default"
+        and gate_losing_prediction["weights_source"] == "default"
+        and gate_prediction["probability"] == gate_default["probability"],
+    )
+
+    for index in range(20, 25):
+        won = index % 2 == 0
+        seed_closed_prediction(
+            learned_crm,
+            index,
+            0.85 if won else 0.15,
+            "active_customer" if won else "lost",
+            "verbal_yes" if won else "prospect",
+            high_scores if won else low_scores,
+        )
+        learned_crm.update_contact(
+            f"closed-{index}@calibration.test",
+            source="winning-source" if won else "losing-source",
+        )
+
+    midpoint_history = learned_crm.win_loss_analysis()
+    midpoint_contact = learned_crm.get_contact("winning@calibration.test")
+    midpoint_model = learned_crm.learned_weights()
+    midpoint_default = learned_crm._deal_probability_for_contact(
+        midpoint_contact, midpoint_history, weight_model=None
+    )
+    midpoint_pure_model = dict(midpoint_model)
+    midpoint_pure_model["outcome_count"] = 30
+    midpoint_learned = learned_crm._deal_probability_for_contact(
+        midpoint_contact, midpoint_history, weight_model=midpoint_pure_model
+    )
+    midpoint_prediction = learned_crm.deal_probability(
+        "winning@calibration.test"
+    )
+    midpoint_expected = round(
+        (midpoint_default["probability"] + midpoint_learned["probability"]) / 2,
+        4,
+    )
+    check(
+        "deal_probability_midpoint_blends",
+        midpoint_prediction["blend_alpha"] == 0.5
+        and abs(midpoint_prediction["probability"] - midpoint_expected) <= 0.0001,
+    )
+    check(
+        "deal_probability_blend_reports_learned_source",
+        midpoint_prediction["blend_alpha"] > 0
+        and midpoint_prediction["weights_source"] == "learned",
+    )
+
+    for index in range(25, 30):
+        won = index % 2 == 0
+        seed_closed_prediction(
+            learned_crm,
+            index,
+            0.85 if won else 0.15,
+            "active_customer" if won else "lost",
+            "verbal_yes" if won else "prospect",
+            high_scores if won else low_scores,
+        )
+        learned_crm.update_contact(
+            f"closed-{index}@calibration.test",
+            source="winning-source" if won else "losing-source",
+        )
+
+    full_history = learned_crm.win_loss_analysis()
+    full_model = learned_crm.learned_weights()
+    full_contact = learned_crm.get_contact("winning@calibration.test")
+    pure_learned_prediction = learned_crm._deal_probability_for_contact(
+        full_contact, full_history, weight_model=full_model
+    )
     winning_prediction = learned_crm.deal_probability("winning@calibration.test")
     losing_prediction = learned_crm.deal_probability("losing@calibration.test")
+    check(
+        "deal_probability_full_blend_is_pure_learned",
+        winning_prediction["blend_alpha"] == 1.0
+        and winning_prediction["probability"]
+        == pure_learned_prediction["probability"],
+    )
 
-    # 84k. Once the threshold is met, public scoring identifies learned mode.
+    # 84m. Once blending is complete, public scoring identifies learned mode.
     check(
         "deal_probability_learned_mode",
         winning_prediction["weights_source"] == "learned"
         and losing_prediction["weights_source"] == "learned",
     )
 
-    # 84l. A separable history ranks the clearly winning profile higher.
+    # 84n. A separable history ranks the clearly winning profile higher.
     check(
         "learned_weights_rank_profiles",
         winning_prediction["probability"] > losing_prediction["probability"],
     )
 
-    # 84m. Logistic scoring remains a valid probability in learned mode.
+    # 84o. Logistic scoring remains a valid probability in learned mode.
     check(
         "learned_probability_range",
         all(0.0 <= prediction["probability"] <= 1.0
             for prediction in (winning_prediction, losing_prediction)),
     )
 
-    # 84n. MCP registers and serves the same calibration report.
+    # 84p. MCP registers and serves the same calibration report.
     try:
         import mcp_server
         original_mcp_db = mcp_server.DB_PATH
