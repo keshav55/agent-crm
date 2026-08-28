@@ -2,6 +2,8 @@
 
 Agent first CRM that self improves. One Python file, SQLite, zero dependencies.
 
+This repo is the reusable open-source CRM engine. Product/company-specific CRM instances should live in their own repos or databases.
+
 It can process data from your Mac and other external CRM APIs.
 
 ```bash

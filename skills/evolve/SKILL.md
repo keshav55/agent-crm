@@ -41,11 +41,26 @@ The `evolve.py` script and `strategy.md` file in the agent-crm project root prov
 
 ### Step 1: Read the CRM state
 
-Pull the three data sources that tell you what's happening.
+Start with experiment history. The loop's own track record is the first input
+to every new proposal: do not repeat a loss unchanged or start a duplicate of a
+running experiment.
 
 ```python
 from crm import CRM
 crm = CRM("crm.db")
+
+# Experiment history and track record — always read these first
+past_experiments = crm.experiment_history()
+wins = [experiment for experiment in past_experiments if experiment["verdict"] == "win"]
+losses = [experiment for experiment in past_experiments if experiment["verdict"] == "loss"]
+running = [experiment for experiment in past_experiments if experiment["status"] == "running"]
+decided = len(wins) + len(losses)
+experiment_track_record = {
+    "wins": wins,
+    "losses": losses,
+    "running": running,
+    "win_rate": round(len(wins) / decided * 100, 1) if decided else 0.0,
+}
 
 # Pipeline overview
 pipeline = crm.pipeline()
@@ -61,8 +76,7 @@ contacts = crm.list_contacts()
 # Stale contacts — relationships that are fading
 stale = crm.stale_contacts(days=14)
 
-# Facts graph — experiment history and observed patterns
-past_experiments = crm.search_graph("experiment")
+# Facts graph — other observed patterns
 past_learnings = crm.search_graph("learning")
 ```
 
@@ -135,15 +149,13 @@ BATCH SIZE: [how many contacts to test on — usually 5-10]
 Use the facts table to track experiments across sessions. This is the persistent memory.
 
 ```python
-import datetime
-batch_id = f"experiment:{datetime.date.today().isoformat()}_{short_name}"
-
-# Record the hypothesis
-crm.observe(batch_id, "hypothesis", "Tuesday emails get 2x replies vs Thursday", source="evolve")
-crm.observe(batch_id, "change_type", "timing", source="evolve")
-crm.observe(batch_id, "batch_size", "8", source="evolve")
-crm.observe(batch_id, "status", "active", source="evolve")
-crm.observe(batch_id, "started_at", datetime.date.today().isoformat(), source="evolve")
+slug = crm.log_experiment(
+    "Tuesday timing",
+    "Tuesday emails get 2x replies vs Thursday",
+    "reply rate",
+    "12.5",
+)
+batch_id = f"experiment:{slug}"
 
 # Tag each contact in the batch
 for contact_email in batch_contacts:
@@ -160,12 +172,11 @@ python evolve.py record --batch N --sent 8 --replies 0 --meetings 0 --notes "tim
 After enough time has passed (typically 3-7 days for email), record what happened:
 
 ```python
-# Update the experiment with results
-crm.observe(batch_id, "result", "3/8 replied (37.5%), baseline was 12.5%", source="evolve")
-crm.observe(batch_id, "status", "completed", source="evolve")
-crm.observe(batch_id, "conclusion", "keep — Tuesday timing works", source="evolve")
+# Numeric results derive win/loss/neutral from the stored baseline
+experiment = crm.conclude_experiment(slug, "37.5")
 
 # If the experiment won, record a learning
+import datetime
 crm.observe("learning:timing", "insight", "Tuesday 9-11am gets 3x reply rate vs Thursday", source="evolve")
 crm.observe("learning:timing", "confidence", "1 batch, needs replication", source="evolve")
 crm.observe("learning:timing", "discovered_at", datetime.date.today().isoformat(), source="evolve")
@@ -173,8 +184,13 @@ crm.observe("learning:timing", "discovered_at", datetime.date.today().isoformat(
 
 If the experiment lost:
 ```python
-crm.observe(batch_id, "conclusion", "revert — no improvement", source="evolve")
+experiment = crm.conclude_experiment(slug, "10")  # verdict derives to "loss"
 crm.observe("learning:timing", "insight", "Thursday is not worse than Tuesday — keep default", source="evolve")
+```
+
+For non-numeric metrics, pass an explicit verdict:
+```python
+crm.conclude_experiment(slug, "Customers preferred version B", verdict="win")
 ```
 
 ### Step 6: Update strategy.md with learnings
@@ -189,9 +205,9 @@ To see all past experiments and learnings stored in the facts table:
 
 ```python
 # All experiments
-experiments = crm.search_graph("experiment:")
+experiments = crm.experiment_history()
 for e in experiments:
-    print(f"{e['entity']} | {e['key']}: {e['value']}")
+    print(f"{e['slug']} | {e['status']} | {e['verdict'] or '-'}")
 
 # All learnings
 learnings = crm.search_graph("learning:")
@@ -199,13 +215,15 @@ for l in learnings:
     print(f"{l['entity']} | {l['key']}: {l['value']}")
 
 # Specific experiment details
-details = crm.search_graph("experiment:2026-03-17_tuesday_timing")
+details = crm.facts_about("experiment:tuesday-timing")
 ```
 
 Or via the CLI:
 ```bash
-python evolve.py history
-python evolve.py status
+python crm.py experiments
+python crm.py experiments --status running
+python crm.py experiment log "Tuesday timing" "Tuesday doubles replies" "reply rate" 12.5
+python crm.py experiment conclude tuesday-timing 37.5
 ```
 
 ---
@@ -269,9 +287,9 @@ User says: "/evolve"
    MEASURE: Reply rate > 25% on next 8 cold emails
    BATCH SIZE: 8
    ```
-4. Record: `crm.observe("experiment:2026-03-17_personalized_pain", "hypothesis", "...", source="evolve")`
+4. Record: `slug = crm.log_experiment("personalized pain", "...", "reply rate", 12.5)`
 5. Execute the batch, wait 5 days
-6. Record: 3/8 replied (37.5%). Push learning to Atris.
+6. Record: `crm.conclude_experiment(slug, 37.5)`. Push the winning learning to Atris.
 7. Update strategy.md: move "specific pain point reference" from experiment to proven.
 
 ---
@@ -279,10 +297,12 @@ User says: "/evolve"
 ## Troubleshooting
 
 ### No experiment history found
-The facts table may be empty. Run `crm.search_graph("experiment")` to check. If empty, this is the first cycle — skip the "review past experiments" substep and focus on establishing a baseline.
+The facts table may be empty. Run `crm.experiment_history()` to check. If empty, this is the first cycle — focus on establishing a baseline.
 
 ### Not enough data to analyze
 If the CRM has fewer than 10 contacts or fewer than 5 activity entries, the analysis step won't yield meaningful patterns. In this case, propose a baseline measurement experiment: send 10 outreach messages using the current strategy and record reply rates.
 
 ### Experiment results are ambiguous
-If the difference between experiment and baseline is less than 2x, the batch was probably too small. Record as "inconclusive" and either increase batch size or try a different variable. Don't declare a winner on thin data.
+If a batch is too small to support a win or loss, conclude it with an explicit
+`neutral` verdict, then increase the batch size or try a different variable.
+Don't declare a winner on thin data.
