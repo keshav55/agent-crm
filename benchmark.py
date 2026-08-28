@@ -670,7 +670,6 @@ def run_mcp_tool_sweep():
 
 
 def run_benchmarks():
-    global PASS, FAIL
 
     # ── 1. Basic CRUD (10 tests) ──
     crm = CRM(TEST_DB)
@@ -2249,8 +2248,6 @@ def run_benchmarks():
     # must be tz-aware too, otherwise the comparison raises TypeError and every
     # message is silently skipped.
     try:
-        import mailbox as _mb
-        import email.utils as _eu
         mbox_tz_dir = tempfile.mkdtemp()
         mbox_tz_path = os.path.join(mbox_tz_dir, "tz_test.mbox")
         # Write a minimal mbox with a timezone-aware Date header (recent)

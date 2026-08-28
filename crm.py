@@ -335,7 +335,6 @@ class CRM:
         contact = self.get_contact(email)
         if not contact:
             return False
-        name = contact["name"]
         self.conn.execute("DELETE FROM activity WHERE contact_id = ?", (contact["id"],))
         self.conn.execute("DELETE FROM deals WHERE contact_id = ?", (contact["id"],))
         self.conn.execute("DELETE FROM contacts WHERE id = ?", (contact["id"],))
@@ -2406,7 +2405,6 @@ class CRM:
     def conversion_funnel(self):
         """Pipeline conversion funnel — count, avg days, and conversion rate per stage."""
         funnel = {}
-        today_str = date.today().isoformat()
 
         # Count lost/churned contacts once — they entered the pipeline but
         # dropped out.  Without stage-transition history we attribute them to
@@ -3558,7 +3556,6 @@ class CRM:
         """Contacts with ZERO activity (not just stale last_contacted). Truly forgotten."""
         contacts = self.list_contacts()
         untouched = []
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
         for c in contacts:
             if c.get("status") in ("lost", "churned"):
                 continue
@@ -4844,7 +4841,6 @@ class CRM:
         wl = self.win_loss_analysis()
         hc = self.health_check()
         eff = self.outreach_effectiveness()
-        attr = self.source_attribution()
         stale = self.stale_contacts()
         cadence = {
             row["status"]: {
@@ -7700,7 +7696,6 @@ class CRM:
 
                 # Store unmapped columns as facts
                 entity = f"contact:{name.lower()}"
-                mapped_vals = set(mapping.values())
                 for h, v in row.items():
                     h_lower = h.strip().lower()
                     if h_lower not in mapping and v and v.strip():
@@ -8007,7 +8002,6 @@ class CRM:
         now = datetime.now()
         current_start = (now - timedelta(days=window_days)).strftime("%Y-%m-%d %H:%M:%S")
         prev_start = (now - timedelta(days=window_days * 2)).strftime("%Y-%m-%d %H:%M:%S")
-        current_end = now.strftime("%Y-%m-%d %H:%M:%S")
 
         # Count activities in each period (activity table)
         current_count = self.conn.execute(
@@ -8671,7 +8665,7 @@ def main():
     p_unarchive = sub.add_parser("unarchive", help="Restore an archived contact")
     p_unarchive.add_argument("identifier")
 
-    p_archived = sub.add_parser("archived", help="List archived contacts")
+    sub.add_parser("archived", help="List archived contacts")
 
     p_export_deals = sub.add_parser("export-deals", help="Export deals as CSV")
     p_export_deals.add_argument("--output", "-o", help="Output file path")
