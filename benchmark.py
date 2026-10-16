@@ -669,6 +669,214 @@ def run_mcp_tool_sweep():
         mcp_server.DB_PATH = original_db_path
 
 
+def run_status_fit_benchmarks():
+    """Canonical statuses, proof-based statuses, fit rules, forecast log."""
+    from datetime import date as _date
+    import crm as crm_module
+
+    work = tempfile.mkdtemp()
+
+    # ── 91. One canonical status list ──
+    ids = [row["id"] for row in CRM.statuses()]
+    check("statuses_canonical_order", ids == [
+        "prospect", "drafted", "sent", "replied", "silent", "met",
+        "proposal", "paying", "left", "lost", "partner", "hold"])
+    check("statuses_labels", dict((r["id"], r["label"]) for r in CRM.statuses())["hold"] == "On hold")
+    aliases = {"contacted": "sent", "emailed": "sent", "bounced": "lost",
+               "usage_customer": "paying", "active_customer": "paying",
+               "graduated": "left", "churned": "left", "strategic_partner": "partner",
+               "verbal_yes": "proposal", "proposal_drafted": "proposal"}
+    check("statuses_aliases_map", all(crm_module.canonical_status(a) == t for a, t in aliases.items()))
+    check("statuses_unknown_passthrough", crm_module.canonical_status("Qualified") == "qualified")
+    out = subprocess.run([sys.executable, "crm.py", "--db", os.path.join(work, "cli.db"),
+                          "statuses", "--json"], capture_output=True, text=True)
+    try:
+        check("statuses_cli_json", json.loads(out.stdout)[0] == {"id": "prospect", "label": "Prospect"})
+    except ValueError:
+        check("statuses_cli_json", False)
+
+    mig = CRM(os.path.join(work, "mig.db"))
+    mig.add_contact("Legacy Lee", email="lee@mig.test", status="active_customer", deal_size="$200/mo")
+    mig.add_contact("Bounce Bo", email="bo@mig.test", status="bounced", tags="wave1")
+    mig.add_contact("Sent Sue", email="sue@mig.test", status="emailed")
+    check("statuses_open_db_keeps_legacy",
+          mig.get_contact("lee@mig.test")["status"] == "active_customer")
+    check("statuses_alias_aware_filter",
+          [c["name"] for c in mig.list_contacts(status="paying")] == ["Legacy Lee"])
+    dry = mig.migrate_statuses()
+    check("migrate_statuses_dry_run_writes_nothing",
+          len(dry["changes"]) == 3 and mig.get_contact("bo@mig.test")["status"] == "bounced")
+    before_updated = mig.get_contact("lee@mig.test")["updated_at"]
+    applied = mig.migrate_statuses(apply=True)
+    bo = mig.get_contact("bo@mig.test")
+    check("migrate_statuses_apply",
+          applied["applied"] and bo["status"] == "lost" and "bounced" in bo["tags"].split(",")
+          and mig.get_contact("lee@mig.test")["status"] == "paying")
+    check("migrate_statuses_keeps_updated_at",
+          mig.get_contact("lee@mig.test")["updated_at"] == before_updated)
+    check("migrate_statuses_idempotent", mig.migrate_statuses(apply=True)["changes"] == [])
+    check("migrate_statuses_sets_vocabulary", mig.uses_canonical_statuses())
+    mig.add_contact("New Customer", email="new@mig.test", status="usage_customer")
+    mig.update_contact("sue@mig.test", status="churned")
+    check("canonical_db_aliases_input",
+          mig.get_contact("new@mig.test")["status"] == "paying"
+          and mig.get_contact("sue@mig.test")["status"] == "left")
+    try:
+        mig.update_contact("sue@mig.test", status="qualified")
+        check("canonical_db_rejects_unknown", False)
+    except ValueError:
+        check("canonical_db_rejects_unknown", mig.get_contact("sue@mig.test")["status"] == "left")
+    undo = mig.undo_status_migration(applied["changes"])
+    check("migrate_statuses_undo_keeps_later_changes",
+          mig.get_contact("bo@mig.test")["status"] == "bounced"
+          and mig.get_contact("sue@mig.test")["status"] == "left"
+          and undo["vocabulary"] == "open")
+    mig.close()
+
+    logic = CRM(os.path.join(work, "logic.db"))
+    logic.add_contact("Win Usage", email="u@logic.test", status="usage_customer", deal_size="$1K/mo")
+    logic.add_contact("Lost Churn", email="c@logic.test", status="churned")
+    logic.add_contact("Open One", email="o@logic.test", status="contacted", deal_size="$5K/mo")
+    logic.add_contact("Open Two", email="t@logic.test", status="emailed")
+    logic.add_contact("Partner Pat", email="p@logic.test", status="partner")
+    logic.add_contact("Hold Hal", email="h@logic.test", status="hold", deal_size="$9K/mo")
+    pipe = {row["status"]: row["count"] for row in logic.pipeline()}
+    check("pipeline_groups_by_canonical", pipe.get("sent") == 2 and "contacted" not in pipe)
+    check("funnel_uses_canonical_stages", list(logic.conversion_funnel()) == list(crm_module.STATUS_FUNNEL))
+    wl = logic.win_loss_analysis()
+    check("win_loss_reads_aliases",
+          [w["name"] for w in wl["wins"]] == ["Win Usage"]
+          and [l["name"] for l in wl["losses"]] == ["Lost Churn"])
+    fc_names = {row["name"] for row in logic.forecast()["contacts"]}
+    check("forecast_excludes_closed_statuses",
+          fc_names == {"Open One", "Open Two"})
+    na = {a["contact"] for a in logic.next_actions(limit=50)}
+    check("next_actions_skip_partner_hold_left",
+          not ({"Partner Pat", "Hold Hal", "Lost Churn"} & na))
+    logic.log_activity("t@logic.test", "email_replied", "Re: hi")
+    check("suggest_status_open_vocabulary",
+          logic.suggest_status("t@logic.test")["suggested"] in ("contacted", "emailed"))
+    logic.close()
+
+    # ── 92. Upstreamed from atris-crm: phone, investors, next-action rules ──
+    up = CRM(os.path.join(work, "up.db"))
+    up.add_contact("Phone Pia", phone="+15551234567", status="prospect")
+    check("phone_lookup", (up.get_contact("+15551234567") or {}).get("name") == "Phone Pia")
+    up.update_contact("+15551234567", company="PiaCo")
+    check("phone_update_by_phone", up.get_contact("Phone Pia")["company"] == "PiaCo")
+    up.update_contact("Phone Pia", investor_type="angel", check_size_min=25000, check_size_max=50000)
+    fp = up.fundraise_pipeline()
+    check("fundraise_pipeline", fp["total_investors"] == 1 and fp["total_potential_check"] == 50000)
+    up.add_contact("Big Stale", email="big@up.test", status="contacted")
+    up.add_contact("Bounced Bea", email="bea@up.test", status="bounced")
+    up.add_contact("Fresh Lab", email="lab@up.test", status="prospect")
+    big_id = up.get_contact("big@up.test")["id"]
+    lab_id = up.get_contact("lab@up.test")["id"]
+    up.conn.execute("UPDATE contacts SET last_contacted = '2026-01-01' WHERE id = ?", (big_id,))
+    up.conn.executemany("INSERT INTO deals (contact_id, name, value, stage) VALUES (?,?,?,?)",
+                        [(big_id, "pilot", "20000", "prospect"), (lab_id, "pilot", "20000", "prospect")])
+    up.conn.commit()
+    acts = {a["contact"]: a for a in up.next_actions(limit=50)}
+    check("next_actions_open_deal_value", acts.get("Big Stale", {}).get("deal_value") == 20000)
+    check("next_actions_high_value_stale_is_high",
+          acts.get("Big Stale", {}).get("priority") == "high"
+          and acts["Big Stale"]["reason"].startswith("High-value contact gone stale"))
+    check("next_actions_bounced_find_address",
+          acts.get("Bounced Bea", {}).get("action") == "Find a working address"
+          and acts["Bounced Bea"]["priority"] == "low")
+    check("next_actions_untouched_big_deal_medium",
+          acts.get("Fresh Lab", {}).get("action") == "Initial outreach"
+          and acts["Fresh Lab"]["priority"] == "medium")
+    up.close()
+
+    # ── 93. Proof-based statuses: silent and quiet ──
+    pr = CRM(os.path.join(work, "proof.db"))
+    pr.migrate_statuses(apply=True)
+    today = _date(2026, 10, 16)
+    for name, email, status in (("Old Send", "old@p.test", "sent"), ("New Send", "new@p.test", "sent"),
+                                ("Replied Late", "rl@p.test", "sent"), ("No Date", "nd@p.test", "sent"),
+                                ("Payer Quiet", "pq@p.test", "paying"), ("Payer Busy", "pb@p.test", "paying"),
+                                ("Payer Never", "pn@p.test", "paying")):
+        pr.add_contact(name, email=email, status=status, deal_size="$200/mo")
+    ids_ = {c["email"]: c["id"] for c in pr.list_contacts()}
+    rows = [(ids_["old@p.test"], "email_sent", "s", "2026-10-01 09:00:00"),
+            (ids_["new@p.test"], "email_sent", "s", "2026-10-14 09:00:00"),
+            (ids_["rl@p.test"], "email_sent", "s", "2026-10-01 09:00:00"),
+            (ids_["rl@p.test"], "email_replied", "r", "2026-10-12 09:00:00"),
+            (ids_["pq@p.test"], "email", "x", "2026-09-20 09:00:00"),
+            (ids_["pq@p.test"], "note", "internal", "2026-10-15 09:00:00"),
+            (ids_["pb@p.test"], "call", "x", "2026-10-13 09:00:00")]
+    pr.conn.executemany("INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?,?,?,?)", rows)
+    pr.conn.commit()
+    dry = pr.mark_silent(days=7, today=today)
+    check("mark_silent_dry_run", [e["name"] for e in dry["silent"]] == ["Old Send"]
+          and pr.get_contact("old@p.test")["status"] == "sent")
+    check("mark_silent_reply_and_window",
+          dry["still_waiting"] == 1 and dry["no_send_date"] == ["No Date"])
+    pr.mark_silent(days=7, apply=True, today=today)
+    check("mark_silent_apply", pr.get_contact("old@p.test")["status"] == "silent")
+    check("mark_silent_idempotent", pr.mark_silent(days=7, apply=True, today=today)["silent"] == [])
+    quiet = [q["name"] for q in pr.quiet_customers(days=10, today=today)]
+    check("quiet_customers", quiet == ["Payer Never", "Payer Quiet"])
+
+    # ── 94. Fit rules, forecast log, grade ──
+    rules = {
+        "criteria": [
+            {"id": "finance", "weight": 40, "reason": "Finance signer",
+             "match": {"field": "title", "any": ["finance", "cfo"]}},
+            {"id": "freight", "weight": 40, "reason": "Freight",
+             "match": {"any_of": [{"field": "company", "any": ["freight"]},
+                                  {"field": "tags", "equals": ["logistics"]}]}},
+            {"id": "big", "weight": 20, "reason": "Big ticket", "match": {"monthly_value_min": 1000}},
+            {"id": "no_email", "weight": -20, "reason": "No email", "match": {"field": "email", "missing": True}},
+        ],
+        "expected_value": {"default_monthly": 20},
+    }
+    rules_path = os.path.join(work, "fit.json")
+    with open(rules_path, "w") as f:
+        json.dump(rules, f)
+    fitdb = CRM(os.path.join(work, "fit.db"))
+    fitdb.add_contact("Fran Finance", email="f@freight.test", company="FastFreight", title="Head of Finance",
+                      deal_size="$5K/mo")
+    fitdb.add_contact("Tia Tail", email="t@tail.test", company="Tail Co", title="Engineer")
+    fitdb.add_contact("Nora NoEmail", company="Box Freight", title="CFO", tags="logistics")
+    fitdb.add_contact("Paid Pete", email="p@paid.test", company="Freight Paid", title="CFO",
+                      status="active_customer", deal_size="$5K/mo")
+    ranked = fitdb.fit(rules_path)
+    check("fit_ranks_by_expected_value", [r["name"] for r in ranked][:1] == ["Fran Finance"]
+          and ranked[0]["fit_score"] == 100 and ranked[0]["expected_value"] == 5000)
+    check("fit_excludes_closed", "Paid Pete" not in {r["name"] for r in ranked})
+    nora = next(r for r in ranked if r["name"] == "Nora NoEmail")
+    check("fit_reasons_and_negative_weights",
+          nora["fit_score"] == 60 and {x["id"] for x in nora["reasons"]} == {"finance", "freight", "no_email"})
+    check("fit_default_value", nora["value_source"] == "default" and nora["monthly_value"] == 20)
+    check("fit_default_rules_path", fitdb._default_fit_path() == rules_path)
+    first = fitdb.forecast_log(rules_path, today=_date(2026, 10, 16))
+    again = fitdb.forecast_log(rules_path, today=_date(2026, 10, 16))
+    check("forecast_log_once_per_day", first["logged"] == 3 and again["logged"] == 0)
+    fitdb.update_contact("f@freight.test", status="replied")
+    fitdb.update_contact("t@tail.test", status="lost")
+    fitdb.forecast_log(rules_path, today=_date(2026, 10, 17))
+    outcomes = dict(fitdb.conn.execute(
+        "SELECT c.name, f.outcome FROM forecasts f JOIN contacts c ON c.id = f.contact_id "
+        "WHERE f.made_at = '2026-10-16'").fetchall())
+    check("forecast_settles_from_status",
+          outcomes == {"Fran Finance": 1, "Tia Tail": 0, "Nora NoEmail": None})
+    waiting = fitdb.grade()
+    check("grade_waits_for_floor", not waiting["ready"] and waiting["settled"] == 2
+          and "2 of 30" in waiting["message"])
+    for i in range(30):
+        fitdb.add_contact(f"Lead {i:02d}", email=f"l{i}@g.test", title="CFO" if i < 10 else "Intern")
+    fitdb.forecast_log(rules_path, today=_date(2026, 10, 18))
+    for i in range(30):
+        fitdb.update_contact(f"l{i}@g.test", status="replied" if i < 8 or i == 20 else "silent")
+    fitdb.settle_forecasts(_date(2026, 10, 25))
+    graded = fitdb.grade()
+    check("grade_reports_lift", graded["ready"] and graded["top_third_positive_pct"] > graded["rest_positive_pct"])
+    fitdb.close()
+    pr.close()
+
+
 def run_benchmarks():
     global PASS, FAIL
 
@@ -7315,6 +7523,9 @@ def run_benchmarks():
 
     # ── 90. Full MCP registered-tool sweep (10 category checks) ──
     run_mcp_tool_sweep()
+
+    # ── 91-94. Canonical statuses, proof statuses, fit rules, forecast log ──
+    run_status_fit_benchmarks()
 
     learned_queue_crm.close()
 

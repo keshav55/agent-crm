@@ -54,6 +54,85 @@ FREE_MAIL_DOMAINS = {
     "yahoo.com",
 }
 
+# --- Canonical statuses ---------------------------------------------------
+# The one status list. Every status decision in this file (pipeline, funnel,
+# win/loss, forecast, health, suggest-status, next actions) reads it through
+# canonical_status() and the groups below, so legacy names keep working.
+STATUSES = (
+    ("prospect", "Prospect"),
+    ("drafted", "Drafted"),
+    ("sent", "Sent"),
+    ("replied", "Replied"),
+    ("silent", "Silent"),
+    ("met", "Met"),
+    ("proposal", "Proposal"),
+    ("paying", "Paying"),
+    ("left", "Left"),
+    ("lost", "Lost"),
+    ("partner", "Partner"),
+    ("hold", "On hold"),
+)
+STATUS_IDS = tuple(status for status, _ in STATUSES)
+STATUS_LABELS = dict(STATUSES)
+# Legacy names: accepted on input, migrated in data.
+STATUS_ALIASES = {
+    "contacted": "sent",
+    "emailed": "sent",
+    "bounced": "lost",
+    "usage_customer": "paying",
+    "active_customer": "paying",
+    "graduated": "left",
+    "churned": "left",
+    "strategic_partner": "partner",
+    "verbal_yes": "proposal",
+    "proposal_drafted": "proposal",
+}
+# An alias that loses information on the way in keeps it as a tag.
+STATUS_ALIAS_TAGS = {"bounced": "bounced"}
+# Funnel order (how far a lead got). silent stalls at the sent step; left
+# reached paying before leaving.
+STATUS_FUNNEL = ("prospect", "drafted", "sent", "replied", "met", "proposal", "paying")
+STATUS_FUNNEL_RANK = dict({s: i for i, s in enumerate(STATUS_FUNNEL)}, silent=2, left=6)
+
+
+def canonical_status(status):
+    """Map any status (canonical, legacy alias, or unknown) to its canonical id.
+
+    Unknown values pass through lower-cased so nothing is silently dropped."""
+    key = str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not key:
+        return "prospect"
+    if key == "on_hold":
+        return "hold"
+    return STATUS_ALIASES.get(key, key)
+
+
+def statuses_matching(*canonical_ids):
+    """Every raw status name (canonical + legacy aliases) for the given ids."""
+    wanted = {canonical_status(s) for s in canonical_ids}
+    names = set(wanted) | {alias for alias, target in STATUS_ALIASES.items() if target in wanted}
+    return tuple(sorted(names))
+
+
+# Semantic groups, as raw names so SQL and dict lookups work on old data too.
+WON_STATUSES = statuses_matching("paying")
+LOST_STATUSES = statuses_matching("lost", "left")
+OUTCOME_STATUSES = tuple(sorted(set(WON_STATUSES) | set(LOST_STATUSES)))
+# Not an open lead: outcomes plus partners and on-hold.
+CLOSED_STATUSES = tuple(sorted(set(OUTCOME_STATUSES) | set(statuses_matching("partner", "hold"))))
+# Reached-out-to or further (a real touch happened).
+REACHED_STATUSES = statuses_matching("sent", "replied", "silent", "met", "proposal", "paying", "left", "partner")
+# Legacy vocabulary name for each canonical id (used when a database has not
+# opted into canonical statuses, so suggestions stay in that database's words).
+LEGACY_STATUS_NAMES = {
+    "sent": "contacted",
+    "proposal": "proposal_drafted",
+    "paying": "active_customer",
+    "left": "churned",
+    "partner": "strategic_partner",
+}
+_SQL_IN = lambda names: ",".join("'" + n + "'" for n in names)  # noqa: E731 (constants only)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,6 +218,33 @@ CREATE INDEX IF NOT EXISTS idx_facts_value ON facts(value);
 """
 
 
+# Optional contact columns added to existing databases on open.
+PHONE_COLUMNS = (("phone", "TEXT"),)
+INVESTOR_COLUMNS = (
+    ("investor_type", "TEXT"),
+    ("check_size_min", "INTEGER"),
+    ("check_size_max", "INTEGER"),
+    ("round_focus", "TEXT"),
+)
+
+
+def migrate_contact_columns(conn):
+    """Idempotent: add phone and investor pipeline columns to contacts."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(contacts)").fetchall()}
+    added = False
+    for column, col_type in PHONE_COLUMNS + INVESTOR_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE contacts ADD COLUMN {column} {col_type}")
+            added = True
+    if added:
+        conn.commit()
+
+
+def migrate_investor_fields(conn):
+    """Kept for callers of the old name (atris-crm's migrate_investor_fields.py)."""
+    migrate_contact_columns(conn)
+
+
 class CRM:
     CADENCE_DEFAULTS = {
         "prospect": 14,
@@ -147,6 +253,14 @@ class CRM:
         "proposal_drafted": 3,
         "verbal_yes": 2,
         "active_customer": 30,
+        # canonical statuses (STATUSES)
+        "drafted": 2,
+        "sent": 7,
+        "replied": 2,
+        "silent": 14,
+        "proposal": 3,
+        "paying": 30,
+        "partner": 30,
     }
     CADENCE_BASE_DAYS = 7
 
@@ -196,6 +310,8 @@ class CRM:
         except sqlite3.OperationalError:
             self.conn.execute("ALTER TABLE contacts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
             self.conn.commit()
+        # Migrate: phone + investor pipeline columns (idempotent).
+        migrate_contact_columns(self.conn)
         # Queue surface events need to retain the same fact values on different
         # days while preserving the graph's existing exact-fact deduplication.
         try:
@@ -222,12 +338,168 @@ class CRM:
                    WHERE source IN ('queue', 'queue_meta') AND event_day != ''"""
             )
 
+    # --- Statuses (one canonical list; see STATUSES at the top) ---
+
+    STATUS_VOCABULARY_KEY = "status_vocabulary"
+
+    def _ensure_settings_table(self):
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS settings (
+                   key TEXT PRIMARY KEY,
+                   value TEXT,
+                   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+               )"""
+        )
+
+    def get_setting(self, key, default=None):
+        """Read one database-level setting; missing table or key gives default."""
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return default
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        with self.conn:
+            self._ensure_settings_table()
+            self.conn.execute(
+                """INSERT INTO settings (key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                  updated_at = CURRENT_TIMESTAMP""",
+                (key, value),
+            )
+        self.__dict__.pop("_status_vocabulary_cache", None)
+
+    def status_vocabulary(self):
+        """'canonical' once a database has migrated to STATUSES, else 'open'.
+
+        Open databases store whatever status they are given (the engine still
+        understands legacy names everywhere). Canonical databases alias legacy
+        names on input and reject unknown ones, so the stored list stays clean.
+        """
+        cached = self.__dict__.get("_status_vocabulary_cache")
+        if cached is None:
+            cached = self.get_setting(self.STATUS_VOCABULARY_KEY, "open")
+            self._status_vocabulary_cache = cached
+        return cached
+
+    def uses_canonical_statuses(self):
+        return self.status_vocabulary() == "canonical"
+
+    @staticmethod
+    def _tags_with(tags, tag):
+        items = [t.strip() for t in (tags or "").split(",") if t.strip()]
+        if tag not in items:
+            items.append(tag)
+        return ",".join(items)
+
+    def _normalize_status_input(self, status, tags=None):
+        """Alias a status on the way in. Returns (status, tags)."""
+        if not self.uses_canonical_statuses():
+            return status, tags
+        key = str(status or "").strip().lower().replace("-", "_").replace(" ", "_")
+        canonical = canonical_status(status)
+        if canonical not in STATUS_IDS:
+            raise ValueError(
+                f"Unknown status '{status}'. Use one of: {', '.join(STATUS_IDS)}"
+            )
+        alias_tag = STATUS_ALIAS_TAGS.get(key)
+        if alias_tag:
+            tags = self._tags_with(tags, alias_tag)
+        return canonical, tags
+
+    def _status_name(self, canonical_id):
+        """A canonical id in this database's own vocabulary (for suggestions)."""
+        if self.uses_canonical_statuses():
+            return canonical_id
+        return LEGACY_STATUS_NAMES.get(canonical_id, canonical_id)
+
+    @staticmethod
+    def statuses():
+        """The canonical status list: [{"id", "label"}, ...] in pipeline order."""
+        return [{"id": status, "label": label} for status, label in STATUSES]
+
+    def migrate_statuses(self, apply=False):
+        """Move every contact onto the canonical list.
+
+        Dry run by default. Idempotent: a second run finds nothing to change.
+        Does not touch updated_at (win/loss timing reads it). Returns the
+        change list, which is also the undo journal (see undo_status_migration).
+        """
+        rows = self.conn.execute(
+            "SELECT id, name, email, status, tags FROM contacts ORDER BY id"
+        ).fetchall()
+        changes, unknown = [], []
+        for row in rows:
+            key = str(row["status"] or "").strip().lower().replace("-", "_").replace(" ", "_")
+            new_status = canonical_status(row["status"])
+            if new_status not in STATUS_IDS:
+                unknown.append({"id": row["id"], "name": row["name"], "status": row["status"]})
+                continue
+            new_tags = row["tags"]
+            if STATUS_ALIAS_TAGS.get(key):
+                new_tags = self._tags_with(row["tags"], STATUS_ALIAS_TAGS[key])
+            if new_status != row["status"] or new_tags != row["tags"]:
+                changes.append({
+                    "id": row["id"], "name": row["name"], "email": row["email"],
+                    "old_status": row["status"], "new_status": new_status,
+                    "old_tags": row["tags"], "new_tags": new_tags,
+                })
+        before = {}
+        for row in rows:
+            before[row["status"]] = before.get(row["status"], 0) + 1
+        result = {
+            "applied": False,
+            "changes": changes,
+            "unknown": unknown,
+            "counts_before": before,
+            "vocabulary": self.status_vocabulary(),
+        }
+        if not apply:
+            return result
+        if unknown:
+            result["error"] = (f"{len(unknown)} contacts have statuses outside the "
+                               "canonical list and no alias; fix them first")
+            return result
+        with self.conn:
+            for change in changes:
+                self.conn.execute(
+                    "UPDATE contacts SET status = ?, tags = ? WHERE id = ? AND status = ?",
+                    (change["new_status"], change["new_tags"], change["id"], change["old_status"]),
+                )
+        self.set_setting(self.STATUS_VOCABULARY_KEY, "canonical")
+        result["applied"] = True
+        result["vocabulary"] = "canonical"
+        result["counts_after"] = {
+            r["status"]: r["n"] for r in self.conn.execute(
+                "SELECT status, COUNT(*) AS n FROM contacts GROUP BY status"
+            ).fetchall()
+        }
+        return result
+
+    def undo_status_migration(self, changes):
+        """Reverse a migrate_statuses change list. Only rows still showing the
+        migrated status are restored, so later real changes are kept."""
+        restored = 0
+        with self.conn:
+            for change in changes:
+                cur = self.conn.execute(
+                    "UPDATE contacts SET status = ?, tags = ? WHERE id = ? AND status = ?",
+                    (change["old_status"], change["old_tags"], change["id"], change["new_status"]),
+                )
+                restored += cur.rowcount
+        self.set_setting(self.STATUS_VOCABULARY_KEY, "open")
+        return {"restored": restored, "vocabulary": "open"}
+
     # --- Contacts ---
 
     def add_contact(self, name, email=None, company=None, title=None,
                     deal_size=None, status="prospect", source=None,
-                    notes=None, tags=None, warn_duplicate=False):
+                    notes=None, tags=None, warn_duplicate=False, phone=None):
         self._validate_email(email)
+        status, tags = self._normalize_status_input(status or "prospect", tags)
         if warn_duplicate:
             existing = self.conn.execute(
                 "SELECT * FROM contacts WHERE LOWER(name) = LOWER(?)", (name,)
@@ -235,9 +507,9 @@ class CRM:
             if existing:
                 return {"id": None, "duplicate_of": dict(existing)}
         self.conn.execute(
-            """INSERT INTO contacts (name, email, company, title, deal_size, status, source, notes, tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name, email, company, title, deal_size, status, source, notes, tags)
+            """INSERT INTO contacts (name, email, company, title, deal_size, status, source, notes, tags, phone)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, email, company, title, deal_size, status, source, notes, tags, phone)
         )
         self.conn.commit()
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -246,8 +518,16 @@ class CRM:
         contact = self.get_contact(identifier)
         if not contact:
             return None
-        allowed = {"name", "company", "title", "deal_size", "status", "source", "notes", "tags", "last_contacted"}
+        allowed = {"name", "company", "title", "deal_size", "status", "source", "notes", "tags",
+                   "last_contacted", "phone", "investor_type", "check_size_min",
+                   "check_size_max", "round_focus"}
         updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if "status" in updates:
+            current_tags = updates.get("tags", contact.get("tags"))
+            status, tags = self._normalize_status_input(updates["status"], current_tags)
+            updates["status"] = status
+            if tags != current_tags:
+                updates["tags"] = tags
         if not updates:
             return contact
         sets = ", ".join(f"{k} = ?" for k in updates)
@@ -267,10 +547,16 @@ class CRM:
         return updated
 
     def get_contact(self, identifier):
-        """Get contact by email or name (partial match)."""
+        """Get contact by email, phone, or name (partial match)."""
         row = self.conn.execute("SELECT * FROM contacts WHERE email = ?", (identifier,)).fetchone()
         if row:
             return dict(row)
+        if identifier and re.fullmatch(r"\+?[\d\s().-]{7,}", str(identifier)):
+            row = self.conn.execute(
+                "SELECT * FROM contacts WHERE phone = ?", (identifier,)
+            ).fetchone()
+            if row:
+                return dict(row)
         escaped = self._escape_like(identifier)
         row = self.conn.execute(
             "SELECT * FROM contacts WHERE name LIKE ? ESCAPE '\\'", (f"%{escaped}%",)
@@ -283,8 +569,10 @@ class CRM:
         if not include_archived:
             query += " AND archived = 0"
         if status:
-            query += " AND status = ?"
-            params.append(status)
+            # Alias-aware: "paying" also finds legacy "active_customer" rows.
+            names = statuses_matching(status)
+            query += f" AND status IN ({','.join('?' for _ in names)})"
+            params.extend(names)
         if company:
             query += " AND company LIKE ? ESCAPE '\\'"
             params.append(f"%{self._escape_like(company)}%")
@@ -1248,11 +1536,26 @@ class CRM:
     # --- Views ---
 
     def pipeline(self):
+        """Contacts per canonical status (legacy names fold into their status)."""
         rows = self.conn.execute(
             """SELECT status, COUNT(*) as count, GROUP_CONCAT(name, ', ') as names
-               FROM contacts WHERE archived = 0 GROUP BY status ORDER BY count DESC"""
+               FROM contacts WHERE archived = 0 GROUP BY status"""
         ).fetchall()
-        return [dict(r) for r in rows]
+        grouped = {}
+        for r in rows:
+            status = canonical_status(r["status"])
+            entry = grouped.setdefault(status, {
+                "status": status, "label": STATUS_LABELS.get(status, status),
+                "count": 0, "names": [],
+            })
+            entry["count"] += r["count"]
+            if r["names"]:
+                entry["names"].append(r["names"])
+        order = {status: i for i, status in enumerate(STATUS_IDS)}
+        result = sorted(grouped.values(), key=lambda e: (-e["count"], order.get(e["status"], 99)))
+        for entry in result:
+            entry["names"] = ", ".join(entry["names"])
+        return result
 
     def stats(self):
         total = self.conn.execute("SELECT COUNT(*) FROM contacts WHERE archived = 0").fetchone()[0]
@@ -1290,7 +1593,8 @@ class CRM:
         "contacts": (
             "id", "email", "name", "company", "title", "deal_size", "status",
             "source", "notes", "tags", "archived", "last_contacted",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "phone", "investor_type",
+            "check_size_min", "check_size_max", "round_focus",
         ),
         "activity": ("id", "contact_id", "type", "summary", "created_at"),
         "deals": (
@@ -1303,7 +1607,7 @@ class CRM:
         ),
     }
 
-    _CSV_FIELDS = _FULL_TABLE_COLUMNS["contacts"]
+    _CSV_FIELDS = _FULL_TABLE_COLUMNS["contacts"][:14]  # core columns; phone lives in facts on CSV import
     _CSV_ALIASES = {
         "name": {"name", "full name", "contact name"},
         "email": {"email", "email address", "e mail", "e-mail", "e-mail address"},
@@ -1535,7 +1839,7 @@ class CRM:
         fieldnames = list(self._CSV_FIELDS)
         if enrich:
             fieldnames.extend(("activity_count", "deal_count", "score"))
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(contacts)
         if should_close:
@@ -2151,8 +2455,11 @@ class CRM:
 
     # --- Lead Intelligence ---
 
-    STATUS_ORDER = ["prospect", "contacted", "met", "proposal_drafted", "verbal_yes", "active_customer"]
-    STATUS_SCORES = {"prospect": 0, "contacted": 5, "met": 8, "proposal_drafted": 12, "verbal_yes": 16, "active_customer": 20}
+    # Funnel order from the canonical list (STATUS_FUNNEL).
+    STATUS_ORDER = list(STATUS_FUNNEL)
+    STATUS_SCORES = {"prospect": 0, "contacted": 5, "met": 8, "proposal_drafted": 12, "verbal_yes": 16, "active_customer": 20,
+                     "drafted": 2, "sent": 5, "replied": 8, "silent": 3, "proposal": 12, "paying": 20,
+                     "partner": 10}
     STAGE_PROBABILITIES = {
         "prospect": 0.10,
         "contacted": 0.20,
@@ -2164,6 +2471,11 @@ class CRM:
         "negotiation": 0.65,
         "verbal_yes": 0.75,
         "active_customer": 1.0,
+        "drafted": 0.12,
+        "sent": 0.20,
+        "replied": 0.30,
+        "silent": 0.12,
+        "paying": 1.0,
     }
     FORECAST_SIGNAL_NAMES = (
         "stage",
@@ -2180,6 +2492,7 @@ class CRM:
         "stale_open_deal",
         "one_sided_messaging",
         "high_probability_quiet",
+        "bad_address",
     )
     ACTION_LEARNING_MIN_OUTCOMES = 10
     ACTION_MOVE_WINDOW_DAYS = 30
@@ -2412,28 +2725,28 @@ class CRM:
         # dropped out.  Without stage-transition history we attribute them to
         # the earliest stage ("prospect") so top-of-funnel conversion rates
         # aren't artificially inflated.
-        lost_churned = self.conn.execute(
-            "SELECT COUNT(*) FROM contacts WHERE status IN ('lost', 'churned')"
-        ).fetchone()[0]
+        all_rows = self.conn.execute(
+            "SELECT created_at, updated_at, status FROM contacts"
+        ).fetchall()
+        lost_statuses = set(statuses_matching("lost"))
+        lost_churned = sum(1 for r in all_rows if r["status"] in lost_statuses)
+        ranked = []
+        for r in all_rows:
+            canonical = canonical_status(r["status"])
+            ranked.append((canonical, STATUS_FUNNEL_RANK.get(canonical), r))
 
         for status in self.STATUS_ORDER:
-            rows = self.conn.execute(
-                "SELECT created_at, updated_at, status FROM contacts WHERE status = ?",
-                (status,)
-            ).fetchall()
-            # Also count contacts that passed through this status (now in a later stage)
             idx = self.STATUS_ORDER.index(status)
-            later_statuses = self.STATUS_ORDER[idx + 1:]
-            passed_through = 0
-            if later_statuses:
-                placeholders = ",".join("?" * len(later_statuses))
-                passed_through = self.conn.execute(
-                    f"SELECT COUNT(*) FROM contacts WHERE status IN ({placeholders})",
-                    later_statuses
-                ).fetchone()[0]
+            rows = [r for canonical, _, r in ranked if canonical == status]
+            # Stalled at this step under another name (silent stalls at sent).
+            stalled = sum(1 for canonical, rank, _ in ranked
+                          if rank == idx and canonical != status)
+            # Also count contacts that passed through this status (now in a later stage)
+            passed_through = sum(1 for _, rank, _ in ranked
+                                 if rank is not None and rank > idx)
 
             current_count = len(rows)
-            total_entered = current_count + passed_through
+            total_entered = current_count + stalled + passed_through
 
             # For the first pipeline stage, include lost/churned contacts in
             # the denominator — they entered the funnel but never converted.
@@ -2690,7 +3003,7 @@ class CRM:
                JOIN contacts c
                  ON p.entity = 'prediction:' || COALESCE(NULLIF(c.email, ''), c.name)
                WHERE p.key = 'probability' AND p.source = 'forecast'
-                 AND c.status IN ('active_customer', 'lost', 'churned')
+                 AND c.status IN (""" + _SQL_IN(OUTCOME_STATUSES) + """)
                ORDER BY p.observed_at ASC, p.rowid ASC"""
         ).fetchall()
         outcomes = []
@@ -2705,7 +3018,7 @@ class CRM:
             outcomes.append({
                 "entity": row["entity"],
                 "probability": probability,
-                "outcome": 1 if row["outcome_status"] == "active_customer" else 0,
+                "outcome": 1 if row["outcome_status"] in WON_STATUSES else 0,
                 "stage": (row["predicted_status"]
                           or self._stage_from_snapshot(snapshot) or "unknown"),
                 "scores": self._signal_scores_from_snapshot(snapshot),
@@ -2820,7 +3133,7 @@ class CRM:
         """Estimate the likelihood that a contact's open deal will close."""
         contact = self.get_contact(identifier)
         if (not contact or contact.get("archived")
-                or contact.get("status") in ("active_customer", "lost", "churned")):
+                or contact.get("status") in CLOSED_STATUSES):
             return None
         scored = self._deal_probability_for_contact(
             contact, self.win_loss_analysis(), weight_model=self.learned_weights()
@@ -2845,7 +3158,7 @@ class CRM:
         ranked = []
 
         for contact in contacts:
-            if contact.get("status") in ("active_customer", "lost", "churned"):
+            if contact.get("status") in CLOSED_STATUSES:
                 continue
             scored = self._deal_probability_for_contact(
                 contact, history, activity_by_contact.get(contact["id"], []),
@@ -2872,18 +3185,20 @@ class CRM:
         weighted_total = round(sum(row["weighted_value"] for row in ranked), 2)
         closed_revenue = round(sum(
             self._parse_deal_size(contact.get("deal_size"))
-            for contact in contacts if contact.get("status") == "active_customer"
+            for contact in contacts if contact.get("status") in WON_STATUSES
         ), 2)
 
         stages = list(self.STATUS_ORDER)
-        stages.extend(sorted({row["status"] for row in ranked if row["status"] not in stages}))
+        stages.extend(sorted({canonical_status(row["status"]) for row in ranked}
+                             - set(stages)))
         by_stage = []
         for status in stages:
-            stage_contacts = [contact for contact in contacts if contact.get("status") == status]
-            stage_rows = [row for row in ranked if row["status"] == status]
+            stage_contacts = [contact for contact in contacts
+                              if canonical_status(contact.get("status")) == status]
+            stage_rows = [row for row in ranked if canonical_status(row["status"]) == status]
             total_value = sum(self._parse_deal_size(contact.get("deal_size"))
                               for contact in stage_contacts)
-            if status == "active_customer":
+            if status == "paying":
                 weighted = total_value
                 probability = 1.0
             else:
@@ -2965,7 +3280,7 @@ class CRM:
         rows = self.conn.execute(
             """SELECT * FROM contacts
                WHERE archived = 0
-               AND status NOT IN ('active_customer', 'churned', 'lost')
+               AND status NOT IN (""" + _SQL_IN(OUTCOME_STATUSES + statuses_matching("hold")) + """)
                ORDER BY last_contacted ASC NULLS FIRST""",
         ).fetchall()
         contacts = []
@@ -2994,7 +3309,8 @@ class CRM:
 
     # --- Agent Superpowers (Wave 3) ---
 
-    VALID_STATUSES = {"prospect", "contacted", "met", "proposal_drafted", "verbal_yes", "active_customer", "lost", "churned"}
+    VALID_STATUSES = ({"prospect", "contacted", "met", "proposal_drafted", "verbal_yes", "active_customer", "lost", "churned"}
+                      | set(STATUS_IDS) | set(STATUS_ALIASES))
 
     def query(self, q):
         """Natural language-ish query. Supports status keywords, 'high value',
@@ -3101,8 +3417,10 @@ class CRM:
         query = "SELECT * FROM contacts WHERE 1=1"
         params = []
         if status:
-            query += " AND status = ?"
-            params.append(status)
+            # Alias-aware: "paying" also finds legacy "active_customer" rows.
+            names = statuses_matching(status)
+            query += f" AND status IN ({','.join('?' for _ in names)})"
+            params.extend(names)
         if company:
             query += " AND company LIKE ? ESCAPE '\\'"
             params.append(f"%{self._escape_like(company)}%")
@@ -3531,7 +3849,7 @@ class CRM:
         contacts = self.list_contacts()
         churning = []
         for c in contacts:
-            if c.get("status") in ("lost", "churned"):
+            if c.get("status") in LOST_STATUSES:
                 continue
             identifier = c.get("email") or c["name"]
             vel = self.velocity(identifier, window_days=decay_days)
@@ -3560,7 +3878,7 @@ class CRM:
         untouched = []
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         for c in contacts:
-            if c.get("status") in ("lost", "churned"):
+            if c.get("status") in LOST_STATUSES:
                 continue
             act_count = self.conn.execute(
                 "SELECT COUNT(*) FROM activity WHERE contact_id = ?",
@@ -3605,9 +3923,9 @@ class CRM:
         # Tuned status cadence owns timing; deal value only influences channel.
         freq = (max(int(cadence_days), 1) if cadence_days is not None
                 else self.tuned_cadence(status))
-        if status in ("verbal_yes", "proposal_drafted"):
+        if canonical_status(status) == "proposal":
             channel = "call"
-        elif status == "active_customer":
+        elif status in WON_STATUSES:
             channel = "email"
         elif deal_val > 50000:
             channel = "call"
@@ -4140,7 +4458,7 @@ class CRM:
             if src not in by_source:
                 by_source[src] = {"total": 0, "converted": 0, "total_deal_value": 0, "contacts": []}
             by_source[src]["total"] += 1
-            if c.get("status") in ("active_customer", "verbal_yes"):
+            if c.get("status") == "verbal_yes" or c.get("status") in WON_STATUSES:
                 by_source[src]["converted"] += 1
             by_source[src]["total_deal_value"] += self._parse_deal_size(c.get("deal_size"))
             by_source[src]["contacts"].append(c["name"])
@@ -4208,7 +4526,8 @@ class CRM:
                 all_activity_types[t] = all_activity_types.get(t, 0) + 1
 
             # Check if contact advanced past prospect
-            if c.get("status") in ("contacted", "met", "proposal_drafted", "verbal_yes", "active_customer"):
+            if (STATUS_FUNNEL_RANK.get(canonical_status(c.get("status")), -1) >= STATUS_FUNNEL_RANK["sent"]
+                    and c.get("status") not in LOST_STATUSES):
                 for a in acts:
                     t = a["type"]
                     advanced_activity_types[t] = advanced_activity_types.get(t, 0) + 1
@@ -4275,7 +4594,7 @@ class CRM:
         forecast = []
 
         for c in contacts:
-            if c.get("status") in ("lost", "churned", "active_customer"):
+            if c.get("status") in CLOSED_STATUSES:
                 continue
             deal_val = self._parse_deal_size(c.get("deal_size"))
             if deal_val == 0:
@@ -4600,7 +4919,7 @@ class CRM:
 
         # 1. Pipeline diversity (up to 25 pts) — how many stages have contacts
         statuses = set(c.get("status") for c in contacts)
-        stage_count = len(statuses - {"lost", "churned"})
+        stage_count = len({canonical_status(s) for s in statuses} - {"lost", "left"})
         div_pts = min(25, stage_count * 5)
         score += div_pts
         factors.append(f"{stage_count} active stages (+{div_pts}pts)")
@@ -4901,15 +5220,18 @@ class CRM:
 
         # Check 4: Pipeline imbalance (too many prospects, too few advanced)
         if not bottleneck:
-            status_counts = {p["status"]: p["count"] for p in pipeline}
+            status_counts = {}
+            for p in pipeline:
+                key = canonical_status(p["status"])
+                status_counts[key] = status_counts.get(key, 0) + p["count"]
             prospect_count = status_counts.get("prospect", 0)
-            advanced = sum(status_counts.get(s, 0) for s in ("met", "proposal_drafted", "verbal_yes"))
+            advanced = sum(status_counts.get(s, 0) for s in ("replied", "met", "proposal"))
             if prospect_count > 10 and advanced == 0:
                 bottleneck = "pipeline_stuck"
                 proposal = {
                     "experiment": "pipeline-push",
-                    "change": f"{prospect_count} prospects but 0 advanced. Focus on converting top 5 prospects to 'contacted' this week.",
-                    "measure": "5 prospects advance to contacted within 7 days",
+                    "change": f"{prospect_count} prospects but 0 advanced. Focus on converting top 5 prospects to '{self._status_name('sent')}' this week.",
+                    "measure": f"5 prospects advance to {self._status_name('sent')} within 7 days",
                     "batch_size": 5,
                     "baseline_value": advanced,
                 }
@@ -4967,7 +5289,7 @@ class CRM:
         """Analyze what closed deals have in common: sources, activity types,
         time to close, activity count. Returns patterns that correlate with winning."""
         wins = self.conn.execute(
-            "SELECT * FROM contacts WHERE status = 'active_customer'"
+            f"SELECT * FROM contacts WHERE status IN ({_SQL_IN(WON_STATUSES)})"
         ).fetchall()
         if not wins:
             return {"patterns": [], "win_count": 0}
@@ -5015,7 +5337,7 @@ class CRM:
     def loss_patterns(self):
         """Analyze what lost deals have in common."""
         losses = self.conn.execute(
-            "SELECT * FROM contacts WHERE status IN ('lost', 'churned')"
+            f"SELECT * FROM contacts WHERE status IN ({_SQL_IN(LOST_STATUSES)})"
         ).fetchall()
         if not losses:
             return {"patterns": [], "loss_count": 0}
@@ -5061,7 +5383,7 @@ class CRM:
         cutoff = (date.today() - timedelta(days=stale_days)).isoformat()
 
         for c in contacts:
-            if c.get("status") in ("active_customer", "lost", "churned"):
+            if c.get("status") in CLOSED_STATUSES:
                 continue
             lc = c.get("last_contacted")
             if lc and lc >= cutoff:
@@ -5093,9 +5415,9 @@ class CRM:
         won_gaps = []
         lost_gaps = []
 
-        for status, gap_list in [("active_customer", won_gaps), ("lost", lost_gaps)]:
+        for names, gap_list in [(WON_STATUSES, won_gaps), (statuses_matching("lost"), lost_gaps)]:
             contacts = self.conn.execute(
-                "SELECT * FROM contacts WHERE status = ?", (status,)
+                f"SELECT * FROM contacts WHERE status IN ({','.join('?' for _ in names)})", names
             ).fetchall()
             for c in contacts:
                 acts = self.conn.execute(
@@ -5298,10 +5620,10 @@ class CRM:
 
     def win_loss_analysis(self):
         wins_rows = self.conn.execute(
-            "SELECT * FROM contacts WHERE status = 'active_customer'"
+            f"SELECT * FROM contacts WHERE status IN ({_SQL_IN(WON_STATUSES)})"
         ).fetchall()
         losses_rows = self.conn.execute(
-            "SELECT * FROM contacts WHERE status IN ('lost', 'churned')"
+            f"SELECT * FROM contacts WHERE status IN ({_SQL_IN(LOST_STATUSES)})"
         ).fetchall()
 
         wins = []
@@ -5370,7 +5692,7 @@ class CRM:
             if label not in cohorts:
                 cohorts[label] = {"added": 0, "converted": 0}
             cohorts[label]["added"] += 1
-            if r["status"] in ("active_customer", "churned"):
+            if r["status"] in WON_STATUSES or r["status"] in statuses_matching("left"):
                 cohorts[label]["converted"] += 1
 
         result = {}
@@ -5412,10 +5734,10 @@ class CRM:
 
     def revenue_report(self):
         active_rows = self.conn.execute(
-            "SELECT deal_size FROM contacts WHERE status = 'active_customer'"
+            f"SELECT deal_size FROM contacts WHERE status IN ({_SQL_IN(WON_STATUSES)})"
         ).fetchall()
         pipeline_rows = self.conn.execute(
-            "SELECT deal_size FROM contacts WHERE status NOT IN ('active_customer', 'lost', 'churned')"
+            f"SELECT deal_size FROM contacts WHERE status NOT IN ({_SQL_IN(CLOSED_STATUSES)})"
         ).fetchall()
 
         arr = sum(self._parse_deal_size(r["deal_size"]) for r in active_rows)
@@ -5601,6 +5923,11 @@ class CRM:
             "negotiation": 4,
             "verbal_yes": 5,
             "active_customer": 6,
+            "drafted": 0,
+            "sent": 1,
+            "silent": 1,
+            "replied": 2,
+            "paying": 6,
         }
         return ranks.get(normalized)
 
@@ -5871,6 +6198,39 @@ class CRM:
             )
         return len(actions)
 
+    # Never nudge these (bounced addresses get "Find a working address").
+    NO_FOLLOWUP_STATUSES = tuple(sorted(set(LOST_STATUSES) | set(statuses_matching("hold", "partner"))))
+    CLOSED_DEAL_STAGES = {"won", "lost", "closed", "closed_won", "closed_lost", "dead"}
+    HIGH_VALUE_DEAL = 5000
+    BOUNCE_TAGS = {"bounced", "email-bounced"}
+
+    def _is_bounced(self, contact):
+        if (contact.get("status") or "").lower() == "bounced":
+            return True
+        tags = {t.strip().lower() for t in (contact.get("tags") or "").split(",")}
+        return canonical_status(contact.get("status")) == "lost" and bool(tags & self.BOUNCE_TAGS)
+
+    def _open_deal_values(self):
+        """Largest open deal value per contact_id (no closed_at, stage not won/lost/closed)."""
+        best = {}
+        for r in self.conn.execute(
+            "SELECT contact_id, value, stage FROM deals WHERE closed_at IS NULL"
+        ).fetchall():
+            stage = (r["stage"] or "").strip().lower()
+            if stage in self.CLOSED_DEAL_STAGES or stage.startswith("closed"):
+                continue
+            val = self._parse_deal_size(r["value"])
+            if val > best.get(r["contact_id"], 0):
+                best[r["contact_id"]] = val
+        return best
+
+    def _contact_deal_value(self, contact, open_deals=None):
+        """Contact deal_size or its largest open deal, whichever is bigger."""
+        if open_deals is None:
+            open_deals = self._open_deal_values()
+        return max(self._parse_deal_size(contact.get("deal_size")),
+                   open_deals.get(contact["id"], 0))
+
     def next_actions(self, limit=10):
         """Build one ranked, explainable "do this today" queue.
 
@@ -5888,10 +6248,16 @@ class CRM:
 
         urgency_weights, learned_signals, _ = self._urgency_weight_model()
         today = date.today()
+        all_contacts = self.list_contacts()
+        bounced = [contact for contact in all_contacts if self._is_bounced(contact)]
+        bounced_ids = {contact["id"] for contact in bounced}
+        # Lost, left, on-hold, and partner contacts never get a follow-up nudge.
         contacts = [
-            contact for contact in self.list_contacts()
-            if contact.get("status") not in ("lost", "churned")
+            contact for contact in all_contacts
+            if contact.get("status") not in self.NO_FOLLOWUP_STATUSES
+            and contact["id"] not in bounced_ids
         ]
+        open_deals = self._open_deal_values()
         contacts_by_id = {contact["id"]: contact for contact in contacts}
         contacts_by_email = {
             contact["email"].lower(): contact
@@ -5905,7 +6271,7 @@ class CRM:
                 "contact": contact["name"],
                 "action": action,
                 "reason": reason,
-                "deal_value": self._parse_deal_size(contact.get("deal_size")),
+                "deal_value": self._contact_deal_value(contact, open_deals),
                 "signals": [],
                 "_primary_score": -1,
                 "_primary_signal": None,
@@ -5982,12 +6348,20 @@ class CRM:
                           f"every {cadence_days} days")
                 score = min(45 + (overdue_days / cadence_days) * 15, 70)
             status = contact.get("status")
-            if status == "active_customer":
+            deal_value = self._contact_deal_value(contact, open_deals)
+            if status in WON_STATUSES:
                 action = "Check in"
-            elif status == "prospect" and days_since is None:
+            elif canonical_status(status) == "prospect" and days_since is None:
                 action = "Initial outreach"
+                if deal_value >= self.HIGH_VALUE_DEAL:
+                    # A real deal waits on the first touch: outrank small stale leads.
+                    reason = f"Never contacted; a ${deal_value:,.0f} deal waits on the first touch"
+                    score = max(score, 60)
             else:
                 action = "Follow up"
+                if deal_value >= self.HIGH_VALUE_DEAL and days_since is not None:
+                    reason = f"High-value contact gone stale; {reason[0].lower()}{reason[1:]}"
+                    score = max(score, 80)
             add_signal(
                 contact, action, reason, score, "cadence_overdue",
                 {"days_since_contact": days_since, "cadence_days": cadence_days},
@@ -6062,6 +6436,13 @@ class CRM:
                         {"sent": best["sent"], "received": best["received"]},
                     )
 
+        # A bounced address needs a working one, never a follow-up.
+        for contact in bounced:
+            add_signal(
+                contact, "Find a working address", "Email bounced", 20,
+                "bad_address", {"email": contact.get("email")},
+            )
+
         for forecast_row in self.forecast()["contacts"]:
             probability = forecast_row["probability"]
             forecast_cadence_days = self.tuned_cadence(forecast_row["status"])
@@ -6082,7 +6463,7 @@ class CRM:
             status = forecast_row["status"]
             if status == "verbal_yes":
                 action = "Send contract"
-            elif status == "proposal_drafted":
+            elif canonical_status(status) == "proposal":
                 action = "Follow up on proposal"
             else:
                 action = "Re-engage"
@@ -6365,35 +6746,43 @@ class CRM:
         suggested = current
         reason = "Current status appears correct"
         confidence = "low"
+        stage = canonical_status(current)
+        open_reach = ("prospect", "drafted", "sent", "replied", "silent")
 
-        # If last activity was meeting and status is still contacted -> suggest met
-        if act_types and act_types[0] == "meeting" and current == "contacted":
-            suggested = "met"
+        # Last activity was a meeting and we only had email contact -> met
+        if act_types and act_types[0] == "meeting" and stage in ("sent", "replied", "silent"):
+            suggested = self._status_name("met")
             reason = "Last activity was a meeting"
             confidence = "high"
-        # If activity count > 3 and status is prospect -> suggest contacted
-        elif act_count > 3 and current == "prospect":
-            suggested = "contacted"
+        # They wrote back (canonical databases track replies as a status)
+        elif (self.uses_canonical_statuses() and "email_replied" in act_types
+              and stage in ("prospect", "drafted", "sent", "silent")):
+            suggested = "replied"
+            reason = "They replied by email"
+            confidence = "high"
+        # If activity count > 3 and status is prospect -> suggest sent/contacted
+        elif act_count > 3 and stage == "prospect":
+            suggested = self._status_name("sent")
             reason = f"{act_count} activities logged but still marked as prospect"
             confidence = "high"
-        # If deal exists at proposal stage -> suggest proposal_drafted
-        elif "proposal" in deal_stages and current in ("prospect", "contacted", "met"):
-            suggested = "proposal_drafted"
+        # If deal exists at proposal stage -> suggest proposal
+        elif "proposal" in deal_stages and stage in open_reach + ("met",):
+            suggested = self._status_name("proposal")
             reason = "Deal at proposal stage"
             confidence = "high"
-        # If deal at closed_won -> suggest active_customer
-        elif "closed_won" in deal_stages and current != "active_customer":
-            suggested = "active_customer"
+        # If deal at closed_won -> suggest paying
+        elif "closed_won" in deal_stages and current not in WON_STATUSES:
+            suggested = self._status_name("paying")
             reason = "Deal marked as closed won"
             confidence = "high"
-        # If any activity and status is prospect -> suggest contacted
-        elif act_count > 0 and current == "prospect":
-            suggested = "contacted"
+        # If any activity and status is prospect -> suggest sent/contacted
+        elif act_count > 0 and stage == "prospect":
+            suggested = self._status_name("sent")
             reason = "Has activity but still marked as prospect"
             confidence = "medium"
         # If meeting in activity history and status < met
-        elif "meeting" in act_types and current in ("prospect", "contacted"):
-            suggested = "met"
+        elif "meeting" in act_types and stage in open_reach:
+            suggested = self._status_name("met")
             reason = "Meeting recorded in activity history"
             confidence = "medium"
 
@@ -8603,6 +8992,374 @@ class CRM:
 
         return results
 
+    # --- Proof-based statuses: silence and quiet customers ---
+
+    # Activity types that are us reaching out.
+    OUTBOUND_TYPES = ("email_sent", "email", "email_followup", "outreach",
+                      "linkedin_connection_note_sent", "imessage")
+    # Activity types that are them answering (auto-replies do not count).
+    REPLY_TYPES = ("email_replied", "reply", "meeting", "call")
+    # Any real two-way touch (notes, research, and drafts are not touches).
+    TOUCH_TYPES = OUTBOUND_TYPES + REPLY_TYPES + ("email_bounced", "bounce")
+
+    @staticmethod
+    def _day(value):
+        """First 10 chars of a timestamp as a date, or None."""
+        try:
+            return date.fromisoformat(str(value)[:10]) if value else None
+        except ValueError:
+            return None
+
+    def _activity_days(self, types):
+        """{contact_id: [dates]} for the given activity types."""
+        marks = ",".join("?" for _ in types)
+        out = {}
+        for row in self.conn.execute(
+            f"SELECT contact_id, created_at FROM activity WHERE type IN ({marks})", tuple(types)
+        ).fetchall():
+            day = self._day(row["created_at"])
+            if day:
+                out.setdefault(row["contact_id"], []).append(day)
+        return out
+
+    def mark_silent(self, days=7, apply=False, today=None):
+        """Sent with no reply after `days` days -> silent.
+
+        Proof only: the send date is the latest outbound activity (or
+        last_contacted); any reply, call, or meeting on or after it keeps the
+        contact out. Dry run unless apply=True. Idempotent: silent contacts
+        are no longer 'sent', so a second run finds nothing.
+        """
+        today = today or date.today()
+        sent_names = statuses_matching("sent")
+        marks = ",".join("?" for _ in sent_names)
+        rows = self.conn.execute(
+            f"SELECT * FROM contacts WHERE archived = 0 AND status IN ({marks})", sent_names
+        ).fetchall()
+        outbound = self._activity_days(self.OUTBOUND_TYPES)
+        replies = self._activity_days(self.REPLY_TYPES)
+        silent, waiting, no_send_date = [], 0, []
+        for row in rows:
+            c = dict(row)
+            sends = outbound.get(c["id"], [])
+            last_send = max(sends) if sends else self._day(c.get("last_contacted"))
+            if last_send is None:
+                no_send_date.append(c["name"])
+                continue
+            if any(d >= last_send for d in replies.get(c["id"], [])):
+                continue
+            quiet_days = (today - last_send).days
+            if quiet_days < days:
+                waiting += 1
+                continue
+            silent.append({"id": c["id"], "name": c["name"], "email": c.get("email"),
+                           "company": c.get("company"), "last_sent": last_send.isoformat(),
+                           "days_since_send": quiet_days})
+        if apply:
+            for entry in silent:
+                self._set_status_by_id(entry["id"], "silent")
+        silent.sort(key=lambda e: -e["days_since_send"])
+        return {"days": days, "applied": bool(apply), "silent": silent,
+                "still_waiting": waiting, "no_send_date": no_send_date}
+
+    def _set_status_by_id(self, contact_id, status):
+        """Status change for contacts without an email (name lookups can be ambiguous)."""
+        row = self.conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+        if not row:
+            return None
+        status, tags = self._normalize_status_input(status, row["tags"])
+        with self.conn:
+            self.conn.execute(
+                "UPDATE contacts SET status = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, tags, contact_id),
+            )
+        if status != row["status"]:
+            self.observe(self._canonical_contact_entity(dict(row)), "status", status,
+                         source="crm_status")
+        return dict(self.conn.execute("SELECT * FROM contacts WHERE id = ?", (contact_id,)).fetchone())
+
+    def quiet_customers(self, days=10, today=None):
+        """Paying customers with no logged touch in `days` days (or ever)."""
+        today = today or date.today()
+        marks = ",".join("?" for _ in WON_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM contacts WHERE archived = 0 AND status IN ({marks})", WON_STATUSES
+        ).fetchall()
+        touches = self._activity_days(self.TOUCH_TYPES)
+        open_deals = self._open_deal_values()
+        quiet = []
+        for row in rows:
+            c = dict(row)
+            seen = list(touches.get(c["id"], []))
+            if self._day(c.get("last_contacted")):
+                seen.append(self._day(c["last_contacted"]))
+            last = max(seen) if seen else None
+            since = (today - last).days if last else None
+            if since is None or since >= days:
+                quiet.append({
+                    "id": c["id"], "name": c["name"], "email": c.get("email"),
+                    "company": c.get("company"), "deal_size": c.get("deal_size"),
+                    "monthly_value": round(self._contact_deal_value(c, open_deals) / 12, 2),
+                    "last_touch": last.isoformat() if last else None,
+                    "days_since_touch": since,
+                })
+        quiet.sort(key=lambda e: (-(e["days_since_touch"] if e["days_since_touch"] is not None else 10 ** 6),
+                                  -e["monthly_value"]))
+        return quiet
+
+    # --- Fit rules: who the right customer is, written by hand ---
+
+    # Open leads: anyone not paying, gone, lost, a partner, or on hold.
+    OPEN_LEAD_STATUSES = ("prospect", "drafted", "sent", "replied", "silent", "met", "proposal")
+    FORECAST_POSITIVE = ("replied", "met", "proposal", "paying", "left")
+    FORECAST_NEGATIVE = ("silent", "lost")
+    GRADE_MIN_SETTLED = 30
+
+    def _default_fit_path(self):
+        env = os.environ.get("CRM_FIT_RULES")
+        if env:
+            return env
+        base = os.path.dirname(os.path.abspath(str(self.db_path)))
+        return os.path.join(base, "fit.json")
+
+    def load_fit_rules(self, path=None):
+        path = path or self._default_fit_path()
+        with open(path, "r", encoding="utf-8") as f:
+            rules = json.load(f)
+        if not isinstance(rules, dict) or not isinstance(rules.get("criteria"), list):
+            raise ValueError(f"{path}: needs a 'criteria' list")
+        for i, criterion in enumerate(rules["criteria"]):
+            if not isinstance(criterion, dict) or "weight" not in criterion or "match" not in criterion:
+                raise ValueError(f"{path}: criterion {i} needs 'weight' and 'match'")
+        rules["_path"] = path
+        return rules
+
+    def _fit_values(self, contact, facts, match):
+        """The text values a match clause looks at, lower-cased."""
+        if "field" in match:
+            raw = contact.get(match["field"])
+            if match["field"] == "tags":
+                return [t.strip().lower() for t in (raw or "").split(",") if t.strip()]
+            if match["field"] == "email" and raw:
+                return [str(raw).lower(), str(raw).rsplit("@", 1)[-1].lower()]
+            return [str(raw).lower()] if raw not in (None, "") else []
+        if "fact" in match:
+            fact = facts.get(match["fact"])
+            return [str(fact["value"]).lower()] if fact and fact.get("value") not in (None, "") else []
+        return []
+
+    def _fit_match(self, contact, facts, match, monthly_value):
+        """True when a contact satisfies one match clause (see fit.json)."""
+        if "all_of" in match:
+            return all(self._fit_match(contact, facts, m, monthly_value) for m in match["all_of"])
+        if "any_of" in match:
+            return any(self._fit_match(contact, facts, m, monthly_value) for m in match["any_of"])
+        if "not" in match:
+            return not self._fit_match(contact, facts, match["not"], monthly_value)
+        if "monthly_value_min" in match or "monthly_value_max" in match:
+            lo = match.get("monthly_value_min")
+            hi = match.get("monthly_value_max")
+            return ((lo is None or monthly_value >= lo) and (hi is None or monthly_value <= hi))
+        if "status" in match:
+            wanted = {canonical_status(s) for s in match["status"]}
+            return canonical_status(contact.get("status")) in wanted
+        values = self._fit_values(contact, facts, match)
+        if match.get("missing"):
+            return not values
+        if match.get("present"):
+            return bool(values)
+        if "equals" in match:
+            wanted = {str(v).lower() for v in match["equals"]}
+            return any(v in wanted for v in values)
+        if "any" in match:
+            terms = [str(t).lower() for t in match["any"]]
+            if match.get("word"):
+                return any(re.search(rf"\b{re.escape(t)}\b", v) for v in values for t in terms)
+            return any(t in v for v in values for t in terms)
+        return False
+
+    def _monthly_value(self, contact, open_deals, rules):
+        """Expected monthly dollars: deal_size or largest open deal (bare
+        numbers read as yearly, like everywhere else in this file), else the
+        rule file's default for leads with no number yet."""
+        value = self._contact_deal_value(contact, open_deals) / 12
+        if value > 0:
+            return round(value, 2), "deal"
+        default = (rules.get("expected_value") or {}).get("default_monthly", 0)
+        return float(default), "default"
+
+    def fit(self, rules=None, limit=None, include_closed=False):
+        """Rank open leads by fit score x expected monthly value, with reasons."""
+        rules = rules if isinstance(rules, dict) else self.load_fit_rules(rules)
+        max_points = sum(c["weight"] for c in rules["criteria"] if c["weight"] > 0) or 1
+        facts_by_entity = {}
+        for row in self.conn.execute(
+            "SELECT entity, key, value, source, observed_at FROM facts "
+            "WHERE entity LIKE 'contact:%' ORDER BY observed_at, rowid"
+        ).fetchall():
+            facts_by_entity.setdefault(row["entity"], {})[row["key"]] = dict(row)
+        open_deals = self._open_deal_values()
+        ranked = []
+        for c in self.list_contacts():
+            status = canonical_status(c.get("status"))
+            if not include_closed and status not in self.OPEN_LEAD_STATUSES:
+                continue
+            facts = facts_by_entity.get(self._canonical_contact_entity(c), {})
+            monthly, value_source = self._monthly_value(c, open_deals, rules)
+            points, reasons = 0, []
+            for criterion in rules["criteria"]:
+                if self._fit_match(c, facts, criterion["match"], monthly):
+                    points += criterion["weight"]
+                    reasons.append({"id": criterion.get("id"), "weight": criterion["weight"],
+                                    "reason": criterion.get("reason", "")})
+            score = max(0, min(100, round(points * 100 / max_points)))
+            ranked.append({
+                "id": c["id"], "name": c["name"], "email": c.get("email"),
+                "company": c.get("company"), "title": c.get("title"),
+                "status": status, "fit_score": score,
+                "monthly_value": monthly, "value_source": value_source,
+                "expected_value": round(score / 100 * monthly, 2),
+                "reasons": reasons,
+            })
+        ranked.sort(key=lambda r: (-r["expected_value"], -r["fit_score"], r["name"].lower()))
+        if limit is not None:
+            ranked = ranked[:max(int(limit), 0)]
+        return ranked
+
+    # --- Forecast log: dated predictions, graded once enough settle ---
+
+    def _ensure_forecasts_table(self):
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS forecasts (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   contact_id INTEGER NOT NULL,
+                   made_at DATE NOT NULL,
+                   fit_score INTEGER NOT NULL,
+                   expected_value REAL NOT NULL,
+                   status_at TEXT,
+                   touched INTEGER NOT NULL DEFAULT 0,
+                   outcome INTEGER,
+                   settled_at DATE,
+                   UNIQUE(contact_id, made_at),
+                   FOREIGN KEY (contact_id) REFERENCES contacts(id)
+               )"""
+        )
+
+    def settle_forecasts(self, today=None):
+        """Settle open forecasts from current statuses. Returns count settled."""
+        today = (today or date.today()).isoformat()
+        self._ensure_forecasts_table()
+        settled = 0
+        with self.conn:
+            for row in self.conn.execute(
+                """SELECT f.id, c.status FROM forecasts f JOIN contacts c ON c.id = f.contact_id
+                   WHERE f.outcome IS NULL"""
+            ).fetchall():
+                status = canonical_status(row["status"])
+                outcome = (1 if status in self.FORECAST_POSITIVE
+                           else 0 if status in self.FORECAST_NEGATIVE else None)
+                if outcome is None:
+                    continue
+                self.conn.execute(
+                    "UPDATE forecasts SET outcome = ?, settled_at = ? WHERE id = ?",
+                    (outcome, today, row["id"]),
+                )
+                settled += 1
+        return settled
+
+    def forecast_log(self, rules=None, today=None):
+        """Snapshot every open lead's fit forecast once per day (idempotent per
+        day), then settle any forecasts whose leads have moved."""
+        today = today or date.today()
+        self._ensure_forecasts_table()
+        touched_ids = set(self._activity_days(self.TOUCH_TYPES))
+        rows = self.fit(rules)
+        created = 0
+        with self.conn:
+            for r in rows:
+                cur = self.conn.execute(
+                    """INSERT OR IGNORE INTO forecasts
+                       (contact_id, made_at, fit_score, expected_value, status_at, touched)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (r["id"], today.isoformat(), r["fit_score"], r["expected_value"],
+                     r["status"],
+                     1 if r["id"] in touched_ids or r["status"] not in ("prospect", "drafted") else 0),
+                )
+                created += cur.rowcount
+        settled = self.settle_forecasts(today)
+        return {"made_at": today.isoformat(), "open_leads": len(rows),
+                "logged": created, "already_logged_today": len(rows) - created,
+                "settled_now": settled}
+
+    def grade(self, min_settled=None):
+        """Grade the rule only when enough leads have settled.
+
+        Uses each lead's first forecast, preferring one made before anyone
+        touched it, so the team working the top picks harder does not grade
+        its own homework.
+        """
+        min_settled = self.GRADE_MIN_SETTLED if min_settled is None else min_settled
+        self._ensure_forecasts_table()
+        rows = self.conn.execute(
+            """SELECT contact_id, made_at, fit_score, expected_value, touched, outcome
+               FROM forecasts ORDER BY contact_id, touched, made_at, id"""
+        ).fetchall()
+        first = {}
+        for row in rows:
+            first.setdefault(row["contact_id"], dict(row))
+        # settle_forecasts settles every open row of a lead at once, so the
+        # first row carries the lead's outcome.
+        settled = [r for r in first.values() if r["outcome"] is not None]
+        result = {"forecast_leads": len(first), "settled": len(settled),
+                  "needed": min_settled, "ready": len(settled) >= min_settled}
+        if not result["ready"]:
+            result["message"] = (f"{len(settled)} of {min_settled} leads settled. "
+                                 "Waiting before grading.")
+            return result
+        settled.sort(key=lambda r: (-r["expected_value"], -r["fit_score"]))
+        third = max(len(settled) // 3, 1)
+        top, rest = settled[:third], settled[third:]
+        rate = lambda group: round(sum(r["outcome"] for r in group) / len(group) * 100, 1) if group else 0.0  # noqa: E731
+        result.update({
+            "top_third_positive_pct": rate(top),
+            "rest_positive_pct": rate(rest),
+            "overall_positive_pct": rate(settled),
+            "untouched_at_forecast": sum(1 for r in settled if not r["touched"]),
+        })
+        result["lift"] = (round(result["top_third_positive_pct"] / result["rest_positive_pct"], 2)
+                          if result["rest_positive_pct"] else None)
+        return result
+
+    # --- Fundraising pipeline (investor columns) ---
+
+    def fundraise_pipeline(self):
+        """Investor pipeline: contacts with investor_type set."""
+        by_status = self.conn.execute(
+            """SELECT status,
+                      COUNT(*) AS count,
+                      COALESCE(SUM(COALESCE(check_size_max, check_size_min, 0)), 0) AS total_check
+               FROM contacts
+               WHERE investor_type IS NOT NULL
+               GROUP BY status
+               ORDER BY count DESC"""
+        ).fetchall()
+        investors = self.conn.execute(
+            """SELECT c.name, c.company, c.investor_type, c.status,
+                      c.check_size_min, c.check_size_max, c.round_focus,
+                      (SELECT MAX(a.created_at) FROM activity a WHERE a.contact_id = c.id) AS last_activity
+               FROM contacts c
+               WHERE c.investor_type IS NOT NULL
+               ORDER BY c.status, c.name"""
+        ).fetchall()
+        return {
+            "by_status": [dict(r) for r in by_status],
+            "investors": [dict(r) for r in investors],
+            "total_investors": len(investors),
+            "total_potential_check": sum(
+                (r["check_size_max"] or r["check_size_min"] or 0) for r in investors
+            ),
+        }
+
 
 # --- CLI ---
 
@@ -8638,6 +9395,7 @@ def main():
     p_add.add_argument("--source")
     p_add.add_argument("--notes", "-n")
     p_add.add_argument("--tags")
+    p_add.add_argument("--phone")
     p_add.add_argument("--force", "-f", action="store_true", help="Add even if a contact with the same name exists")
 
     # ls
@@ -8660,6 +9418,7 @@ def main():
     p_up.add_argument("--source")
     p_up.add_argument("--notes", "-n")
     p_up.add_argument("--tags")
+    p_up.add_argument("--phone")
 
     # delete
     p_del = sub.add_parser("delete", help="Delete a contact")
@@ -8786,6 +9545,39 @@ def main():
 
     # pipeline
     sub.add_parser("pipeline", help="View pipeline summary")
+
+    # statuses: the one canonical list
+    p_statuses = sub.add_parser("statuses", help="The canonical status list (and legacy aliases)")
+    p_statuses.add_argument("--json", action="store_true", help='[{"id","label"}, ...]')
+    p_mig = sub.add_parser("migrate-statuses",
+                           help="Move legacy statuses onto the canonical list (dry run unless --apply)")
+    p_mig.add_argument("--apply", action="store_true")
+    p_mig.add_argument("--journal", help="Write the change list (the undo file) here")
+    p_mig.add_argument("--undo", metavar="JOURNAL", help="Reverse a migration from its journal")
+    p_mig.add_argument("--json", action="store_true")
+
+    # proof-based statuses
+    p_silent = sub.add_parser("mark-silent", help="Sent with no reply after N days -> silent (dry run unless --apply)")
+    p_silent.add_argument("--days", type=int, default=7)
+    p_silent.add_argument("--apply", action="store_true")
+    p_silent.add_argument("--json", action="store_true")
+    p_quiet = sub.add_parser("quiet", help="Paying customers with no logged touch in N days")
+    p_quiet.add_argument("--days", type=int, default=10)
+    p_quiet.add_argument("--json", action="store_true")
+
+    # fit rules + forecast log
+    p_fit = sub.add_parser("fit", help="Rank open leads by fit score x expected monthly value")
+    p_fit.add_argument("--rules", help="Rule file (default: fit.json next to the database, or $CRM_FIT_RULES)")
+    p_fit.add_argument("--limit", type=int, default=20)
+    p_fit.add_argument("--json", action="store_true")
+    p_flog = sub.add_parser("forecast-log", help="Snapshot every open lead's fit forecast (once per day) and settle outcomes")
+    p_flog.add_argument("--rules")
+    p_flog.add_argument("--json", action="store_true")
+    p_grade = sub.add_parser("grade", help="Grade the fit rule once enough forecast leads have settled")
+    p_grade.add_argument("--min", type=int, default=None, help="Settled leads needed (default 30)")
+    p_grade.add_argument("--json", action="store_true")
+
+    sub.add_parser("fundraise", help="Investor fundraising pipeline report")
 
     # stats
     sub.add_parser("stats", help="CRM stats")
@@ -9062,11 +9854,19 @@ def main():
 
     crm = CRM(args.db)
 
+    if args.command in ("add", "update") and args.status:
+        try:  # canonical databases reject statuses outside the list
+            crm._normalize_status_input(args.status)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            crm.close()
+            sys.exit(2)
+
     if args.command == "add":
         result = crm.add_contact(args.name, email=args.email, company=args.company,
                                   title=args.title, deal_size=args.deal, status=args.status,
                                   source=args.source, notes=args.notes, tags=args.tags,
-                                  warn_duplicate=not args.force)
+                                  warn_duplicate=not args.force, phone=args.phone)
         if isinstance(result, dict):
             dup = result["duplicate_of"]
             print(f"Warning: contact '{dup['name']}' already exists (id={dup['id']}, email={dup.get('email')})")
@@ -9102,6 +9902,7 @@ def main():
         if args.source: fields["source"] = args.source
         if args.notes: fields["notes"] = args.notes
         if args.tags: fields["tags"] = args.tags
+        if args.phone: fields["phone"] = args.phone
         c = crm.update_contact(args.identifier, **fields)
         if c:
             print(f"Updated: {c['name']} → {c['status']}")
@@ -9479,6 +10280,149 @@ def main():
         pipeline = crm.pipeline()
         for row in pipeline:
             print(f"  {row['status']}: {row['count']} — {row['names']}")
+
+    elif args.command == "statuses":
+        if args.json:
+            print(json.dumps(CRM.statuses()))
+        else:
+            print(f"  Vocabulary: {crm.status_vocabulary()}")
+            for row in CRM.statuses():
+                aliases = [a for a, t in STATUS_ALIASES.items() if t == row["id"]]
+                extra = f"  (also accepts: {', '.join(aliases)})" if aliases else ""
+                print(f"  {row['id']:<9} {row['label']}{extra}")
+
+    elif args.command == "migrate-statuses":
+        if args.undo:
+            with open(args.undo, encoding="utf-8") as f:
+                journal = json.load(f)
+            result = crm.undo_status_migration(journal.get("changes", journal))
+            print(json.dumps(result) if args.json else
+                  f"Restored {result['restored']} contacts; vocabulary is now {result['vocabulary']}.")
+        else:
+            result = crm.migrate_statuses(apply=args.apply)
+            if args.journal and result["changes"]:
+                with open(args.journal, "w", encoding="utf-8") as f:
+                    json.dump({"db": os.path.abspath(args.db), "made_at": datetime.now().isoformat(),
+                               "applied": result["applied"], "changes": result["changes"]}, f, indent=2)
+                    f.write("\n")
+            if args.json:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                moves = {}
+                for change in result["changes"]:
+                    key = f"{change['old_status']} -> {change['new_status']}"
+                    moves[key] = moves.get(key, 0) + 1
+                verb = "Moved" if result["applied"] else "Would move"
+                if not result["changes"]:
+                    print("  Nothing to move; every status is already on the canonical list.")
+                else:
+                    print(f"  {verb} {len(result['changes'])} contacts:")
+                for key, n in sorted(moves.items(), key=lambda kv: -kv[1]):
+                    print(f"    {key}: {n}")
+                if result["unknown"]:
+                    print(f"  {len(result['unknown'])} contacts have unknown statuses:")
+                    for u in result["unknown"][:20]:
+                        print(f"    {u['name']}: {u['status']}")
+                if result.get("error"):
+                    print(f"  Not applied: {result['error']}")
+                elif not result["applied"]:
+                    print("  Dry run. Pass --apply to write (back up the database first).")
+            if result.get("error"):
+                crm.close()
+                sys.exit(1)
+
+    elif args.command == "mark-silent":
+        result = crm.mark_silent(days=args.days, apply=args.apply)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            verb = "Marked" if result["applied"] else "Would mark"
+            print(f"  {verb} {len(result['silent'])} silent (sent {args.days}+ days ago, no reply).")
+            for e in result["silent"]:
+                print(f"    {e['name']} ({e.get('company') or '-'}) last sent {e['last_sent']}, {e['days_since_send']}d")
+            print(f"  Still inside the window: {result['still_waiting']}. No send date on file: {len(result['no_send_date'])}.")
+            if not result["applied"]:
+                print("  Dry run. Pass --apply to write.")
+
+    elif args.command == "quiet":
+        rows = crm.quiet_customers(days=args.days)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            print(f"  {len(rows)} paying customers with no logged touch in {args.days}+ days:")
+            for r in rows:
+                since = f"{r['days_since_touch']}d ago ({r['last_touch']})" if r["last_touch"] else "never"
+                print(f"    {r['name']} ({r.get('company') or '-'}) ${r['monthly_value']:,.0f}/mo, last touch {since}")
+
+    elif args.command == "fit":
+        try:
+            rows = crm.fit(args.rules, limit=args.limit)
+        except (OSError, ValueError) as e:
+            print(f"Error: could not read fit rules: {e}", file=sys.stderr)
+            crm.close()
+            sys.exit(2)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            for i, r in enumerate(rows, 1):
+                print(f"  {i}. {r['name']} ({r.get('company') or '-'}) [{r['status']}] "
+                      f"fit {r['fit_score']} x ${r['monthly_value']:,.0f}/mo = ${r['expected_value']:,.0f}")
+                for reason in r["reasons"]:
+                    sign = "+" if reason["weight"] >= 0 else ""
+                    print(f"       {sign}{reason['weight']} {reason['reason']}")
+
+    elif args.command == "forecast-log":
+        try:
+            result = crm.forecast_log(args.rules)
+        except (OSError, ValueError) as e:
+            print(f"Error: could not read fit rules: {e}", file=sys.stderr)
+            crm.close()
+            sys.exit(2)
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"  {result['made_at']}: logged {result['logged']} forecasts "
+                  f"({result['already_logged_today']} already logged today), "
+                  f"settled {result['settled_now']}.")
+
+    elif args.command == "grade":
+        result = crm.grade(min_settled=args.min)
+        if args.json:
+            print(json.dumps(result))
+        elif not result["ready"]:
+            print(f"  {result['message']}")
+        else:
+            print(f"  Settled leads: {result['settled']}")
+            print(f"  Top third by forecast: {result['top_third_positive_pct']}% replied, met, or paid")
+            print(f"  The rest: {result['rest_positive_pct']}%  (lift {result['lift']})")
+
+    elif args.command == "fundraise":
+        fp = crm.fundraise_pipeline()
+        print("Fundraise Pipeline")
+        print("==================")
+        print(f"  Total investors: {fp['total_investors']}")
+        print(f"  Total potential check: ${fp['total_potential_check']:,.0f}")
+        print()
+        print("  By stage:")
+        if not fp["by_status"]:
+            print("    (empty)")
+        else:
+            for row in fp["by_status"]:
+                print(f"    {row['status']}: {row['count']} — ${row['total_check']:,.0f} potential")
+        print()
+        print("  Investors:")
+        if not fp["investors"]:
+            print("    (empty)")
+        else:
+            for inv in fp["investors"]:
+                firm = inv["company"] or "-"
+                last = (inv["last_activity"] or "never")[:10]
+                check = ""
+                if inv["check_size_min"] or inv["check_size_max"]:
+                    lo = inv["check_size_min"] or "?"
+                    hi = inv["check_size_max"] or "?"
+                    check = f"  check ${lo:,}-${hi:,}" if isinstance(lo, int) and isinstance(hi, int) else f"  check ${lo}-${hi}"
+                print(f"    {inv['name']} | {firm} | {inv['investor_type']} | {inv['status']} | last {last}{check}")
 
     elif args.command == "stats":
         s = crm.stats()
