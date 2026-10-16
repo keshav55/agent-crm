@@ -2,6 +2,8 @@
 
 Agent first CRM that self improves. One Python file, SQLite, zero dependencies.
 
+This repo is the reusable open-source CRM engine. Product/company-specific CRM instances should live in their own repos or databases.
+
 It can process data from your Mac and other external CRM APIs.
 
 ```bash
@@ -162,6 +164,38 @@ crm.ingest_all()                        # pull Contacts, iMessage, Calendar, Mai
 ```
 
 No server. No protocol. `from crm import CRM` and go.
+
+## Statuses
+
+One list, in pipeline order: `prospect, drafted, sent, replied, silent, met, proposal, paying, left, lost, partner, hold`.
+
+```bash
+python crm.py statuses --json           # [{"id": "prospect", "label": "Prospect"}, ...]
+python crm.py migrate-statuses          # dry run: legacy names -> the list
+python crm.py migrate-statuses --apply --journal undo.json
+python crm.py migrate-statuses --undo undo.json
+```
+
+Legacy names (`contacted`, `active_customer`, `churned`, `verbal_yes`, ...) keep working everywhere. A database that has been migrated aliases them on input (`bounced` becomes `lost` plus a `bounced` tag) and rejects anything off the list.
+
+Statuses from proof, not memory:
+
+```bash
+python crm.py mark-silent --days 7 [--apply]   # sent, no reply in 7 days -> silent
+python crm.py quiet --days 10                   # paying customers nobody touched in 10 days
+```
+
+## Right-customer rule
+
+Write who your right customer is as weighted criteria in `fit.json` (next to the database), then:
+
+```bash
+python crm.py fit --limit 10       # open leads ranked by fit score x expected monthly value, with reasons
+python crm.py forecast-log         # snapshot every open lead's forecast, once per day; settles outcomes
+python crm.py grade                # grades the rule once 30 leads have settled; waits until then
+```
+
+A criterion is `{"id", "weight", "reason", "match"}`. `match` checks a contact field (`{"field": "title", "any": ["finance", "coo"]}`), tags (`{"field": "tags", "equals": ["freight"]}`), a graph fact (`{"fact": "employees", "any": [...]}`), the status, the expected monthly value (`{"monthly_value_min": 1000}`), or combines them with `any_of`, `all_of`, `not`. Negative weights subtract.
 
 ## MCP server (optional)
 

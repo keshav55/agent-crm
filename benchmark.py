@@ -9,11 +9,16 @@ Each test = 1 point. Bonus points for performance thresholds.
 """
 
 import os
+import json
+import random
+import re
+import sqlite3
+import subprocess
 import sys
 import time
 import tempfile
 import traceback
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 # Force a temp DB so we never touch real data
 TEST_DB = os.path.join(tempfile.mkdtemp(), "bench.db")
@@ -24,6 +29,20 @@ from crm import CRM
 PASS = 0
 FAIL = 0
 ERRORS = []
+PERFORMANCE_TIMINGS = []
+
+PERFORMANCE_SEED = 20260805
+PROPERTY_SEED = 8675309
+PERFORMANCE_THRESHOLDS_MS = {
+    "list_contacts": 15.0,
+    "get_contact_email": 1.0,
+    "get_contact_partial_name": 1.0,
+    "pipeline": 2.0,
+    "next_actions_10": 1200.0,
+    "forecast": 600.0,
+    "intro_paths": 2000.0,
+    "export_full": 40.0,
+}
 
 
 def check(name, condition):
@@ -33,6 +52,842 @@ def check(name, condition):
     else:
         FAIL += 1
         ERRORS.append(name)
+
+
+def make_performance_fixture():
+    """Build the deterministic 500-contact/2000-activity regression fixture."""
+    rng = random.Random(PERFORMANCE_SEED)
+    db_path = os.path.join(tempfile.mkdtemp(), "integrity-perf.db")
+    crm = CRM(db_path)
+    statuses = (
+        "prospect", "contacted", "met", "proposal_drafted",
+        "verbal_yes", "active_customer", "lost",
+    )
+    contacts = []
+    for index in range(500):
+        contacts.append((
+            f"Benchmark Contact {index:03d}",
+            f"perf+{index}@tenant-{index % 100}.benchmark.test",
+            f"Benchmark Co {rng.randrange(100):03d}",
+            f"Role {rng.randrange(20)}",
+            f"${rng.randrange(1, 250)}K",
+            statuses[rng.randrange(len(statuses))],
+            "seeded-benchmark",
+            f"Fixture note {rng.randrange(10000)}",
+            f"group-{rng.randrange(25)}",
+            f"2026-01-{1 + rng.randrange(28):02d}",
+        ))
+
+    with crm.conn:
+        crm.conn.executemany(
+            """INSERT INTO contacts
+               (name, email, company, title, deal_size, status, source, notes,
+                tags, last_contacted)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            contacts,
+        )
+
+    contact_ids = [
+        row["id"] for row in crm.conn.execute(
+            "SELECT id FROM contacts ORDER BY id"
+        ).fetchall()
+    ]
+    activity_types = ("email", "call", "meeting", "note")
+    activity_start = datetime(2026, 1, 1)
+    activities = []
+    for index in range(2000):
+        # Leave the target without activity so intro_paths has to traverse to it.
+        contact_id = contact_ids[rng.randrange(499)]
+        activities.append((
+            contact_id,
+            activity_types[rng.randrange(len(activity_types))],
+            f"Seeded activity {index}",
+            (activity_start + timedelta(minutes=index)).isoformat(sep=" "),
+        ))
+
+    with crm.conn:
+        crm.conn.executemany(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, ?, ?, ?)""",
+            activities,
+        )
+        crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source)
+               VALUES (?, ?, ?, ?)""",
+            (
+                (
+                    "contact:benchmark contact 000", "knows",
+                    "contact:benchmark contact 498", "seeded-benchmark",
+                ),
+                (
+                    "contact:benchmark contact 498", "knows",
+                    "contact:benchmark contact 499", "seeded-benchmark",
+                ),
+            ),
+        )
+
+    fixture_counts = (
+        crm.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+        crm.conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0],
+    )
+    if fixture_counts != (500, 2000):
+        crm.close()
+        raise AssertionError(
+            f"performance fixture has {fixture_counts}, expected (500, 2000)"
+        )
+    return crm
+
+
+def benchmark_exit_code(fail_count):
+    """Return a failing process status whenever any benchmark check failed."""
+    return 1 if fail_count > 0 else 0
+
+
+def result_lines(pass_count, fail_count):
+    """Create the two machine-readable score lines from the same counter."""
+    total = pass_count + fail_count
+    return (
+        f"RESULTS: {pass_count}/{total} tests passed",
+        f"score: {pass_count}",
+    )
+
+
+def score_integrity_errors(pass_count, fail_count, results_line, score_line):
+    """Validate score output and exit semantics before publishing results."""
+    errors = []
+    try:
+        results_pass = int(results_line.split(": ", 1)[1].split("/", 1)[0])
+        score_pass = int(score_line.rsplit(" ", 1)[1])
+    except (IndexError, ValueError):
+        return ["score_integrity_unparseable_output"]
+    if results_pass != pass_count or score_pass != pass_count:
+        errors.append("score_integrity_pass_count_mismatch")
+    if benchmark_exit_code(0) != 0 or benchmark_exit_code(1) == 0:
+        errors.append("score_integrity_exit_semantics")
+    if (fail_count > 0) != (benchmark_exit_code(fail_count) != 0):
+        errors.append("score_integrity_current_exit_code")
+    return errors
+
+
+def make_imessage_fixture_db(handle_counts=()):
+    """Create a minimal chat.db fixture from (handle, sent, received) tuples."""
+    db_path = os.path.join(tempfile.mkdtemp(), "chat.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE handle (
+            ROWID INTEGER PRIMARY KEY,
+            id TEXT
+        );
+        CREATE TABLE message (
+            ROWID INTEGER PRIMARY KEY,
+            handle_id INTEGER,
+            is_from_me INTEGER,
+            date INTEGER
+        );
+        CREATE TABLE chat (
+            ROWID INTEGER PRIMARY KEY
+        );
+    """)
+    apple_now = int((datetime.now().timestamp() - 978307200) * 1_000_000_000)
+    message_id = 1
+    for handle_id, (handle, sent, received) in enumerate(handle_counts, start=1):
+        conn.execute("INSERT INTO handle (ROWID, id) VALUES (?, ?)", (handle_id, handle))
+        for is_from_me, count in ((1, sent), (0, received)):
+            for _ in range(count):
+                conn.execute(
+                    "INSERT INTO message (ROWID, handle_id, is_from_me, date) VALUES (?, ?, ?, ?)",
+                    (message_id, handle_id, is_from_me, apple_now + message_id),
+                )
+                message_id += 1
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def make_addressbook_fixture_db(records=()):
+    """Create a minimal AddressBook-v22.abcddb fixture from contact mappings."""
+    db_path = os.path.join(tempfile.mkdtemp(), "AddressBook-v22.abcddb")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE ZABCDRECORD (
+            Z_PK INTEGER PRIMARY KEY,
+            ZFIRSTNAME TEXT,
+            ZLASTNAME TEXT,
+            ZORGANIZATION TEXT,
+            ZJOBTITLE TEXT,
+            ZNOTE TEXT
+        );
+        CREATE TABLE ZABCDEMAILADDRESS (
+            ZOWNER INTEGER,
+            ZADDRESSNORMALIZED TEXT
+        );
+        CREATE TABLE ZABCDPHONENUMBER (
+            ZOWNER INTEGER,
+            ZFULLNUMBER TEXT
+        );
+    """)
+    for record_id, record in enumerate(records, start=1):
+        conn.execute(
+            """INSERT INTO ZABCDRECORD
+               (Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZJOBTITLE, ZNOTE)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                record_id,
+                record.get("first"),
+                record.get("last"),
+                record.get("company"),
+                record.get("title"),
+                record.get("notes"),
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO ZABCDEMAILADDRESS (ZOWNER, ZADDRESSNORMALIZED) VALUES (?, ?)",
+            [(record_id, email) for email in record.get("emails", [])],
+        )
+        conn.executemany(
+            "INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (?, ?)",
+            [(record_id, phone) for phone in record.get("phones", [])],
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def make_calendar_fixture_records():
+    """Return fake Calendar event and attendee records at the current time."""
+    apple_now = datetime.now().timestamp() - 978307200
+    records = [{
+        "title": "Fixture Person Planning",
+        "location": "Fixture Room",
+        "start_date": apple_now,
+        "end_date": apple_now + 1800,
+        "notes": "Quarterly fixture review",
+    }]
+    attendees = [
+        {
+            "name": "Guest One",
+            "address": "mailto:guest@example.com",
+            "event_title": "Fixture Person Planning",
+            "event_date": apple_now,
+        },
+        {
+            "name": "Named Guest",
+            "address": "",
+            "event_title": "Fixture Person Planning",
+            "event_date": apple_now,
+        },
+    ]
+    return records, attendees
+
+
+def make_mail_fixture_records():
+    """Return fake Envelope Index query rows for sent/received aggregation."""
+    now = int(datetime.now().timestamp())
+    return [
+        {
+            "subject": "Fixture one", "date_sent": now,
+            "from_addr": "FIXTURE@EXAMPLE.COM", "to_addr": "guest@example.com",
+            "is_read": 1,
+        },
+        {
+            "subject": "Fixture two", "date_sent": now + 1,
+            "from_addr": "guest@example.com", "to_addr": "fixture@example.com",
+            "is_read": 1,
+        },
+        {
+            "subject": "Fixture three", "date_sent": now + 2,
+            "from_addr": "fixture@example.com", "to_addr": "other@example.com",
+            "is_read": 0,
+        },
+    ]
+
+
+MCP_SWEEP_BATCHES = (
+    ("contact_crud", (
+        "crm_add_contact", "crm_list_contacts", "crm_view_contact",
+        "crm_update_contact", "crm_log_activity", "crm_search",
+    )),
+    ("contact_intelligence", (
+        "crm_score_contact", "crm_enrich", "crm_unified_search",
+        "crm_recent_contacts", "crm_contact_summary", "crm_contact_360",
+        "crm_quick_add", "crm_compare_contacts",
+    )),
+    ("graph_context", (
+        "crm_observe", "crm_facts_about", "crm_context_for_agent",
+        "crm_search_graph", "crm_query",
+    )),
+    ("pipeline_analytics", (
+        "crm_pipeline", "crm_forecast", "crm_calibration", "crm_stats",
+        "crm_dashboard", "crm_weekly_digest", "crm_source_attribution",
+        "crm_pipeline_health_score", "crm_period_comparison",
+    )),
+    ("data_exchange", (
+        "crm_export_full", "crm_import_csv", "crm_ingest", "crm_doctor",
+    )),
+    ("relationships", (
+        "crm_find_intros", "crm_intro_paths", "crm_relationship_health",
+        "crm_network_summary", "crm_touch_plan", "crm_company_summary",
+        "crm_relationship_score",
+    )),
+    ("deals", (
+        "crm_add_deal", "crm_update_deal", "crm_close_deal",
+        "crm_list_deals", "crm_deal_pipeline", "crm_deal_velocity_report",
+        "crm_win_patterns", "crm_optimal_cadence", "crm_tuned_cadence",
+        "crm_dead_pipeline",
+    )),
+    ("hygiene_lifecycle", (
+        "crm_merge_contacts", "crm_auto_merge", "crm_suggest_merges",
+        "crm_archive_contact", "crm_unarchive_contact",
+        "crm_delete_contacts", "crm_detect_churning",
+    )),
+    ("actions_fields", (
+        "crm_next_actions", "crm_queue_stats", "crm_set_reminder",
+        "crm_due_reminders", "crm_set_field", "crm_get_fields",
+    )),
+    ("learning_experiments", (
+        "crm_propose_ticks", "crm_evolve", "crm_log_experiment",
+        "crm_conclude_experiment", "crm_experiments",
+    )),
+)
+
+MCP_SWEEP_PLAIN_TEXT_TOOLS = {
+    "crm_add_contact", "crm_log_activity", "crm_observe", "crm_pipeline",
+    "crm_context_for_agent", "crm_add_deal", "crm_archive_contact",
+    "crm_unarchive_contact", "crm_delete_contacts", "crm_contact_summary",
+    "crm_set_reminder", "crm_set_field", "crm_quick_add",
+}
+
+# These JSON tools have fixture rows that make an empty collection a regression.
+MCP_SWEEP_ALLOW_EMPTY_JSON = {"crm_detect_churning"}
+
+
+def make_mcp_sweep_fixture():
+    """Seed a small, isolated CRM that exercises every MCP tool category."""
+    fixture_dir = tempfile.mkdtemp()
+    db_path = os.path.join(fixture_dir, "mcp-sweep.db")
+    csv_path = os.path.join(fixture_dir, "mcp-import.csv")
+    crm = CRM(db_path)
+
+    contacts = (
+        ("Fixture Alice", "alice@mcp-sweep.test", "Acme Labs", "CTO",
+         "$120K", "active_customer", "referral", "Primary fixture", "enterprise"),
+        ("Fixture Bob", "bob@mcp-sweep.test", "Acme Labs", "VP Sales",
+         "$80K", "proposal_drafted", "event", "Pipeline fixture", "enterprise"),
+        ("Fixture Target", "target@mcp-sweep.test", "Target Co", "CEO",
+         "$50K", "contacted", "intro", "Introduction target", "target"),
+        ("Fixture Merge", "merge@mcp-sweep.test", "Acme Labs", "CTO",
+         "$120K", "prospect", "referral", "Merge fixture", "enterprise"),
+        ("Fixture Archive", "archive@mcp-sweep.test", "Archive Co", "VP",
+         "$10K", "prospect", "fixture", "Archive fixture", "fixture"),
+        ("Fixture Delete", "delete@mcp-sweep.test", "Delete Co", "VP",
+         "$10K", "prospect", "fixture", "Delete fixture", "fixture"),
+        ("Fixture Duplicate", "duplicate.one@mcp-sweep.test", "Duplicate Co", "VP",
+         "$15K", "prospect", "fixture", "Rich duplicate", "fixture"),
+        ("Fixture Duplicate", "duplicate.two@mcp-sweep.test", "Duplicate Co", None,
+         None, "prospect", "fixture", None, None),
+    )
+    for (name, email, company, title, deal_size, status, source, notes,
+         tags) in contacts:
+        crm.add_contact(
+            name, email=email, company=company, title=title,
+            deal_size=deal_size, status=status, source=source,
+            notes=notes, tags=tags,
+        )
+
+    crm.log_activity("alice@mcp-sweep.test", "email", "Fixture recent email")
+    crm.log_activity("alice@mcp-sweep.test", "meeting", "Fixture discovery meeting")
+    crm.log_activity("bob@mcp-sweep.test", "proposal", "Fixture proposal")
+    alice = crm.get_contact("alice@mcp-sweep.test")
+    bob = crm.get_contact("bob@mcp-sweep.test")
+    old_timestamp = (datetime.now() - timedelta(days=90)).isoformat(sep=" ")
+    old_day = (datetime.now().date() - timedelta(days=90)).isoformat()
+    recent_day = (datetime.now().date() - timedelta(days=10)).isoformat()
+    with crm.conn:
+        crm.conn.execute(
+            "UPDATE contacts SET last_contacted = ? WHERE id = ?",
+            (recent_day, alice["id"]),
+        )
+        crm.conn.execute(
+            "UPDATE contacts SET last_contacted = ? WHERE id = ?",
+            (old_day, bob["id"]),
+        )
+        crm.conn.execute(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (bob["id"], "email", "Old fixture email", old_timestamp),
+        )
+
+    crm.observe("contact:fixture alice", "role", "buyer", source="fixture")
+    crm.observe(
+        "contact:fixture alice", "knows", "contact:fixture target",
+        source="fixture",
+    )
+    crm.observe(
+        "contact:fixture alice", "imessage_total", "42", source="imessage"
+    )
+    crm.observe(
+        "contact:fixture alice", "message_intensity", "high", source="imessage"
+    )
+    crm.observe(
+        "contact:fixture target", "company", "Target Co", source="fixture"
+    )
+
+    crm.add_deal(
+        "alice@mcp-sweep.test", "Open Fixture Deal", value="$120K",
+        stage="negotiation", notes="open",
+    )
+    crm.add_deal(
+        "bob@mcp-sweep.test", "Update Fixture Deal", value="$80K",
+        stage="proposal", notes="update",
+    )
+    update_deal_id = crm.conn.execute(
+        "SELECT id FROM deals WHERE name = 'Update Fixture Deal'"
+    ).fetchone()[0]
+    crm.add_deal(
+        "bob@mcp-sweep.test", "Close Fixture Deal", value="$25K",
+        stage="qualification", notes="close",
+    )
+    close_deal_id = crm.conn.execute(
+        "SELECT id FROM deals WHERE name = 'Close Fixture Deal'"
+    ).fetchone()[0]
+    crm.set_reminder(
+        "alice@mcp-sweep.test",
+        (datetime.now().date() - timedelta(days=1)).isoformat(),
+        "Fixture overdue reminder",
+    )
+    crm.set_field("alice@mcp-sweep.test", "account_tier", "strategic")
+    experiment_slug = crm.log_experiment(
+        "Fixture Conclusion", "Fixture hypothesis", "conversion_rate", 10
+    )
+    crm.close()
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as csv_file:
+        csv_file.write(
+            "name,email,company\n"
+            "Fixture Imported,imported@mcp-sweep.test,Import Co\n"
+        )
+
+    return {
+        "db_path": db_path,
+        "csv_path": csv_path,
+        "update_deal_id": update_deal_id,
+        "close_deal_id": close_deal_id,
+        "experiment_slug": experiment_slug,
+    }
+
+
+def mcp_sweep_schema_value(property_name, property_schema, fixture):
+    """Choose one deterministic, schema-valid value for a sweep argument."""
+    if "default" in property_schema:
+        return property_schema["default"]
+    if property_schema.get("enum"):
+        return property_schema["enum"][0]
+
+    fixture_strings = {
+        "identifier": "alice@mcp-sweep.test",
+        "email": "alice@mcp-sweep.test",
+        "name": "MCP Sweep Fixture",
+        "term": "Fixture",
+        "entity": "contact:fixture alice",
+        "key": "role",
+        "value": "buyer",
+        "type": "email",
+        "summary": "MCP sweep activity",
+        "query": "enterprise",
+        "target": "Target Co",
+        "target_identifier": "target@mcp-sweep.test",
+        "company": "Acme Labs",
+        "note": "MCP sweep reminder",
+        "field_name": "sweep_field",
+        "field_value": "sweep_value",
+        "hypothesis": "Fixture improves coverage",
+        "metric": "coverage",
+        "slug_or_name": fixture["experiment_slug"],
+        "text": "Sweep Quick, CTO at Quick Co, quick@mcp-sweep.test",
+        "contact_a": "alice@mcp-sweep.test",
+        "contact_b": "bob@mcp-sweep.test",
+        "keep": "alice@mcp-sweep.test",
+        "merge": "merge@mcp-sweep.test",
+        "path": fixture["csv_path"],
+    }
+    property_type = property_schema.get("type")
+    if isinstance(property_type, list):
+        property_type = property_type[0]
+    if property_type == "string":
+        return fixture_strings.get(property_name, "fixture")
+    if property_type == "integer":
+        return {"limit": 5, "max_hops": 3}.get(property_name, 30)
+    if property_type == "number":
+        return 1
+    if property_type == "boolean":
+        return False
+    if property_type == "array":
+        return ["alice@mcp-sweep.test"]
+    if property_type == "object":
+        return {}
+    raise ValueError(
+        f"unsupported schema for {property_name}: {property_schema!r}"
+    )
+
+
+def mcp_sweep_arguments(tool, fixture):
+    """Derive minimal useful arguments from a tool's advertised input schema."""
+    schema = tool.get("inputSchema", {})
+    required = set(schema.get("required", ()))
+    arguments = {}
+    for property_name, property_schema in schema.get("properties", {}).items():
+        include = (
+            property_name in required
+            or "default" in property_schema
+            or "enum" in property_schema
+            or property_name in {
+                "limit", "days", "max_hops", "include_future_days",
+                "stale_days",
+            }
+        )
+        if include:
+            arguments[property_name] = mcp_sweep_schema_value(
+                property_name, property_schema, fixture
+            )
+
+    overrides = {
+        "crm_add_contact": {"name": "Sweep Added Contact"},
+        "crm_import_csv": {"path": fixture["csv_path"]},
+        "crm_search_graph": {"query": "buyer"},
+        # The connector dispatch is covered with a stub below; existing ingest
+        # fixture tests exercise the real source transforms independently.
+        "crm_ingest": {"source": "contacts"},
+        "crm_add_deal": {
+            "identifier": "alice@mcp-sweep.test", "name": "Sweep Added Deal"
+        },
+        "crm_update_deal": {"deal_id": fixture["update_deal_id"]},
+        "crm_close_deal": {"deal_id": fixture["close_deal_id"]},
+        "crm_merge_contacts": {
+            "keep": "alice@mcp-sweep.test", "merge": "merge@mcp-sweep.test"
+        },
+        "crm_archive_contact": {"identifier": "archive@mcp-sweep.test"},
+        "crm_unarchive_contact": {"identifier": "archive@mcp-sweep.test"},
+        "crm_delete_contacts": {"identifiers": ["delete@mcp-sweep.test"]},
+        "crm_log_experiment": {
+            "name": "Sweep Logged Experiment",
+            "hypothesis": "Fixture improves coverage",
+            "metric": "coverage",
+            "baseline_value": 1,
+        },
+        "crm_conclude_experiment": {
+            "slug_or_name": fixture["experiment_slug"], "result_value": 2
+        },
+        "crm_quick_add": {
+            "text": "Sweep Quick, CTO at Quick Co, quick@mcp-sweep.test"
+        },
+    }
+    arguments.update(overrides.get(tool["name"], {}))
+    return arguments
+
+
+def mcp_sweep_output_error(tool_name, output):
+    """Return why a tool response is invalid, or None when it is usable."""
+    if not isinstance(output, str) or not output.strip():
+        return "empty/non-string response"
+    bad_plain_markers = (
+        "Not found:", "Contact not found:", "One or both contacts not found",
+        "Could not parse", "Unknown tool:",
+    )
+    if any(marker in output for marker in bad_plain_markers):
+        return "fixture lookup failed"
+    if tool_name in MCP_SWEEP_PLAIN_TEXT_TOOLS:
+        return None
+    try:
+        parsed = json.loads(output)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return f"invalid JSON ({exc})"
+    if not parsed and tool_name not in MCP_SWEEP_ALLOW_EMPTY_JSON:
+        return "unexpected empty JSON"
+    return None
+
+
+def run_mcp_tool_sweep():
+    """Call every registered MCP tool once, reported as ten category checks."""
+    import mcp_server
+
+    fixture = make_mcp_sweep_fixture()
+    registered_tools = list(mcp_server.TOOLS)
+    registered_names = [tool.get("name") for tool in registered_tools]
+    assignment = {}
+    coverage_errors = []
+    for batch_name, expected_names in MCP_SWEEP_BATCHES:
+        for tool_name in expected_names:
+            if tool_name in assignment:
+                coverage_errors.append(f"duplicate category:{tool_name}")
+            assignment[tool_name] = batch_name
+    stale_assignments = sorted(set(assignment) - set(registered_names))
+    if stale_assignments:
+        coverage_errors.append(f"not registered:{','.join(stale_assignments)}")
+    duplicate_registrations = sorted({
+        name for name in registered_names if registered_names.count(name) > 1
+    })
+    if duplicate_registrations:
+        coverage_errors.append(
+            f"registered twice:{','.join(duplicate_registrations)}"
+        )
+
+    tools_by_batch = {batch_name: [] for batch_name, _ in MCP_SWEEP_BATCHES}
+    first_batch = MCP_SWEEP_BATCHES[0][0]
+    for tool in registered_tools:
+        batch_name = assignment.get(tool.get("name"))
+        if batch_name is None:
+            coverage_errors.append(f"uncategorized:{tool.get('name')}")
+            batch_name = first_batch
+        tools_by_batch[batch_name].append(tool)
+
+    original_db_path = mcp_server.DB_PATH
+    original_ingest_contacts = CRM.ingest_macos_contacts
+    mcp_server.DB_PATH = fixture["db_path"]
+    CRM.ingest_macos_contacts = lambda self: (1, 1)
+    try:
+        for batch_index, (batch_name, _) in enumerate(MCP_SWEEP_BATCHES):
+            batch_errors = list(coverage_errors) if batch_index == 0 else []
+            for tool in tools_by_batch[batch_name]:
+                tool_name = tool["name"]
+                try:
+                    arguments = mcp_sweep_arguments(tool, fixture)
+                    output = mcp_server.handle_tool_call(tool_name, arguments)
+                    output_error = mcp_sweep_output_error(tool_name, output)
+                    if output_error:
+                        batch_errors.append(f"{tool_name}:{output_error}")
+                except Exception as exc:
+                    batch_errors.append(
+                        f"{tool_name}:{type(exc).__name__}:{exc}"
+                    )
+            detail = "|".join(batch_errors[:3])
+            check(
+                f"mcp_sweep_{batch_name}" + (f"[{detail}]" if detail else ""),
+                not batch_errors,
+            )
+    finally:
+        CRM.ingest_macos_contacts = original_ingest_contacts
+        mcp_server.DB_PATH = original_db_path
+
+
+def run_status_fit_benchmarks():
+    """Canonical statuses, proof-based statuses, fit rules, forecast log."""
+    from datetime import date as _date
+    import crm as crm_module
+
+    work = tempfile.mkdtemp()
+
+    # ── 91. One canonical status list ──
+    ids = [row["id"] for row in CRM.statuses()]
+    check("statuses_canonical_order", ids == [
+        "prospect", "drafted", "sent", "replied", "silent", "met",
+        "proposal", "paying", "left", "lost", "partner", "hold"])
+    check("statuses_labels", dict((r["id"], r["label"]) for r in CRM.statuses())["hold"] == "On hold")
+    aliases = {"contacted": "sent", "emailed": "sent", "bounced": "lost",
+               "usage_customer": "paying", "active_customer": "paying",
+               "graduated": "left", "churned": "left", "strategic_partner": "partner",
+               "verbal_yes": "proposal", "proposal_drafted": "proposal"}
+    check("statuses_aliases_map", all(crm_module.canonical_status(a) == t for a, t in aliases.items()))
+    check("statuses_unknown_passthrough", crm_module.canonical_status("Qualified") == "qualified")
+    out = subprocess.run([sys.executable, "crm.py", "--db", os.path.join(work, "cli.db"),
+                          "statuses", "--json"], capture_output=True, text=True)
+    try:
+        check("statuses_cli_json", json.loads(out.stdout)[0] == {"id": "prospect", "label": "Prospect"})
+    except ValueError:
+        check("statuses_cli_json", False)
+
+    mig = CRM(os.path.join(work, "mig.db"))
+    mig.add_contact("Legacy Lee", email="lee@mig.test", status="active_customer", deal_size="$200/mo")
+    mig.add_contact("Bounce Bo", email="bo@mig.test", status="bounced", tags="wave1")
+    mig.add_contact("Sent Sue", email="sue@mig.test", status="emailed")
+    check("statuses_open_db_keeps_legacy",
+          mig.get_contact("lee@mig.test")["status"] == "active_customer")
+    check("statuses_alias_aware_filter",
+          [c["name"] for c in mig.list_contacts(status="paying")] == ["Legacy Lee"])
+    dry = mig.migrate_statuses()
+    check("migrate_statuses_dry_run_writes_nothing",
+          len(dry["changes"]) == 3 and mig.get_contact("bo@mig.test")["status"] == "bounced")
+    before_updated = mig.get_contact("lee@mig.test")["updated_at"]
+    applied = mig.migrate_statuses(apply=True)
+    bo = mig.get_contact("bo@mig.test")
+    check("migrate_statuses_apply",
+          applied["applied"] and bo["status"] == "lost" and "bounced" in bo["tags"].split(",")
+          and mig.get_contact("lee@mig.test")["status"] == "paying")
+    check("migrate_statuses_keeps_updated_at",
+          mig.get_contact("lee@mig.test")["updated_at"] == before_updated)
+    check("migrate_statuses_idempotent", mig.migrate_statuses(apply=True)["changes"] == [])
+    check("migrate_statuses_sets_vocabulary", mig.uses_canonical_statuses())
+    mig.add_contact("New Customer", email="new@mig.test", status="usage_customer")
+    mig.update_contact("sue@mig.test", status="churned")
+    check("canonical_db_aliases_input",
+          mig.get_contact("new@mig.test")["status"] == "paying"
+          and mig.get_contact("sue@mig.test")["status"] == "left")
+    try:
+        mig.update_contact("sue@mig.test", status="qualified")
+        check("canonical_db_rejects_unknown", False)
+    except ValueError:
+        check("canonical_db_rejects_unknown", mig.get_contact("sue@mig.test")["status"] == "left")
+    undo = mig.undo_status_migration(applied["changes"])
+    check("migrate_statuses_undo_keeps_later_changes",
+          mig.get_contact("bo@mig.test")["status"] == "bounced"
+          and mig.get_contact("sue@mig.test")["status"] == "left"
+          and undo["vocabulary"] == "open")
+    mig.close()
+
+    logic = CRM(os.path.join(work, "logic.db"))
+    logic.add_contact("Win Usage", email="u@logic.test", status="usage_customer", deal_size="$1K/mo")
+    logic.add_contact("Lost Churn", email="c@logic.test", status="churned")
+    logic.add_contact("Open One", email="o@logic.test", status="contacted", deal_size="$5K/mo")
+    logic.add_contact("Open Two", email="t@logic.test", status="emailed")
+    logic.add_contact("Partner Pat", email="p@logic.test", status="partner")
+    logic.add_contact("Hold Hal", email="h@logic.test", status="hold", deal_size="$9K/mo")
+    pipe = {row["status"]: row["count"] for row in logic.pipeline()}
+    check("pipeline_groups_by_canonical", pipe.get("sent") == 2 and "contacted" not in pipe)
+    check("funnel_uses_canonical_stages", list(logic.conversion_funnel()) == list(crm_module.STATUS_FUNNEL))
+    wl = logic.win_loss_analysis()
+    check("win_loss_reads_aliases",
+          [w["name"] for w in wl["wins"]] == ["Win Usage"]
+          and [l["name"] for l in wl["losses"]] == ["Lost Churn"])
+    fc_names = {row["name"] for row in logic.forecast()["contacts"]}
+    check("forecast_excludes_closed_statuses",
+          fc_names == {"Open One", "Open Two"})
+    na = {a["contact"] for a in logic.next_actions(limit=50)}
+    check("next_actions_skip_partner_hold_left",
+          not ({"Partner Pat", "Hold Hal", "Lost Churn"} & na))
+    logic.log_activity("t@logic.test", "email_replied", "Re: hi")
+    check("suggest_status_open_vocabulary",
+          logic.suggest_status("t@logic.test")["suggested"] in ("contacted", "emailed"))
+    logic.close()
+
+    # ── 92. Upstreamed from atris-crm: phone, investors, next-action rules ──
+    up = CRM(os.path.join(work, "up.db"))
+    up.add_contact("Phone Pia", phone="+15551234567", status="prospect")
+    check("phone_lookup", (up.get_contact("+15551234567") or {}).get("name") == "Phone Pia")
+    up.update_contact("+15551234567", company="PiaCo")
+    check("phone_update_by_phone", up.get_contact("Phone Pia")["company"] == "PiaCo")
+    up.update_contact("Phone Pia", investor_type="angel", check_size_min=25000, check_size_max=50000)
+    fp = up.fundraise_pipeline()
+    check("fundraise_pipeline", fp["total_investors"] == 1 and fp["total_potential_check"] == 50000)
+    up.add_contact("Big Stale", email="big@up.test", status="contacted")
+    up.add_contact("Bounced Bea", email="bea@up.test", status="bounced")
+    up.add_contact("Fresh Lab", email="lab@up.test", status="prospect")
+    big_id = up.get_contact("big@up.test")["id"]
+    lab_id = up.get_contact("lab@up.test")["id"]
+    up.conn.execute("UPDATE contacts SET last_contacted = '2026-01-01' WHERE id = ?", (big_id,))
+    up.conn.executemany("INSERT INTO deals (contact_id, name, value, stage) VALUES (?,?,?,?)",
+                        [(big_id, "pilot", "20000", "prospect"), (lab_id, "pilot", "20000", "prospect")])
+    up.conn.commit()
+    acts = {a["contact"]: a for a in up.next_actions(limit=50)}
+    check("next_actions_open_deal_value", acts.get("Big Stale", {}).get("deal_value") == 20000)
+    check("next_actions_high_value_stale_is_high",
+          acts.get("Big Stale", {}).get("priority") == "high"
+          and acts["Big Stale"]["reason"].startswith("High-value contact gone stale"))
+    check("next_actions_bounced_find_address",
+          acts.get("Bounced Bea", {}).get("action") == "Find a working address"
+          and acts["Bounced Bea"]["priority"] == "low")
+    check("next_actions_untouched_big_deal_medium",
+          acts.get("Fresh Lab", {}).get("action") == "Initial outreach"
+          and acts["Fresh Lab"]["priority"] == "medium")
+    up.close()
+
+    # ── 93. Proof-based statuses: silent and quiet ──
+    pr = CRM(os.path.join(work, "proof.db"))
+    pr.migrate_statuses(apply=True)
+    today = _date(2026, 10, 16)
+    for name, email, status in (("Old Send", "old@p.test", "sent"), ("New Send", "new@p.test", "sent"),
+                                ("Replied Late", "rl@p.test", "sent"), ("No Date", "nd@p.test", "sent"),
+                                ("Payer Quiet", "pq@p.test", "paying"), ("Payer Busy", "pb@p.test", "paying"),
+                                ("Payer Never", "pn@p.test", "paying")):
+        pr.add_contact(name, email=email, status=status, deal_size="$200/mo")
+    ids_ = {c["email"]: c["id"] for c in pr.list_contacts()}
+    rows = [(ids_["old@p.test"], "email_sent", "s", "2026-10-01 09:00:00"),
+            (ids_["new@p.test"], "email_sent", "s", "2026-10-14 09:00:00"),
+            (ids_["rl@p.test"], "email_sent", "s", "2026-10-01 09:00:00"),
+            (ids_["rl@p.test"], "email_replied", "r", "2026-10-12 09:00:00"),
+            (ids_["pq@p.test"], "email", "x", "2026-09-20 09:00:00"),
+            (ids_["pq@p.test"], "note", "internal", "2026-10-15 09:00:00"),
+            (ids_["pb@p.test"], "call", "x", "2026-10-13 09:00:00")]
+    pr.conn.executemany("INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?,?,?,?)", rows)
+    pr.conn.commit()
+    dry = pr.mark_silent(days=7, today=today)
+    check("mark_silent_dry_run", [e["name"] for e in dry["silent"]] == ["Old Send"]
+          and pr.get_contact("old@p.test")["status"] == "sent")
+    check("mark_silent_reply_and_window",
+          dry["still_waiting"] == 1 and dry["no_send_date"] == ["No Date"])
+    pr.mark_silent(days=7, apply=True, today=today)
+    check("mark_silent_apply", pr.get_contact("old@p.test")["status"] == "silent")
+    check("mark_silent_idempotent", pr.mark_silent(days=7, apply=True, today=today)["silent"] == [])
+    quiet = [q["name"] for q in pr.quiet_customers(days=10, today=today)]
+    check("quiet_customers", quiet == ["Payer Never", "Payer Quiet"])
+
+    # ── 94. Fit rules, forecast log, grade ──
+    rules = {
+        "criteria": [
+            {"id": "finance", "weight": 40, "reason": "Finance signer",
+             "match": {"field": "title", "any": ["finance", "cfo"]}},
+            {"id": "freight", "weight": 40, "reason": "Freight",
+             "match": {"any_of": [{"field": "company", "any": ["freight"]},
+                                  {"field": "tags", "equals": ["logistics"]}]}},
+            {"id": "big", "weight": 20, "reason": "Big ticket", "match": {"monthly_value_min": 1000}},
+            {"id": "tail", "weight": -5, "reason": "Tail", "match": {"monthly_value_min": 7, "monthly_value_max": 25}},
+            {"id": "no_email", "weight": -20, "reason": "No email", "match": {"field": "email", "missing": True}},
+        ],
+        "expected_value": {"default_monthly": 20},
+    }
+    rules_path = os.path.join(work, "fit.json")
+    with open(rules_path, "w") as f:
+        json.dump(rules, f)
+    fitdb = CRM(os.path.join(work, "fit.db"))
+    fitdb.add_contact("Fran Finance", email="f@freight.test", company="FastFreight", title="Head of Finance",
+                      deal_size="$5K/mo")
+    fitdb.add_contact("Tia Tail", email="t@tail.test", company="Tail Co", title="Engineer")
+    fitdb.add_contact("Nora NoEmail", company="Box Freight", title="CFO", tags="logistics")
+    fitdb.add_contact("Paid Pete", email="p@paid.test", company="Freight Paid", title="CFO",
+                      status="active_customer", deal_size="$5K/mo")
+    ranked = fitdb.fit(rules_path)
+    check("fit_ranks_by_expected_value", [r["name"] for r in ranked][:1] == ["Fran Finance"]
+          and ranked[0]["fit_score"] == 100 and ranked[0]["expected_value"] == 5000)
+    check("fit_excludes_closed", "Paid Pete" not in {r["name"] for r in ranked})
+    nora = next(r for r in ranked if r["name"] == "Nora NoEmail")
+    check("fit_reasons_and_negative_weights",
+          nora["fit_score"] == 60 and {x["id"] for x in nora["reasons"]} == {"finance", "freight", "no_email"})
+    check("fit_default_value", nora["value_source"] == "default" and nora["monthly_value"] == 20
+          and "tail" not in {x["id"] for x in nora["reasons"]})
+    check("fit_default_rules_path", fitdb._default_fit_path() == rules_path)
+    first = fitdb.forecast_log(rules_path, today=_date(2026, 10, 16))
+    again = fitdb.forecast_log(rules_path, today=_date(2026, 10, 16))
+    check("forecast_log_once_per_day", first["logged"] == 3 and again["logged"] == 0)
+    fitdb.update_contact("f@freight.test", status="replied")
+    fitdb.update_contact("t@tail.test", status="lost")
+    fitdb.forecast_log(rules_path, today=_date(2026, 10, 17))
+    outcomes = dict(fitdb.conn.execute(
+        "SELECT c.name, f.outcome FROM forecasts f JOIN contacts c ON c.id = f.contact_id "
+        "WHERE f.made_at = '2026-10-16'").fetchall())
+    check("forecast_settles_from_status",
+          outcomes == {"Fran Finance": 1, "Tia Tail": 0, "Nora NoEmail": None})
+    # A lead already replied when forecast does not settle from that old
+    # status; a later move to met does.
+    fitdb.add_contact("Rita Replied", email="rita@r.test", status="replied", title="CFO")
+    fitdb.forecast_log(rules_path, today=_date(2026, 10, 17))
+    rita_id = fitdb.get_contact("rita@r.test")["id"]
+    rita = lambda: fitdb.conn.execute(  # noqa: E731
+        "SELECT outcome FROM forecasts WHERE contact_id = ?", (rita_id,)).fetchone()[0]
+    check("forecast_no_settle_from_old_status", rita() is None)
+    fitdb.update_contact("rita@r.test", status="met")
+    fitdb.settle_forecasts(_date(2026, 10, 18))
+    check("forecast_settles_on_later_change", rita() == 1)
+    waiting = fitdb.grade()
+    check("grade_waits_for_floor", not waiting["ready"] and waiting["settled"] == 3
+          and "3 of 30" in waiting["message"])
+    for i in range(30):
+        fitdb.add_contact(f"Lead {i:02d}", email=f"l{i}@g.test", title="CFO" if i < 10 else "Intern")
+    fitdb.forecast_log(rules_path, today=_date(2026, 10, 18))
+    for i in range(30):
+        fitdb.update_contact(f"l{i}@g.test", status="replied" if i < 8 or i == 20 else "silent")
+    fitdb.settle_forecasts(_date(2026, 10, 25))
+    graded = fitdb.grade()
+    check("grade_reports_lift", graded["ready"] and graded["top_third_positive_pct"] > graded["rest_positive_pct"])
+    fitdb.close()
+    pr.close()
 
 
 def run_benchmarks():
@@ -192,8 +1047,8 @@ def run_benchmarks():
     check("export_csv_creates_file", os.path.exists(export_path))
 
     crm2 = CRM(os.path.join(tempfile.mkdtemp(), "import_test.db"))
-    count = crm2.import_csv(export_path)
-    check("import_csv_count", count >= 2)
+    csv_result = crm2.import_csv(export_path)
+    check("import_csv_count", csv_result["imported"] >= 2)
     imported = crm2.list_contacts()
     check("import_csv_data", len(imported) >= 2)
     crm2.close()
@@ -1129,53 +1984,61 @@ def run_benchmarks():
 
     # ── 16. Local Data Connectors (8 tests) ──
     # Test that ingest methods exist, accept correct args, return correct types.
-    # These run on any machine (gracefully return (0,0) when macOS DBs not found).
+    # Every call is fixture-injected so this suite never probes live macOS data.
 
     ingest_crm = CRM(os.path.join(tempfile.mkdtemp(), "ingest.db"))
+    contract_addressbook_db = make_addressbook_fixture_db()
+    contract_imessage_db = make_imessage_fixture_db()
 
     # 16a. ingest_macos_contacts exists and returns tuple
     try:
-        result = ingest_crm.ingest_macos_contacts()
+        result = ingest_crm.ingest_macos_contacts(db_paths=[contract_addressbook_db])
         check("ingest_contacts_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_contacts_returns_tuple", False)
 
     # 16b. ingest_macos_contacts returns ints
     try:
-        added, facts = ingest_crm.ingest_macos_contacts()
+        added, facts = ingest_crm.ingest_macos_contacts(db_paths=[contract_addressbook_db])
         check("ingest_contacts_returns_ints", isinstance(added, int) and isinstance(facts, int))
     except (AttributeError, TypeError, ValueError):
         check("ingest_contacts_returns_ints", False)
 
     # 16c. ingest_macos_imessage exists and returns tuple
     try:
-        result = ingest_crm.ingest_macos_imessage(days=30)
+        result = ingest_crm.ingest_macos_imessage(days=30, db_path=contract_imessage_db)
         check("ingest_imessage_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_imessage_returns_tuple", False)
 
     # 16d. ingest_macos_imessage accepts days parameter
     try:
-        result = ingest_crm.ingest_macos_imessage(days=7)
+        result = ingest_crm.ingest_macos_imessage(days=7, db_path=contract_imessage_db)
         check("ingest_imessage_days_param", isinstance(result, tuple))
     except (AttributeError, TypeError):
         check("ingest_imessage_days_param", False)
 
     # 16e. ingest_macos_calendar exists and returns tuple
     try:
-        result = ingest_crm.ingest_macos_calendar()
+        result = ingest_crm.ingest_macos_calendar(records=[], attendees=[])
         check("ingest_calendar_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_calendar_returns_tuple", False)
 
     # 16f. ingest_macos_calendar accepts days_back/days_forward
     try:
-        result = ingest_crm.ingest_macos_calendar(days_back=7, days_forward=7)
+        result = ingest_crm.ingest_macos_calendar(
+            days_back=7, days_forward=7, records=[], attendees=[]
+        )
         check("ingest_calendar_days_params", isinstance(result, tuple))
     except (AttributeError, TypeError):
         check("ingest_calendar_days_params", False)
 
     # 16g. ingest_all exists and returns dict
+    ingest_crm.ingest_macos_contacts = lambda: (0, 0)
+    ingest_crm.ingest_macos_imessage = lambda days=90: (0, 0)
+    ingest_crm.ingest_macos_calendar = lambda days_back=30, days_forward=30: (0, 0)
+    ingest_crm.ingest_macos_mail = lambda days=90: (0, 0)
     try:
         result = ingest_crm.ingest_all()
         check("ingest_all_returns_dict", isinstance(result, dict) and "total_facts" in result)
@@ -1573,7 +2436,7 @@ def run_benchmarks():
 
     # 21a. ingest_macos_mail exists and returns tuple
     try:
-        result = email_crm.ingest_macos_mail(days=30)
+        result = email_crm.ingest_macos_mail(days=30, rows=[])
         check("ingest_mail_returns_tuple", isinstance(result, tuple) and len(result) == 2)
     except (AttributeError, TypeError):
         check("ingest_mail_returns_tuple", False)
@@ -1594,7 +2457,7 @@ def run_benchmarks():
 
     # 21d. ingest_macos_mail accepts days param
     try:
-        result = email_crm.ingest_macos_mail(days=7)
+        result = email_crm.ingest_macos_mail(days=7, rows=[])
         check("ingest_mail_days_param", isinstance(result, tuple))
     except (AttributeError, TypeError):
         check("ingest_mail_days_param", False)
@@ -2824,6 +3687,465 @@ def run_benchmarks():
 
     sm_crm.close()
 
+    # ── 52d. Autonomous Data Hygiene (18 tests) ──
+
+    confidence_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-confidence.db"))
+    confidence_crm.add_contact(
+        "Email Erin", email="erin@confidence.test", title="VP"
+    )
+    confidence_crm.add_contact(
+        "Different Person", email="ERIN@CONFIDENCE.TEST"
+    )
+    confidence_crm.add_contact(
+        "Company Cara", email="cara@first.test", company="Acme"
+    )
+    confidence_crm.add_contact(
+        "company-cara", email="cara@second.test", company=" acme "
+    )
+    confidence_crm.add_contact(
+        "Name Nina", email="nina@first.test", company="First"
+    )
+    confidence_crm.add_contact(
+        " name  nina ", email="nina@second.test", company="Second"
+    )
+    confidence_crm.add_contact(
+        "Fuzzy Finn", email="finn@shared.test"
+    )
+    confidence_crm.add_contact(
+        "Fuzzy Fin", email="other@shared.test"
+    )
+
+    try:
+        confidence_suggestions = confidence_crm.suggest_merges()
+        email_confidence = next(
+            item["confidence"] for item in confidence_suggestions
+            if "exact email match" in item["reasons"]
+        )
+        company_confidence = next(
+            item["confidence"] for item in confidence_suggestions
+            if "same normalized name + same company" in item["reasons"]
+        )
+        name_confidence = next(
+            item["confidence"] for item in confidence_suggestions
+            if item["reasons"] == ["same normalized name"]
+        )
+        check(
+            "hygiene_confidence_email_gt_name_company",
+            email_confidence > company_confidence,
+        )
+        check(
+            "hygiene_confidence_name_company_gt_name_only_and_range",
+            company_confidence > name_confidence
+            and all(0.0 <= item["confidence"] <= 1.0
+                    for item in confidence_suggestions),
+        )
+        fuzzy = next(
+            item for item in confidence_suggestions
+            if "fuzzy name + shared email domain" in item["reasons"]
+        )
+        check(
+            "hygiene_confidence_fuzzy_shared_domain",
+            0.70 <= fuzzy["confidence"] < company_confidence,
+        )
+        check(
+            "hygiene_suggestions_deterministic",
+            confidence_suggestions == confidence_crm.suggest_merges(),
+        )
+    except (AttributeError, KeyError, StopIteration, TypeError):
+        check("hygiene_confidence_email_gt_name_company", False)
+        check("hygiene_confidence_name_company_gt_name_only_and_range", False)
+        check("hygiene_confidence_fuzzy_shared_domain", False)
+        check("hygiene_suggestions_deterministic", False)
+    confidence_crm.close()
+
+    hygiene_merge_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-merge.db"))
+    hygiene_keep_id = hygiene_merge_crm.add_contact(
+        "Hygiene Alice", email="keep@hygiene.test", notes="keep-note"
+    )
+    hygiene_drop_id = hygiene_merge_crm.add_contact(
+        "Hygiene Alice Duplicate", email="drop@hygiene.test",
+        company="Hygiene Co", title="CTO",
+    )
+    hygiene_merge_crm.log_activity(
+        "drop@hygiene.test", "call", "Drop-owned call"
+    )
+    hygiene_deal_id = hygiene_merge_crm.add_deal(
+        "drop@hygiene.test", "Drop-owned deal", "$8K"
+    )
+    hygiene_reminder_id = hygiene_merge_crm.set_reminder(
+        "drop@hygiene.test", "2026-08-20", "Drop-owned reminder"
+    )
+    hygiene_merge_crm.set_field(
+        "drop@hygiene.test", "region", "EMEA"
+    )
+    hygiene_field_id = hygiene_merge_crm.conn.execute(
+        "SELECT id FROM custom_fields WHERE contact_id = ?", (hygiene_drop_id,)
+    ).fetchone()[0]
+    hygiene_merge_crm.observe(
+        "contact:keep@hygiene.test", "preferred_channel", "email", "seed"
+    )
+    hygiene_merge_crm.observe(
+        "contact:hygiene_alice_duplicate", "timezone", "CET", "seed"
+    )
+    before_keep = dict(hygiene_merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE id = ?", (hygiene_keep_id,)
+    ).fetchone())
+    before_drop = dict(hygiene_merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE id = ?", (hygiene_drop_id,)
+    ).fetchone())
+    before_owners = {
+        table: [tuple(row) for row in hygiene_merge_crm.conn.execute(
+            f"SELECT id, contact_id FROM {table} ORDER BY id"
+        ).fetchall()]
+        for table in ("activity", "deals", "reminders", "custom_fields")
+    }
+    pre_merge_fact_ids = [row[0] for row in hygiene_merge_crm.conn.execute(
+        "SELECT rowid FROM facts ORDER BY rowid"
+    ).fetchall()]
+
+    try:
+        merge_result = hygiene_merge_crm.merge_contacts(
+            hygiene_keep_id, hygiene_drop_id
+        )
+        moved_activity = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM activity WHERE summary = 'Drop-owned call'"
+        ).fetchone()[0]
+        moved_deal = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM deals WHERE id = ?", (hygiene_deal_id,)
+        ).fetchone()[0]
+        check(
+            "hygiene_merge_moves_activity_deals",
+            moved_activity == hygiene_keep_id and moved_deal == hygiene_keep_id,
+        )
+        merged_contact = dict(hygiene_merge_crm.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (hygiene_keep_id,)
+        ).fetchone())
+        moved_reminder = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM reminders WHERE id = ?",
+            (hygiene_reminder_id,),
+        ).fetchone()[0]
+        moved_field = hygiene_merge_crm.conn.execute(
+            "SELECT contact_id FROM custom_fields WHERE id = ?",
+            (hygiene_field_id,),
+        ).fetchone()[0]
+        check(
+            "hygiene_merge_moves_reminders_fields_and_fills_blanks",
+            moved_reminder == hygiene_keep_id
+            and moved_field == hygiene_keep_id
+            and merged_contact["company"] == "Hygiene Co"
+            and merged_contact["title"] == "CTO",
+        )
+        canonical_entity = hygiene_merge_crm._canonical_contact_entity(before_keep)
+        canonicalized = hygiene_merge_crm.conn.execute(
+            f"""SELECT entity FROM facts
+                WHERE rowid IN ({', '.join('?' for _ in pre_merge_fact_ids)})""",
+            pre_merge_fact_ids,
+        ).fetchall()
+        check(
+            "hygiene_merge_canonicalizes_fact_variants",
+            len(canonicalized) == len(pre_merge_fact_ids)
+            and all(row["entity"] == canonical_entity for row in canonicalized),
+        )
+
+        undo_result = hygiene_merge_crm.undo_merge(merge_result["merge_id"])
+        restored_keep = dict(hygiene_merge_crm.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (hygiene_keep_id,)
+        ).fetchone())
+        restored_drop = dict(hygiene_merge_crm.conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (hygiene_drop_id,)
+        ).fetchone())
+        check(
+            "hygiene_undo_restores_contacts_exactly",
+            undo_result["restored"]
+            and restored_keep == before_keep
+            and restored_drop == before_drop,
+        )
+        restored_owners = {
+            table: [tuple(row) for row in hygiene_merge_crm.conn.execute(
+                f"SELECT id, contact_id FROM {table} ORDER BY id"
+            ).fetchall()]
+            for table in ("activity", "deals", "reminders", "custom_fields")
+        }
+        check(
+            "hygiene_undo_restores_row_ownership_exactly",
+            restored_owners == before_owners,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_merge_moves_activity_deals", False)
+        check("hygiene_merge_moves_reminders_fields_and_fills_blanks", False)
+        check("hygiene_merge_canonicalizes_fact_variants", False)
+        check("hygiene_undo_restores_contacts_exactly", False)
+        check("hygiene_undo_restores_row_ownership_exactly", False)
+    hygiene_merge_crm.close()
+
+    clean_undo_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-undo-clean.db"))
+    clean_undo_crm.add_contact("Clean Keep", email="keep@undo.test")
+    clean_undo_crm.add_contact("Clean Drop", email="drop@undo.test")
+    clean_contacts_before = [dict(row) for row in clean_undo_crm.conn.execute(
+        "SELECT * FROM contacts ORDER BY id"
+    ).fetchall()]
+    try:
+        clean_merge = clean_undo_crm.merge_contacts(
+            "keep@undo.test", "drop@undo.test"
+        )
+        clean_undo = clean_undo_crm.undo_merge(clean_merge["merge_id"])
+        clean_contacts_after = [dict(row) for row in clean_undo_crm.conn.execute(
+            "SELECT * FROM contacts ORDER BY id"
+        ).fetchall()]
+        check(
+            "hygiene_undo_clean_regression",
+            clean_undo["restored"]
+            and clean_contacts_after == clean_contacts_before,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_undo_clean_regression", False)
+    clean_undo_crm.close()
+
+    conflict_undo_crm = CRM(
+        os.path.join(tempfile.mkdtemp(), "hygiene-undo-conflict.db")
+    )
+    conflict_undo_crm.add_contact("Conflict Keep", email="keep@conflict.test")
+    conflict_undo_crm.add_contact("Conflict Drop", email="reused@conflict.test")
+    try:
+        conflict_merge = conflict_undo_crm.merge_contacts(
+            "keep@conflict.test", "reused@conflict.test"
+        )
+        conflict_undo_crm.add_contact(
+            "New Email Owner", email="reused@conflict.test"
+        )
+        conflict_tables = (
+            "contacts", "activity", "deals", "reminders", "custom_fields",
+            "facts",
+        )
+        conflict_before = {
+            table: [dict(row) for row in conflict_undo_crm.conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+            ).fetchall()]
+            for table in conflict_tables
+        }
+        conflict_undo = conflict_undo_crm.undo_merge(conflict_merge["merge_id"])
+        conflict_after = {
+            table: [dict(row) for row in conflict_undo_crm.conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+            ).fetchall()]
+            for table in conflict_tables
+        }
+        check(
+            "hygiene_undo_email_conflict_transactional",
+            isinstance(conflict_undo, dict)
+            and "reused@conflict.test" in conflict_undo.get("error", "")
+            and "taken" in conflict_undo["error"]
+            and conflict_after == conflict_before,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_undo_email_conflict_transactional", False)
+    conflict_undo_crm.close()
+
+    dry_merge_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-dry.db"))
+    dry_merge_crm.add_contact("Dry One", email="dry@merge.test")
+    dry_merge_crm.add_contact("Dry Two", email="DRY@MERGE.TEST")
+    before_dry = {
+        table: [dict(row) for row in dry_merge_crm.conn.execute(
+            f"SELECT * FROM {table} ORDER BY 1"
+        ).fetchall()]
+        for table in ("contacts", "activity", "deals", "reminders",
+                      "custom_fields", "facts")
+    }
+    try:
+        dry_result = dry_merge_crm.auto_merge(threshold=0.9, dry_run=True)
+        after_dry = {
+            table: [dict(row) for row in dry_merge_crm.conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+            ).fetchall()]
+            for table in ("contacts", "activity", "deals", "reminders",
+                          "custom_fields", "facts")
+        }
+        check(
+            "hygiene_auto_merge_dry_run_no_mutation",
+            dry_result["dry_run"] and dry_result["count"] == 1
+            and before_dry == after_dry,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_dry_run_no_mutation", False)
+    dry_merge_crm.close()
+
+    threshold_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-threshold.db"))
+    threshold_crm.add_contact(
+        "Threshold Taylor", email="taylor@one.test", company="One"
+    )
+    threshold_crm.add_contact(
+        " threshold  taylor ", email="taylor@two.test", company="Two"
+    )
+    try:
+        high_threshold = threshold_crm.auto_merge(
+            threshold=0.9, dry_run=False
+        )
+        high_count = threshold_crm.conn.execute(
+            "SELECT COUNT(*) FROM contacts"
+        ).fetchone()[0]
+        low_threshold = threshold_crm.auto_merge(
+            threshold=0.6, dry_run=False
+        )
+        low_count = threshold_crm.conn.execute(
+            "SELECT COUNT(*) FROM contacts"
+        ).fetchone()[0]
+        check(
+            "hygiene_auto_merge_threshold_respected",
+            high_threshold["count"] == 0 and high_count == 2
+            and low_threshold["count"] == 1 and low_count == 1,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_threshold_respected", False)
+    threshold_crm.close()
+
+    default_merge_crm = CRM(
+        os.path.join(tempfile.mkdtemp(), "hygiene-default-name-company.db")
+    )
+    default_merge_crm.add_contact(
+        "Default Dana", email="dana@default-merge.test", company="Default Co"
+    )
+    default_merge_crm.add_contact(
+        " default  dana ", company=" default co "
+    )
+    try:
+        default_name_company_merge = default_merge_crm.auto_merge(dry_run=False)
+        check(
+            "hygiene_auto_merge_name_company_missing_email_default",
+            default_name_company_merge["count"] == 1
+            and default_name_company_merge["merges"][0]["confidence"] == 0.9
+            and len(default_merge_crm.list_contacts()) == 1,
+        )
+    except (AttributeError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_name_company_missing_email_default", False)
+    default_merge_crm.close()
+
+    conflicting_email_merge_crm = CRM(
+        os.path.join(tempfile.mkdtemp(), "hygiene-conflicting-emails.db")
+    )
+    conflicting_email_merge_crm.add_contact(
+        "Conflict Casey", email="casey@first.test", company="Conflict Co"
+    )
+    conflicting_email_merge_crm.add_contact(
+        " conflict casey ", email="casey@second.test", company=" conflict co "
+    )
+    try:
+        conflicting_email_result = conflicting_email_merge_crm.auto_merge(
+            dry_run=False
+        )
+        conflicting_suggestion = conflicting_email_merge_crm.suggest_merges()[0]
+        check(
+            "hygiene_auto_merge_name_company_conflicting_emails_blocked",
+            conflicting_email_result["count"] == 0
+            and conflicting_suggestion["confidence"] == 0.88
+            and len(conflicting_email_merge_crm.list_contacts()) == 2,
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_auto_merge_name_company_conflicting_emails_blocked", False)
+    conflicting_email_merge_crm.close()
+
+    doctor_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-doctor.db"))
+    doctor_contact_id = doctor_crm.add_contact(
+        "Doctor Dana", email="dana@doctor.test"
+    )
+    with doctor_crm.conn:
+        doctor_crm.conn.execute(
+            "UPDATE contacts SET email = ?, status = ? WHERE id = ?",
+            (" Dana@Doctor.TEST ", "impossible", doctor_contact_id),
+        )
+        doctor_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary) VALUES (999, 'note', 'orphan')"
+        )
+        doctor_crm.conn.execute(
+            "INSERT INTO deals (contact_id, name) VALUES (999, 'orphan')"
+        )
+        doctor_crm.conn.execute(
+            """INSERT INTO reminders (contact_id, due_date, note)
+               VALUES (999, '2026-08-20', 'orphan')"""
+        )
+        doctor_crm.conn.execute(
+            """INSERT INTO facts (entity, key, value, source)
+               VALUES ('contact:missing-person', 'role', 'ghost', 'seed')"""
+        )
+    try:
+        doctor_report = doctor_crm.doctor()
+        check(
+            "hygiene_doctor_finds_orphans_and_bad_email",
+            all(len(doctor_report["orphans"][table]) == 1
+                for table in ("activity", "deals", "reminders"))
+            and doctor_report["bad_emails"][0]["normalized"]
+            == "dana@doctor.test",
+        )
+        check(
+            "hygiene_doctor_finds_unresolved_facts_and_statuses",
+            "contact:missing-person" in doctor_report["unresolved_facts"]
+            and doctor_report["invalid_statuses"][0]["status"] == "impossible",
+        )
+    except (AttributeError, IndexError, KeyError, TypeError):
+        check("hygiene_doctor_finds_orphans_and_bad_email", False)
+        check("hygiene_doctor_finds_unresolved_facts_and_statuses", False)
+    doctor_crm.close()
+
+    doctor_fix_crm = CRM(os.path.join(tempfile.mkdtemp(), "hygiene-doctor-fix.db"))
+    fix_contact_id = doctor_fix_crm.add_contact(
+        "Doctor Fix", email="fix@doctor.test"
+    )
+    with doctor_fix_crm.conn:
+        doctor_fix_crm.conn.execute(
+            "UPDATE contacts SET email = ?, status = ? WHERE id = ?",
+            (" Fix@Doctor.TEST ", "impossible", fix_contact_id),
+        )
+        doctor_fix_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary) VALUES (777, 'note', 'orphan')"
+        )
+        doctor_fix_crm.conn.execute(
+            "INSERT INTO deals (contact_id, name) VALUES (777, 'orphan')"
+        )
+        doctor_fix_crm.conn.execute(
+            """INSERT INTO reminders (contact_id, due_date, note)
+               VALUES (777, '2026-08-20', 'orphan')"""
+        )
+        doctor_fix_crm.conn.execute(
+            """INSERT INTO facts (entity, key, value, source)
+               VALUES ('contact:missing-fix', 'role', 'ghost', 'seed')"""
+        )
+    try:
+        before_fix_report = doctor_fix_crm.doctor()
+        fixed_report = doctor_fix_crm.doctor(fix=True)
+        second_report = doctor_fix_crm.doctor()
+        normalized_email = doctor_fix_crm.conn.execute(
+            "SELECT email FROM contacts WHERE id = ?", (fix_contact_id,)
+        ).fetchone()[0]
+        recovered = doctor_fix_crm.conn.execute(
+            "SELECT archived, source FROM contacts WHERE id = 777"
+        ).fetchone()
+        check(
+            "hygiene_doctor_fix_repairs_safe_subset_only",
+            before_fix_report["invalid_statuses"][0]["status"] == "impossible"
+            and before_fix_report["unresolved_facts"] == ["contact:missing-fix"]
+            and all(len(before_fix_report["orphans"][table]) == 1
+                    for table in ("activity", "deals", "reminders"))
+            and len(before_fix_report["bad_emails"]) == 1
+            and not fixed_report["clean"] and fixed_report["issue_count"] == 2
+            and fixed_report["invalid_statuses"]
+            == before_fix_report["invalid_statuses"]
+            and fixed_report["unresolved_facts"] == ["contact:missing-fix"]
+            and all(not fixed_report["orphans"][table]
+                    for table in ("activity", "deals", "reminders"))
+            and not fixed_report["bad_emails"]
+            and second_report["issue_count"] == 2
+            and second_report["invalid_statuses"]
+            == fixed_report["invalid_statuses"]
+            and second_report["unresolved_facts"]
+            == fixed_report["unresolved_facts"]
+            and normalized_email == "fix@doctor.test"
+            and recovered["archived"] == 1 and recovered["source"] == "doctor"
+            and len(fixed_report["fixed"]["emails_normalized"]) == 1
+            and len(fixed_report["fixed"]["orphan_contacts_created"]) == 1,
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, sqlite3.Error):
+        check("hygiene_doctor_fix_repairs_safe_subset_only", False)
+    doctor_fix_crm.close()
+
     # ── 53. Relationship Score (4 tests) ──
 
     rs_crm = CRM(os.path.join(tempfile.mkdtemp(), "rs.db"))
@@ -3635,6 +4957,2601 @@ def run_benchmarks():
 
     dp_crm.close()
 
+    # ── 75. Deal Close Probability (15 tests) ──
+
+    prob_dir = tempfile.mkdtemp()
+    prob_db = os.path.join(prob_dir, "probability.db")
+    prob_crm = CRM(prob_db)
+
+    # Closed history calibrates both the overall win rate and source quality.
+    prob_crm.add_contact("Won Referral One", email="won1@prob.com", status="active_customer",
+                         source="referral", deal_size="$20K/yr")
+    prob_crm.add_contact("Won Referral Two", email="won2@prob.com", status="active_customer",
+                         source="referral", deal_size="$30K/yr")
+    prob_crm.add_contact("Lost Outbound One", email="lost1@prob.com", status="lost",
+                         source="outbound", deal_size="$10K/yr")
+    prob_crm.add_contact("Lost Outbound Two", email="lost2@prob.com", status="churned",
+                         source="outbound", deal_size="$10K/yr")
+    won_id = prob_crm.get_contact("won1@prob.com")["id"]
+    prob_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'call', 'First touch', datetime('now', '-14 days'))",
+        (won_id,)
+    )
+    prob_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'call', 'Second touch', datetime('now', '-7 days'))",
+        (won_id,)
+    )
+
+    prob_crm.add_contact("Early Stage", email="early@prob.com", status="prospect",
+                         source="referral", deal_size="$10K/yr")
+    prob_crm.add_contact("Late Stage", email="late@prob.com", status="verbal_yes",
+                         source="referral", deal_size="$20K/yr")
+    prob_crm.add_contact("Recent Contact", email="recent@prob.com", status="contacted",
+                         source="referral", deal_size="$12K/yr")
+    prob_crm.add_contact("Stale Contact", email="stale@prob.com", status="contacted",
+                         source="referral", deal_size="$12K/yr")
+    prob_crm.add_contact("Frequent Contact", email="frequent@prob.com", status="contacted",
+                         source="referral", deal_size="$15K/yr")
+    prob_crm.add_contact("Sparse Contact", email="sparse@prob.com", status="contacted",
+                         source="referral", deal_size="$15K/yr")
+    prob_crm.add_contact("Good Source", email="good@prob.com", status="met",
+                         source="referral", deal_size="$8K/yr")
+    prob_crm.add_contact("Bad Source", email="bad@prob.com", status="met",
+                         source="outbound", deal_size="$8K/yr")
+
+    for email, days in (("recent@prob.com", 1), ("stale@prob.com", 90),
+                        ("sparse@prob.com", 1)):
+        contact_id = prob_crm.get_contact(email)["id"]
+        prob_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'email', 'Pipeline touch', datetime('now', ?))",
+            (contact_id, f"-{days} days")
+        )
+    frequent_id = prob_crm.get_contact("frequent@prob.com")["id"]
+    for days in (1, 4, 7, 10):
+        prob_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) VALUES (?, 'email', 'Pipeline touch', datetime('now', ?))",
+            (frequent_id, f"-{days} days")
+        )
+    prob_crm.conn.commit()
+
+    # 75a. deal_probability returns the documented top-level shape
+    try:
+        probability = prob_crm.deal_probability("early@prob.com")
+        check("deal_probability_keys", isinstance(probability, dict) and
+              set(probability) == {"probability", "signals", "contact", "status",
+                                   "weights_source", "blend_alpha"})
+    except (AttributeError, TypeError):
+        check("deal_probability_keys", False)
+
+    # 75b. probability is always bounded to [0, 1]
+    try:
+        probabilities = [prob_crm.deal_probability(email)["probability"] for email in
+                         ("early@prob.com", "late@prob.com", "recent@prob.com", "stale@prob.com")]
+        check("deal_probability_range", all(0.0 <= value <= 1.0 for value in probabilities))
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_range", False)
+
+    # 75c. signals expose name, raw value, weight, and numerical effect
+    try:
+        signals = prob_crm.deal_probability("early@prob.com")["signals"]
+        names = {signal["name"] for signal in signals}
+        expected = {"stage", "activity_recency", "activity_frequency", "source", "historical_win_rate"}
+        shape_ok = all(set(signal) == {"name", "value", "weight", "effect"} for signal in signals)
+        check("deal_probability_signal_shape", shape_ok and names == expected)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_signal_shape", False)
+
+    # 75d. a deeper pipeline stage raises probability with other signals equal
+    try:
+        early = prob_crm.deal_probability("early@prob.com")["probability"]
+        late = prob_crm.deal_probability("late@prob.com")["probability"]
+        check("deal_probability_stage_depth", late > early)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_stage_depth", False)
+
+    # 75e. recent activity beats otherwise-identical stale activity
+    try:
+        recent = prob_crm.deal_probability("recent@prob.com")["probability"]
+        stale = prob_crm.deal_probability("stale@prob.com")["probability"]
+        check("deal_probability_recency", recent > stale)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_recency", False)
+
+    # 75f. activity frequency is compared with the learned winning cadence
+    try:
+        frequent = prob_crm.deal_probability("frequent@prob.com")["probability"]
+        sparse = prob_crm.deal_probability("sparse@prob.com")["probability"]
+        check("deal_probability_frequency", frequent > sparse)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_frequency", False)
+
+    # 75g. a historically winning source beats a historically losing source
+    try:
+        good_source = prob_crm.deal_probability("good@prob.com")["probability"]
+        bad_source = prob_crm.deal_probability("bad@prob.com")["probability"]
+        check("deal_probability_source_history", good_source > bad_source)
+    except (AttributeError, TypeError, KeyError):
+        check("deal_probability_source_history", False)
+
+    # 75h. repeated calls over unchanged data are deterministic
+    try:
+        first = prob_crm.deal_probability("frequent@prob.com")
+        second = prob_crm.deal_probability("frequent@prob.com")
+        check("deal_probability_deterministic", first == second)
+    except (AttributeError, TypeError):
+        check("deal_probability_deterministic", False)
+
+    # 75i. an unknown contact returns None
+    try:
+        check("deal_probability_unknown", prob_crm.deal_probability("missing@prob.com") is None)
+    except (AttributeError, TypeError):
+        check("deal_probability_unknown", False)
+
+    # 75j. an empty CRM has a zero-valued empty forecast
+    try:
+        empty_crm = CRM(os.path.join(tempfile.mkdtemp(), "empty-forecast.db"))
+        empty_forecast = empty_crm.forecast()
+        empty_crm.close()
+        check("forecast_empty_crm", empty_forecast["contacts"] == [] and
+              empty_forecast["weighted_pipeline"] == 0 and empty_forecast["count"] == 0)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_empty_crm", False)
+
+    # 75k. forecast contains open contacts and excludes won/lost contacts
+    try:
+        probability_forecast = prob_crm.forecast()
+        names = [row["name"] for row in probability_forecast["contacts"]]
+        check("forecast_open_only", "Early Stage" in names and "Won Referral One" not in names and
+              "Lost Outbound One" not in names)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_open_only", False)
+
+    # 75l. forecast ranks contacts by probability descending
+    try:
+        values = [row["probability"] for row in prob_crm.forecast()["contacts"]]
+        check("forecast_probability_order", values == sorted(values, reverse=True))
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_probability_order", False)
+
+    # 75m. row and aggregate weighted values use deal value * probability
+    try:
+        probability_forecast = prob_crm.forecast()
+        rows = probability_forecast["contacts"]
+        rows_correct = all(row["weighted_value"] == round(row["deal_value"] * row["probability"], 2)
+                           for row in rows)
+        total_correct = probability_forecast["weighted_pipeline"] == round(
+            sum(row["weighted_value"] for row in rows), 2
+        )
+        check("forecast_weighted_value_math", rows_correct and total_correct)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_weighted_value_math", False)
+
+    # 75n. forecast limit truncates rows without changing their rank
+    try:
+        full_forecast = prob_crm.forecast()
+        limited_forecast = prob_crm.forecast(limit=2)
+        check("forecast_limit", len(limited_forecast["contacts"]) == 2 and
+              limited_forecast["contacts"] == full_forecast["contacts"][:2])
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_limit", False)
+
+    # 75o. MCP registers and serves the forecast tool
+    try:
+        import mcp_server
+        original_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = prob_db
+        mcp_names = {tool["name"] for tool in mcp_server.TOOLS}
+        mcp_output = mcp_server.handle_tool_call("crm_forecast", {"limit": 1})
+        mcp_server.DB_PATH = original_mcp_db
+        check("forecast_mcp_tool", "crm_forecast" in mcp_names and
+              '"weighted_pipeline"' in mcp_output and '"contacts"' in mcp_output)
+    except (AttributeError, TypeError, KeyError):
+        check("forecast_mcp_tool", False)
+
+    prob_crm.close()
+
+    # ── 76. Next-Best-Action Queue (12 tests) ──
+
+    empty_actions_crm = CRM(os.path.join(tempfile.mkdtemp(), "empty-actions.db"))
+
+    # 76a. an empty CRM has no recommended actions
+    try:
+        check("next_actions_empty_crm", empty_actions_crm.next_actions() == [])
+    except (AttributeError, TypeError):
+        check("next_actions_empty_crm", False)
+    empty_actions_crm.close()
+
+    actions_dir = tempfile.mkdtemp()
+    actions_db = os.path.join(actions_dir, "next-actions.db")
+    actions_crm = CRM(actions_db)
+
+    # A seven-day winning activity gap calibrates optimal_cadence().
+    actions_crm.add_contact("Won Pattern", email="won@actions.com", status="active_customer")
+    won_pattern_id = actions_crm.get_contact("won@actions.com")["id"]
+    for days in (14, 7):
+        actions_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) "
+            "VALUES (?, 'email', 'Winning touch', datetime('now', ?))",
+            (won_pattern_id, f"-{days} days"),
+        )
+    actions_crm.update_contact("won@actions.com", last_contacted=_date.today().isoformat())
+
+    actions_crm.add_contact("Reminder Rita", email="rita@actions.com", status="contacted")
+    actions_crm.update_contact("rita@actions.com", last_contacted=_date.today().isoformat())
+    actions_crm.set_reminder(
+        "rita@actions.com", (_date.today() - timedelta(days=3)).isoformat(), "Call Rita"
+    )
+
+    actions_crm.add_contact("Mild Cadence", email="mild@actions.com", status="contacted")
+    actions_crm.update_contact(
+        "mild@actions.com", last_contacted=(_date.today() - timedelta(days=10)).isoformat()
+    )
+
+    actions_crm.add_contact("Health Hank", email="hank@actions.com", status="prospect")
+    actions_crm.update_contact("hank@actions.com", last_contacted=_date.today().isoformat())
+
+    actions_crm.add_contact("Stale Deal Sam", email="sam@actions.com", status="contacted")
+    actions_crm.update_contact("sam@actions.com", last_contacted=_date.today().isoformat())
+    actions_crm.add_deal("sam@actions.com", "Expansion", value="$25K", stage="proposal")
+    actions_crm.conn.execute(
+        "UPDATE deals SET updated_at = datetime('now', '-45 days') WHERE contact_id = ?",
+        (actions_crm.get_contact("sam@actions.com")["id"],),
+    )
+
+    actions_crm.add_contact(
+        "Quiet Quinn", email="quinn@actions.com", status="verbal_yes",
+        deal_size="$50K", source="referral",
+    )
+    quiet_id = actions_crm.get_contact("quinn@actions.com")["id"]
+    actions_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) "
+        "VALUES (?, 'meeting', 'Buying signal', datetime('now', '-21 days'))",
+        (quiet_id,),
+    )
+    actions_crm.update_contact(
+        "quinn@actions.com", last_contacted=(_date.today() - timedelta(days=21)).isoformat()
+    )
+
+    actions_crm.add_contact("Limit Leo", email="leo@actions.com", status="prospect")
+
+    for name, email, status in (
+        ("Lost Lola", "lost@actions.com", "lost"),
+        ("Churned Chad", "churned@actions.com", "churned"),
+        ("Archived Aria", "archived@actions.com", "verbal_yes"),
+    ):
+        actions_crm.add_contact(name, email=email, status=status, deal_size="$100K")
+        actions_crm.set_reminder(
+            email, (_date.today() - timedelta(days=30)).isoformat(), "Should stay hidden"
+        )
+    actions_crm.archive_contact("archived@actions.com")
+    actions_crm.conn.commit()
+
+    # 76b. limit truncates without changing the established rank
+    try:
+        all_actions = actions_crm.next_actions(limit=50)
+        limited_actions = actions_crm.next_actions(limit=2)
+        check("next_actions_limit", len(limited_actions) == 2 and
+              limited_actions == all_actions[:2])
+    except (AttributeError, TypeError):
+        check("next_actions_limit", False)
+
+    # 76c. the queue is ordered by urgency descending
+    try:
+        urgency = [item["urgency_score"] for item in actions_crm.next_actions(limit=50)]
+        check("next_actions_urgency_order", urgency == sorted(urgency, reverse=True))
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_urgency_order", False)
+
+    # 76d. an overdue reminder outranks a mildly overdue cadence
+    try:
+        by_name = {item["contact"]: item for item in actions_crm.next_actions(limit=50)}
+        check("next_actions_reminder_priority",
+              by_name["Reminder Rita"]["urgency_score"] >
+              by_name["Mild Cadence"]["urgency_score"])
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_reminder_priority", False)
+
+    # 76e. archived, lost, and churned contacts never enter the queue
+    try:
+        names = {item["contact"] for item in actions_crm.next_actions(limit=50)}
+        check("next_actions_excludes_inactive",
+              not names.intersection({"Archived Aria", "Lost Lola", "Churned Chad"}))
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_excludes_inactive", False)
+
+    # 76f. unchanged CRM data produces byte-for-byte-equivalent rows
+    try:
+        first_actions = actions_crm.next_actions(limit=50)
+        second_actions = actions_crm.next_actions(limit=50)
+        check("next_actions_deterministic", first_actions == second_actions)
+    except (AttributeError, TypeError):
+        check("next_actions_deterministic", False)
+
+    # 76g. every row exposes the documented queue contract
+    try:
+        required = {"contact", "action", "reason", "urgency_score", "signals"}
+        queue = actions_crm.next_actions(limit=50)
+        check("next_actions_required_keys", bool(queue) and
+              all(required.issubset(item) for item in queue))
+    except (AttributeError, TypeError):
+        check("next_actions_required_keys", False)
+
+    # 76h. reasons are always useful display strings
+    try:
+        queue = actions_crm.next_actions(limit=50)
+        check("next_actions_nonempty_reason", bool(queue) and all(
+            isinstance(item["reason"], str) and item["reason"].strip() for item in queue
+        ))
+    except (AttributeError, TypeError, KeyError):
+        check("next_actions_nonempty_reason", False)
+
+    # 76h2. one-sided iMessage traffic surfaces a Reply action
+    try:
+        actions_crm.add_contact("Chatty Charlie", email="charlie@imsg.test", status="contacted")
+        for k, v in (("imessage_sent", "2"), ("imessage_received", "40"), ("imessage_total", "42")):
+            actions_crm.observe("contact:charlie@imsg.test", k, v, source="imessage")
+        charlie = next(item for item in actions_crm.next_actions(limit=50)
+                       if item["contact"] == "Chatty Charlie")
+        check("next_actions_imsg_reciprocity",
+              "one_sided_messaging" in {signal["name"] for signal in charlie["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_imsg_reciprocity", False)
+
+    # 76i. contacts beyond the learned winning cadence expose that signal
+    try:
+        mild = next(item for item in actions_crm.next_actions(limit=50)
+                    if item["contact"] == "Mild Cadence")
+        check("next_actions_cadence_signal",
+              "cadence_overdue" in {signal["name"] for signal in mild["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_cadence_signal", False)
+
+    # 76j. low relationship-health scores surface as an explicit signal
+    try:
+        hank = next(item for item in actions_crm.next_actions(limit=50)
+                    if item["contact"] == "Health Hank")
+        check("next_actions_health_signal",
+              "low_relationship_health" in {signal["name"] for signal in hank["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_health_signal", False)
+
+    # 76k. stale open deals surface through the existing stale_deals detector
+    try:
+        sam = next(item for item in actions_crm.next_actions(limit=50)
+                   if item["contact"] == "Stale Deal Sam")
+        check("next_actions_stale_deal_signal",
+              "stale_open_deal" in {signal["name"] for signal in sam["signals"]})
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_stale_deal_signal", False)
+
+    # 76l. high-probability deals that went quiet get a close-focused action
+    try:
+        quinn = next(item for item in actions_crm.next_actions(limit=50)
+                     if item["contact"] == "Quiet Quinn")
+        signal_names = {signal["name"] for signal in quinn["signals"]}
+        check("next_actions_probability_signal",
+              "high_probability_quiet" in signal_names and quinn["action"] == "Send contract")
+    except (AttributeError, TypeError, KeyError, StopIteration):
+        check("next_actions_probability_signal", False)
+
+    actions_crm.close()
+
+    # ── 77. Experiment Outcome Tracking (14 tests) ──
+
+    experiment_dir = tempfile.mkdtemp()
+    experiment_db = os.path.join(experiment_dir, "experiments.db")
+    experiment_crm = CRM(experiment_db)
+
+    # 77a. logging returns a stable slug and writes running/evolve facts
+    try:
+        reply_slug = experiment_crm.log_experiment(
+            "Reply Rate Test", "Personalized copy raises replies", "reply rate", 10
+        )
+        reply_facts = experiment_crm.facts_about(f"experiment:{reply_slug}")
+        check("experiment_log_slug_source_status",
+              reply_slug == "reply-rate-test" and
+              reply_facts["status"]["value"] == "running" and
+              all(fact["source"] == "evolve" for fact in reply_facts.values()))
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_log_slug_source_status", False)
+
+    # 77b. history round-trips the complete experiment definition
+    try:
+        reply = experiment_crm.experiment_history()[0]
+        check("experiment_history_round_trip",
+              reply["slug"] == reply_slug and
+              reply["name"] == "Reply Rate Test" and
+              reply["hypothesis"] == "Personalized copy raises replies" and
+              reply["metric"] == "reply rate" and
+              reply["baseline_value"] == "10" and
+              reply["result_value"] is None and reply["verdict"] is None)
+    except (AttributeError, TypeError, KeyError, IndexError):
+        check("experiment_history_round_trip", False)
+
+    # 77c. running and completed records expose their lifecycle dates
+    try:
+        before = experiment_crm.experiment_history()[0]
+        experiment_crm.conclude_experiment(reply_slug, 15)
+        after = next(e for e in experiment_crm.experiment_history() if e["slug"] == reply_slug)
+        check("experiment_history_dates",
+              bool(before["started_at"]) and before["concluded_at"] is None and
+              bool(after["started_at"]) and bool(after["concluded_at"]))
+    except (AttributeError, TypeError, KeyError, IndexError):
+        check("experiment_history_dates", False)
+
+    # 77d. a numeric improvement derives a win
+    try:
+        won = experiment_crm.conclude_experiment(reply_slug, 15)
+        check("experiment_conclude_win",
+              won["verdict"] == "win" and won["status"] == "completed" and
+              won["result_value"] == "15")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_win", False)
+
+    # 77e. a numeric decline derives a loss
+    try:
+        loss_slug = experiment_crm.log_experiment("Lower Result", "Test a decline", "score", 10)
+        lost = experiment_crm.conclude_experiment(loss_slug, 5)
+        check("experiment_conclude_loss", lost["verdict"] == "loss")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_loss", False)
+
+    # 77f. an unchanged numeric result derives neutral
+    try:
+        neutral_slug = experiment_crm.log_experiment("Same Result", "Test parity", "score", 10)
+        neutral = experiment_crm.conclude_experiment(neutral_slug, "10.0")
+        check("experiment_conclude_neutral", neutral["verdict"] == "neutral")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_neutral", False)
+
+    # 77g. an explicit verdict wins over numeric comparison
+    try:
+        explicit_slug = experiment_crm.log_experiment("Guardrail Result", "Guardrail matters", "score", 10)
+        explicit = experiment_crm.conclude_experiment(explicit_slug, 20, verdict="loss")
+        check("experiment_explicit_verdict", explicit["verdict"] == "loss")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_explicit_verdict", False)
+
+    # 77h. non-numeric comparison requires an explicit verdict
+    try:
+        text_slug = experiment_crm.log_experiment("Qualitative Test", "Users prefer it", "preference", "old")
+        raised = False
+        try:
+            experiment_crm.conclude_experiment(text_slug, "new")
+        except ValueError:
+            raised = True
+        check("experiment_nonnumeric_requires_verdict", raised)
+    except (AttributeError, TypeError, KeyError):
+        check("experiment_nonnumeric_requires_verdict", False)
+
+    # 77i. status filters separate running work from completed history
+    try:
+        running_history = experiment_crm.experiment_history(status="running")
+        completed_history = experiment_crm.experiment_history(status="completed")
+        check("experiment_status_filter",
+              {e["slug"] for e in running_history} == {text_slug} and
+              all(e["status"] == "completed" for e in completed_history) and
+              len(completed_history) == 4)
+    except (AttributeError, TypeError, KeyError):
+        check("experiment_status_filter", False)
+
+    # 77j. evolve reads the prior outcomes into a track record before logging
+    try:
+        evolved = experiment_crm.evolve()
+        track = evolved["analysis"]["experiment_track_record"]
+        check("evolve_experiment_track_record",
+              set(track) == {"wins", "losses", "running", "win_rate"} and
+              len(track["wins"]) == 1 and len(track["losses"]) == 2 and
+              len(track["running"]) == 1 and track["win_rate"] == 33.3)
+    except (AttributeError, TypeError, KeyError):
+        check("evolve_experiment_track_record", False)
+
+    # 77k. concluding an unknown slug is a handled miss
+    try:
+        check("experiment_unknown_slug",
+              experiment_crm.conclude_experiment("does-not-exist", 1) is None and
+              experiment_crm.conclude_experiment("???", 1) is None)
+    except (AttributeError, TypeError, ValueError):
+        check("experiment_unknown_slug", False)
+
+    # 77l. conclusion accepts the original human-facing name
+    try:
+        name_slug = experiment_crm.log_experiment("Resolve By Name", "Names resolve", "score", 1)
+        by_name = experiment_crm.conclude_experiment("Resolve By Name", 2)
+        check("experiment_conclude_by_name",
+              by_name["slug"] == name_slug and by_name["verdict"] == "win")
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_conclude_by_name", False)
+
+    # 77m. unchanged facts produce deterministic history
+    try:
+        first_history = experiment_crm.experiment_history()
+        second_history = experiment_crm.experiment_history()
+        check("experiment_history_deterministic", first_history == second_history)
+    except (AttributeError, TypeError):
+        check("experiment_history_deterministic", False)
+
+    # 77n. MCP registers and serves log, conclude, and history tools
+    try:
+        import mcp_server
+        original_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = os.path.join(experiment_dir, "mcp-experiments.db")
+        mcp_names = {tool["name"] for tool in mcp_server.TOOLS}
+        logged_json = mcp_server.handle_tool_call("crm_log_experiment", {
+            "name": "MCP Test",
+            "hypothesis": "MCP round trip",
+            "metric": "score",
+            "baseline_value": 1,
+        })
+        concluded_json = mcp_server.handle_tool_call("crm_conclude_experiment", {
+            "slug_or_name": "mcp-test",
+            "result_value": 2,
+        })
+        history_json = mcp_server.handle_tool_call("crm_experiments", {"status": "completed"})
+        mcp_server.DB_PATH = original_mcp_db
+        check("experiment_mcp_tools",
+              {"crm_log_experiment", "crm_conclude_experiment", "crm_experiments"}.issubset(mcp_names) and
+              '"slug": "mcp-test"' in logged_json and '"verdict": "win"' in concluded_json and
+              '"status": "completed"' in history_json)
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("experiment_mcp_tools", False)
+
+    experiment_crm.close()
+
+    # ── 78. Full Import/Export Round-Trip (18 tests) ──
+
+    roundtrip_dir = tempfile.mkdtemp()
+    roundtrip_source = CRM(os.path.join(roundtrip_dir, "source.db"))
+    roundtrip_source.add_contact(
+        "Round Trip Alice", email="alice@roundtrip.test", company="Source Co",
+        title="CTO", deal_size="$42K", status="proposal_drafted",
+        source="referral", notes="Preserve me", tags="vip,technical",
+    )
+    roundtrip_source.add_contact(
+        "Exact Name Bob", company="Name Match Co", status="contacted", notes="No email"
+    )
+    roundtrip_source.log_activity("alice@roundtrip.test", "meeting", "Reviewed proposal")
+    roundtrip_source.add_deal(
+        "alice@roundtrip.test", "Enterprise plan", value="$42K",
+        stage="proposal", notes="Annual contract",
+    )
+    roundtrip_source.observe(
+        "company:source-co", "industry", "robotics", source="benchmark"
+    )
+    roundtrip_source.conn.execute(
+        "UPDATE activity SET created_at = '2025-01-02 03:04:05' WHERE summary = 'Reviewed proposal'"
+    )
+    roundtrip_source.conn.execute(
+        """UPDATE deals SET created_at = '2025-01-03 04:05:06',
+           updated_at = '2025-01-04 05:06:07', closed_at = '2025-01-05 06:07:08'
+           WHERE name = 'Enterprise plan'"""
+    )
+    roundtrip_source.conn.execute(
+        "UPDATE facts SET observed_at = '2025-01-06 07:08:09' WHERE source = 'benchmark'"
+    )
+    roundtrip_source.conn.commit()
+    full_export = roundtrip_source.export_full()
+
+    # 78a. export contract is versioned and contains every core table
+    check(
+        "full_export_contract",
+        set(full_export) == {"schema_version", "contacts", "activity", "deals", "facts"}
+        and full_export["schema_version"] == 1,
+    )
+
+    roundtrip_target = CRM(os.path.join(roundtrip_dir, "target.db"))
+    full_import_result = roundtrip_target.import_full(full_export)
+    restored_export = roundtrip_target.export_full()
+
+    # 78b-e. every table round-trips with identical counts, fields, ids, and timestamps
+    check(
+        "full_roundtrip_contacts",
+        full_import_result["imported"]["contacts"] == len(full_export["contacts"])
+        and restored_export["contacts"] == full_export["contacts"],
+    )
+    check(
+        "full_roundtrip_activity",
+        full_import_result["imported"]["activity"] == len(full_export["activity"])
+        and restored_export["activity"] == full_export["activity"],
+    )
+    check(
+        "full_roundtrip_deals",
+        full_import_result["imported"]["deals"] == len(full_export["deals"])
+        and restored_export["deals"] == full_export["deals"],
+    )
+    check(
+        "full_roundtrip_facts",
+        full_import_result["imported"]["facts"] == len(full_export["facts"])
+        and restored_export["facts"] == full_export["facts"],
+    )
+
+    # 78f. a non-merge restore refuses non-empty databases without changing them
+    before_refused_import = roundtrip_target.export_full()
+    refused_import = roundtrip_target.import_full(full_export)
+    check(
+        "full_import_nonempty_error",
+        "error" in refused_import and roundtrip_target.export_full() == before_refused_import,
+    )
+
+    merge_crm = CRM(os.path.join(roundtrip_dir, "merge.db"))
+    merge_crm.add_contact(
+        "Old Alice Name", email="alice@roundtrip.test", company="Old Co", notes="Old notes"
+    )
+    merge_crm.add_contact("Exact Name Bob", company="Old Name Match Co")
+    first_merge = merge_crm.import_full(full_export, merge=True)
+
+    # 78g. email matches update the existing contact rather than duplicating it
+    alice_rows = merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE email = 'alice@roundtrip.test'"
+    ).fetchall()
+    check(
+        "full_merge_email_upsert",
+        len(alice_rows) == 1 and alice_rows[0]["name"] == "Round Trip Alice"
+        and alice_rows[0]["company"] == "Source Co" and first_merge["updated_contacts"] == 2,
+    )
+
+    # 78h. contacts without email fall back to an exact name upsert
+    bob_rows = merge_crm.conn.execute(
+        "SELECT * FROM contacts WHERE name = 'Exact Name Bob'"
+    ).fetchall()
+    check(
+        "full_merge_exact_name_upsert",
+        len(bob_rows) == 1 and bob_rows[0]["company"] == "Name Match Co",
+    )
+
+    # 78i. repeated merges dedupe timestamped activity and facts
+    counts_before_second_merge = {
+        table: merge_crm.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("activity", "facts")
+    }
+    second_merge = merge_crm.import_full(full_export, merge=True)
+    counts_after_second_merge = {
+        table: merge_crm.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("activity", "facts")
+    }
+    check(
+        "full_merge_dedupes_timestamped_rows",
+        counts_after_second_merge == counts_before_second_merge
+        and second_merge["skipped"]["activity"] == len(full_export["activity"])
+        and second_merge["skipped"]["facts"] == len(full_export["facts"]),
+    )
+
+    # 78j. contact CSV export/import preserves every contact column
+    csv_roundtrip_path = os.path.join(roundtrip_dir, "contacts.csv")
+    roundtrip_source.export_csv(csv_roundtrip_path)
+    csv_roundtrip_crm = CRM(os.path.join(roundtrip_dir, "csv-roundtrip.db"))
+    csv_roundtrip_result = csv_roundtrip_crm.import_csv(csv_roundtrip_path)
+    source_contact_rows = [dict(row) for row in roundtrip_source.conn.execute(
+        "SELECT * FROM contacts ORDER BY id"
+    )]
+    csv_contact_rows = [dict(row) for row in csv_roundtrip_crm.conn.execute(
+        "SELECT * FROM contacts ORDER BY id"
+    )]
+    check(
+        "csv_contact_roundtrip",
+        csv_roundtrip_result == {"imported": 2, "skipped": 0, "errors": 0}
+        and csv_contact_rows == source_contact_rows,
+    )
+
+    # 78k. explicit mappings override odd headers and retain phone as a fact
+    odd_csv_path = os.path.join(roundtrip_dir, "odd-headers.csv")
+    with open(odd_csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("Person Label,Mail Box,Employer,Pipeline,Telephone,Long Memo\n")
+        f.write("Mapped Maya,maya@mapped.test,Odd Co,contacted,+15551234567,Met at demo\n")
+    odd_csv_crm = CRM(os.path.join(roundtrip_dir, "odd-csv.db"))
+    odd_csv_result = odd_csv_crm.import_csv(odd_csv_path, mapping={
+        "name": "Person Label", "email": "Mail Box", "company": "Employer",
+        "status": "Pipeline", "phone": "Telephone", "notes": "Long Memo",
+    })
+    mapped_maya = odd_csv_crm.get_contact("maya@mapped.test")
+    maya_facts = odd_csv_crm.facts_about("contact:mapped maya")
+    check(
+        "csv_odd_header_mapping",
+        odd_csv_result["imported"] == 1 and mapped_maya["company"] == "Odd Co"
+        and mapped_maya["status"] == "contacted" and mapped_maya["notes"] == "Met at demo"
+        and maya_facts["phone"]["value"] == "+15551234567",
+    )
+
+    # 78l. malformed rows count as errors while valid rows still import
+    malformed_csv_path = os.path.join(roundtrip_dir, "malformed.csv")
+    with open(malformed_csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("name,email\n")
+        f.write("Valid Vera,vera@valid.test\n")
+        f.write("Broken Bob,bob@broken.test,unexpected\n")
+    malformed_csv_crm = CRM(os.path.join(roundtrip_dir, "malformed-csv.db"))
+    malformed_csv_result = malformed_csv_crm.import_csv(malformed_csv_path)
+    check(
+        "csv_malformed_rows_counted",
+        malformed_csv_result == {"imported": 1, "skipped": 0, "errors": 1}
+        and malformed_csv_crm.get_contact("vera@valid.test") is not None,
+    )
+
+    # 78m. one vCard file can contain multiple contacts, organizations, and phones
+    multi_vcard_path = os.path.join(roundtrip_dir, "multi.vcf")
+    with open(multi_vcard_path, "w", encoding="utf-8", newline="") as f:
+        f.write("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Vera Card\r\n")
+        f.write("EMAIL;TYPE=WORK:vera@vcard.test\r\nORG:Card Co\r\nTEL;TYPE=CELL:+10000000001\r\nEND:VCARD\r\n")
+        f.write("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Victor Card\r\n")
+        f.write("EMAIL:victor@vcard.test\r\nORG:Other Co\r\nEND:VCARD\r\n")
+    multi_vcard_crm = CRM(os.path.join(roundtrip_dir, "multi-vcard.db"))
+    multi_vcard_count = multi_vcard_crm.import_vcard(multi_vcard_path)
+    check(
+        "vcard_multi_card_parse",
+        multi_vcard_count == 2 and multi_vcard_crm.get_contact("vera@vcard.test")["company"] == "Card Co"
+        and multi_vcard_crm.facts_about("contact:vera card")["phone"]["value"] == "+10000000001",
+    )
+
+    # 78n. folded lines and charset/encoding parameters decode without dependencies
+    folded_vcard_path = os.path.join(roundtrip_dir, "folded.vcf")
+    with open(folded_vcard_path, "wb") as f:
+        f.write(b"BEGIN:VCARD\r\nVERSION:3.0\r\n")
+        f.write(b"FN;CHARSET=ISO-8859-1;ENCODING=QUOTED-PRINTABLE:Jos=E9 Long\r\n")
+        f.write(b"EMAIL:jose@vcard.test\r\nORG:Very Long \r\n Company Name\r\n")
+        f.write(b"TEL;TYPE=WORK:+10000000002\r\nEND:VCARD\r\n")
+    folded_vcard_crm = CRM(os.path.join(roundtrip_dir, "folded-vcard.db"))
+    folded_vcard_count = folded_vcard_crm.import_vcard(folded_vcard_path)
+    folded_contact = folded_vcard_crm.get_contact("jose@vcard.test")
+    check(
+        "vcard_folded_charset_parse",
+        folded_vcard_count == 1 and folded_contact["name"] == "José Long"
+        and folded_contact["company"] == "Very Long Company Name"
+        and folded_vcard_crm.facts_about("contact:josé long")["phone"]["value"] == "+10000000002",
+    )
+
+    # 78o. empty CSV and vCard files are handled as zero-row imports
+    empty_path = os.path.join(roundtrip_dir, "empty")
+    with open(empty_path, "w", encoding="utf-8"):
+        pass
+    check(
+        "empty_import_files",
+        folded_vcard_crm.import_csv(empty_path) == {"imported": 0, "skipped": 0, "errors": 0}
+        and folded_vcard_crm.import_vcard(empty_path) == 0,
+    )
+
+    # 78p. MCP advertises and serves the full export and CSV import tools
+    try:
+        import mcp_server as _roundtrip_mcp
+        original_roundtrip_mcp_db = _roundtrip_mcp.DB_PATH
+        _roundtrip_mcp.DB_PATH = os.path.join(roundtrip_dir, "mcp.db")
+        mcp_tool_names = {tool["name"] for tool in _roundtrip_mcp.TOOLS}
+        mcp_csv_json = _roundtrip_mcp.handle_tool_call("crm_import_csv", {
+            "path": odd_csv_path,
+            "mapping": {"Person Label": "name", "Mail Box": "email"},
+        })
+        mcp_export_json = _roundtrip_mcp.handle_tool_call("crm_export_full", {})
+        _roundtrip_mcp.DB_PATH = original_roundtrip_mcp_db
+        check(
+            "roundtrip_mcp_tools",
+            {"crm_export_full", "crm_import_csv"}.issubset(mcp_tool_names)
+            and '"imported": 1' in mcp_csv_json and '"schema_version": 1' in mcp_export_json,
+        )
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("roundtrip_mcp_tools", False)
+
+    preserve_payload = json.loads(json.dumps(full_export))
+    for contact_row in preserve_payload["contacts"]:
+        if contact_row.get("email") == "alice@roundtrip.test":
+            contact_row.pop("notes")
+        elif contact_row.get("name") == "Exact Name Bob":
+            contact_row["notes"] = None
+    preserve_merge_crm = CRM(os.path.join(roundtrip_dir, "preserve-merge.db"))
+    preserve_merge_crm.add_contact(
+        "Local Alice", email="alice@roundtrip.test", notes="KEEP OMITTED"
+    )
+    preserve_merge_crm.add_contact(
+        "Exact Name Bob", notes="KEEP EXPLICIT NULL"
+    )
+    preserve_merge_result = preserve_merge_crm.import_full(
+        preserve_payload, merge=True
+    )
+
+    # 78q-r. missing and explicit-null import fields preserve populated local data
+    check(
+        "full_merge_preserves_omitted_local_field",
+        "error" not in preserve_merge_result
+        and preserve_merge_crm.get_contact("alice@roundtrip.test")["notes"]
+        == "KEEP OMITTED",
+    )
+    check(
+        "full_merge_preserves_explicit_null_local_field",
+        "error" not in preserve_merge_result
+        and preserve_merge_crm.get_contact("Exact Name Bob")["notes"]
+        == "KEEP EXPLICIT NULL",
+    )
+    preserve_merge_crm.close()
+
+    # ── 79. Multi-hop introduction paths (13 tests) ──
+    intro_dir = tempfile.mkdtemp()
+    intro_db = os.path.join(intro_dir, "intro-paths.db")
+    intro_crm = CRM(intro_db)
+
+    def add_intro_contact(name, email, company=None):
+        intro_crm.add_contact(name, email=email, company=company)
+
+    def make_intro_anchor(name):
+        entity = f"contact:{name.casefold().replace(' ', '_')}"
+        intro_crm.observe(entity, "imessage_total", "120", source="imessage")
+        intro_crm.observe(entity, "message_intensity", "high", source="imessage")
+
+    # A pure two-hop introduced_by chain.
+    add_intro_contact("Two Anchor", "two-anchor@two-anchor.example")
+    add_intro_contact("Two Bridge", "two-bridge@two-bridge.example")
+    add_intro_contact("Two Target", "two-target@two-target.example")
+    make_intro_anchor("Two Anchor")
+    intro_crm.observe("contact:two_anchor", "introduced_by", "contact:two_bridge")
+    intro_crm.observe("contact:two_bridge", "introduced_by", "contact:two_target")
+    two_hop_paths = intro_crm.intro_paths("Two Target", max_hops=2)
+    check(
+        "intro_paths_two_hop_introduced_chain",
+        any(path["path"] == ["Two Anchor", "Two Bridge", "Two Target"]
+            and path["hops"] == 2 for path in two_hop_paths),
+    )
+
+    # A target that requires all three allowed hops.
+    for name, email in (
+        ("Three Anchor", "three-anchor@three-anchor.example"),
+        ("Three First", "three-first@three-first.example"),
+        ("Three Second", "three-second@three-second.example"),
+        ("Three Target", "three-target@three-target.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Three Anchor")
+    intro_crm.observe("contact:three_anchor", "knows", "contact:three_first")
+    intro_crm.observe("contact:three_first", "knows", "contact:three_second")
+    intro_crm.observe("contact:three_second", "knows", "contact:three_target")
+    three_hop_at_two = intro_crm.intro_paths("Three Target", max_hops=2)
+    three_hop_at_three = intro_crm.intro_paths("Three Target", max_hops=3)
+    check("intro_paths_three_hop_respects_max_two", three_hop_at_two == [])
+    check(
+        "intro_paths_three_hop_found_at_three",
+        any(path["path"] == ["Three Anchor", "Three First", "Three Second", "Three Target"]
+            and path["hops"] == 3 for path in three_hop_at_three),
+    )
+
+    # A shorter route must rank before a longer route to the same target.
+    for name, email in (
+        ("Mixed Anchor", "mixed-anchor@mixed-anchor.example"),
+        ("Mixed Short", "mixed-short@mixed-short.example"),
+        ("Mixed Long One", "mixed-long-one@mixed-long-one.example"),
+        ("Mixed Long Two", "mixed-long-two@mixed-long-two.example"),
+        ("Mixed Target", "mixed-target@mixed-target.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Mixed Anchor")
+    intro_crm.observe("contact:mixed_anchor", "knows", "contact:mixed_short")
+    intro_crm.observe("contact:mixed_short", "knows", "contact:mixed_target")
+    intro_crm.observe("contact:mixed_anchor", "introduced_by", "contact:mixed_long_one")
+    intro_crm.observe("contact:mixed_long_one", "introduced_by", "contact:mixed_long_two")
+    intro_crm.observe("contact:mixed_long_two", "introduced_by", "contact:mixed_target")
+    mixed_paths = intro_crm.intro_paths("Mixed Target", max_hops=3)
+    check(
+        "intro_paths_shorter_outranks_longer",
+        len(mixed_paths) >= 2 and mixed_paths[0]["hops"] == 2
+        and any(path["hops"] == 3 for path in mixed_paths),
+    )
+
+    # At equal depth, explicit introduction edges beat a route containing a
+    # shared-domain inference.
+    for name, email in (
+        ("Explicit Anchor", "explicit-anchor@explicit-anchor.example"),
+        ("Explicit Bridge", "explicit-bridge@explicit-bridge.example"),
+        ("Domain Anchor", "domain-anchor@shared.example"),
+        ("Domain Bridge", "domain-bridge@shared.example"),
+        ("Rank Target", "rank-target@rank-target.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Explicit Anchor")
+    make_intro_anchor("Domain Anchor")
+    intro_crm.observe("contact:explicit_anchor", "introduced_by", "contact:explicit_bridge")
+    intro_crm.observe("contact:explicit_bridge", "introduced_by", "contact:rank_target")
+    intro_crm.observe("contact:domain_bridge", "knows", "contact:rank_target")
+    rank_paths = intro_crm.intro_paths("Rank Target", max_hops=2)
+    explicit_path = next((path for path in rank_paths if path["path"][0] == "Explicit Anchor"), None)
+    domain_path = next((path for path in rank_paths if path["path"][0] == "Domain Anchor"), None)
+    check(
+        "intro_paths_explicit_outranks_shared_domain",
+        explicit_path is not None and domain_path is not None
+        and rank_paths.index(explicit_path) < rank_paths.index(domain_path)
+        and explicit_path["strength"] > domain_path["strength"],
+    )
+
+    add_intro_contact("Isolated Target", "isolated@isolated.example")
+    check("intro_paths_no_path", intro_crm.intro_paths("Isolated Target") == [])
+    check(
+        "intro_paths_self_target",
+        intro_crm.intro_paths("me") == [] and intro_crm.intro_paths("Two Anchor") == [],
+    )
+
+    # Closing a loop in the three-hop component must not repeat nodes or run
+    # beyond the requested depth.
+    intro_crm.observe("contact:three_second", "knows", "contact:three_anchor")
+    cycle_paths = intro_crm.intro_paths("Three Target", max_hops=3)
+    check(
+        "intro_paths_cycles_are_bounded",
+        bool(cycle_paths) and len(cycle_paths) < 10
+        and all(len(path["path"]) == path["hops"] + 1
+                and len(set(path["path"])) == len(path["path"])
+                and path["hops"] <= 3 for path in cycle_paths),
+    )
+    check(
+        "intro_paths_deterministic_ordering",
+        intro_crm.intro_paths("Rank Target", max_hops=3)
+        == intro_crm.intro_paths("Rank Target", max_hops=3),
+    )
+    check(
+        "intro_paths_explanations",
+        bool(rank_paths) and all(isinstance(path["explanation"], str)
+                                 and path["explanation"].strip() for path in rank_paths),
+    )
+
+    for name, email in (
+        ("Gmail Anchor", "gmail.anchor@gmail.com"),
+        ("Gmail Bridge", "gmail.bridge@gmail.com"),
+        ("Gmail Target", "gmail.target@gmail.com"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Gmail Anchor")
+    check(
+        "intro_paths_free_mail_domain_creates_no_path",
+        intro_crm.intro_paths("Gmail Target", max_hops=2) == [],
+    )
+
+    for name, email in (
+        ("Corporate Anchor", "anchor@connected-corp.example"),
+        ("Corporate Bridge", "bridge@connected-corp.example"),
+        ("Corporate Target", "target@connected-corp.example"),
+    ):
+        add_intro_contact(name, email)
+    make_intro_anchor("Corporate Anchor")
+    corporate_domain_paths = intro_crm.intro_paths(
+        "Corporate Target", max_hops=2
+    )
+    check(
+        "intro_paths_corporate_shared_domain_still_connects",
+        any(
+            path["path"]
+            == ["Corporate Anchor", "Corporate Bridge", "Corporate Target"]
+            for path in corporate_domain_paths
+        ),
+    )
+
+    try:
+        import mcp_server as _intro_mcp
+        original_intro_mcp_db = _intro_mcp.DB_PATH
+        _intro_mcp.DB_PATH = intro_db
+        intro_tool_names = {tool["name"] for tool in _intro_mcp.TOOLS}
+        intro_mcp_json = _intro_mcp.handle_tool_call("crm_intro_paths", {
+            "target_identifier": "Two Target",
+            "max_hops": 2,
+        })
+        _intro_mcp.DB_PATH = original_intro_mcp_db
+        intro_mcp_paths = __import__("json").loads(intro_mcp_json)
+        check(
+            "intro_paths_mcp_tool",
+            "crm_intro_paths" in intro_tool_names
+            and any(path["path"][-1] == "Two Target" for path in intro_mcp_paths),
+        )
+    except (AttributeError, TypeError, KeyError, ValueError):
+        check("intro_paths_mcp_tool", False)
+
+    intro_crm.close()
+
+    # ── 80. macOS ingest fixtures and transform hardening (16 tests) ──
+    ingest_dir = tempfile.mkdtemp()
+    ingest_crm = CRM(os.path.join(ingest_dir, "ingest.db"))
+
+    addressbook_db = make_addressbook_fixture_db([{
+        "first": "Fixture",
+        "last": "Person",
+        "company": "Fixture Co",
+        "title": "CTO",
+        "notes": "Imported from the fixture",
+        "emails": ["fixture@example.com", "fixture.alt@example.com"],
+        "phones": ["(415) 555-0100"],
+    }])
+    contacts_added, contact_facts_added = ingest_crm.ingest_macos_contacts(
+        db_paths=[addressbook_db]
+    )
+    fixture_contact = ingest_crm.get_contact("fixture@example.com")
+
+    # 80a. the actual AddressBook SQLite query feeds the contact transform
+    check(
+        "ingest_addressbook_contact_mapping",
+        contacts_added == 1 and contact_facts_added > 0
+        and fixture_contact["name"] == "Fixture Person"
+        and fixture_contact["company"] == "Fixture Co"
+        and fixture_contact["title"] == "CTO",
+    )
+
+    # 80b. all AddressBook emails, phones, company, and notes reach the graph
+    addressbook_history = ingest_crm.history_of("contact:fixture person")
+    check(
+        "ingest_addressbook_fact_mapping",
+        {fact["value"] for fact in addressbook_history if fact["key"] == "email"}
+        == {"fixture@example.com", "fixture.alt@example.com"}
+        and ingest_crm.facts_about("contact:fixture person")["company"]["value"] == "Fixture Co"
+        and ingest_crm.facts_about("contact:fixture person")["notes"]["value"]
+        == "Imported from the fixture"
+        and ingest_crm.facts_about("phone:+14155550100")["name"]["value"]
+        == "Fixture Person",
+    )
+
+    imessage_db = make_imessage_fixture_db([
+        ("(415) 555-0100", 8, 12),       # threshold: 20 is low
+        ("FIXTURE@EXAMPLE.COM", 9, 12),  # threshold: 21 is medium
+        ("medium@example.com", 50, 50),  # threshold: 100 is medium
+        ("high@example.com", 51, 50),    # threshold: 101 is high
+    ])
+    handles_found, imessage_facts_added = ingest_crm.ingest_macos_imessage(
+        days=2, db_path=imessage_db
+    )
+    phone_message_facts = ingest_crm.facts_about("phone:+14155550100")
+
+    # 80c. the actual chat.db aggregate query returns every fixture handle
+    check(
+        "ingest_imessage_fixture_query",
+        handles_found == 4 and imessage_facts_added > 0,
+    )
+
+    # 80d. sent, received, and total counts survive aggregation exactly
+    check(
+        "ingest_imessage_counts",
+        phone_message_facts["imessage_total"]["value"] == "20"
+        and phone_message_facts["imessage_sent"]["value"] == "8"
+        and phone_message_facts["imessage_received"]["value"] == "12",
+    )
+
+    # 80e. intensity boundaries stay low <=20, medium <=100, high >100
+    check(
+        "ingest_imessage_intensity_thresholds",
+        phone_message_facts["message_intensity"]["value"] == "low"
+        and ingest_crm.facts_about("contact:fixture@example.com")["message_intensity"]["value"] == "medium"
+        and ingest_crm.facts_about("contact:medium@example.com")["message_intensity"]["value"] == "medium"
+        and ingest_crm.facts_about("contact:high@example.com")["message_intensity"]["value"] == "high",
+    )
+
+    # 80f. reciprocity retains both directions rather than collapsing to total
+    check(
+        "ingest_imessage_reciprocity",
+        phone_message_facts["imessage_ratio"]["value"] == "8:12",
+    )
+
+    # 80g. formatted phones and case-varied emails both resolve to the contact
+    matched_handles = {
+        fact["value"] for fact in ingest_crm.history_of(
+            "contact:fixture person", key="imessage_handle"
+        )
+    }
+    check(
+        "ingest_imessage_contact_variants",
+        matched_handles == {"(415) 555-0100", "FIXTURE@EXAMPLE.COM"},
+    )
+
+    calendar_records, calendar_attendees = make_calendar_fixture_records()
+    events_found, calendar_facts_added = ingest_crm.ingest_macos_calendar(
+        records=calendar_records, attendees=calendar_attendees
+    )
+
+    # 80h. fake Calendar records exercise the real meeting transform
+    check(
+        "ingest_calendar_event_mapping",
+        events_found == 1 and calendar_facts_added > 0
+        and ingest_crm.facts_about("meeting:fixture person planning")["location"]["value"]
+        == "Fixture Room",
+    )
+
+    # 80i. email and named attendees aggregate onto their contact entities
+    check(
+        "ingest_calendar_attendees",
+        ingest_crm.facts_about("contact:guest@example.com")["meeting"]["value"]
+        == "Fixture Person Planning"
+        and ingest_crm.facts_about("contact:named guest")["meeting"]["value"]
+        == "Fixture Person Planning"
+        and ingest_crm.facts_about("contact:fixture person")["meeting"]["value"]
+        == "Fixture Person Planning",
+    )
+
+    mail_records = make_mail_fixture_records()
+    threads_found, mail_facts_added = ingest_crm.ingest_macos_mail(rows=mail_records)
+    fixture_mail_facts = ingest_crm.facts_about("email:fixture@example.com")
+
+    # 80j. one returned Envelope Index row counts as one thread
+    check(
+        "ingest_mail_thread_count",
+        threads_found == 3 and mail_facts_added > 0,
+    )
+
+    # 80k. per-address direction counts and case-insensitive contact linking work
+    check(
+        "ingest_mail_address_aggregation",
+        fixture_mail_facts["email_total"]["value"] == "3"
+        and fixture_mail_facts["email_sent"]["value"] == "2"
+        and fixture_mail_facts["email_received"]["value"] == "1"
+        and ingest_crm.facts_about("contact:fixture person")["email_total"]["value"] == "3",
+    )
+
+    fact_count_before_empty = ingest_crm.conn.execute(
+        "SELECT COUNT(*) FROM facts"
+    ).fetchone()[0]
+    empty_addressbook_db = make_addressbook_fixture_db()
+
+    # 80l. an empty AddressBook fixture produces no contacts or facts
+    check(
+        "ingest_empty_addressbook",
+        ingest_crm.ingest_macos_contacts(db_paths=[empty_addressbook_db]) == (0, 0)
+        and ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        == fact_count_before_empty,
+    )
+
+    empty_imessage_db = make_imessage_fixture_db()
+
+    # 80m. an empty chat.db fixture produces no handles or facts
+    check(
+        "ingest_empty_imessage",
+        ingest_crm.ingest_macos_imessage(days=2, db_path=empty_imessage_db) == (0, 0)
+        and ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        == fact_count_before_empty,
+    )
+
+    # 80n. empty injected Calendar and Mail sources also stay at zero
+    check(
+        "ingest_empty_record_sources",
+        ingest_crm.ingest_macos_calendar(records=[], attendees=[]) == (0, 0)
+        and ingest_crm.ingest_macos_mail(rows=[]) == (0, 0)
+        and ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        == fact_count_before_empty,
+    )
+
+    # 80o. malformed rows are skipped while later valid rows are still ingested
+    malformed_contacts = ingest_crm.ingest_macos_contacts(records=[
+        None,
+        {"first": "Valid", "last": "Contact", "emails": [], "phones": []},
+    ])
+    malformed_messages = ingest_crm.ingest_macos_imessage(rows=[
+        {"handle": "broken@example.com", "msg_count": "not-a-number"},
+        {"handle": "valid@example.com", "msg_count": 1, "sent": 1, "received": 0},
+    ])
+    malformed_calendar = ingest_crm.ingest_macos_calendar(
+        records=[None, {"title": "Valid Fixture Event", "start_date": None}],
+        attendees=[None],
+    )
+    malformed_mail = ingest_crm.ingest_macos_mail(rows=[
+        {"from_addr": 42, "to_addr": None},
+        {"from_addr": "valid@example.com", "to_addr": "other@example.com", "date_sent": 1},
+    ])
+    check(
+        "ingest_malformed_rows_skipped",
+        malformed_contacts[1] > 0 and malformed_messages[0] == 1
+        and malformed_calendar[0] == 1 and malformed_mail[0] == 1,
+    )
+
+    # 80p. re-running the same fixtures refreshes facts without duplicating rows
+    counts_before_reingest = (
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+    )
+    ingest_crm.ingest_macos_contacts(db_paths=[addressbook_db])
+    ingest_crm.ingest_macos_imessage(days=2, db_path=imessage_db)
+    ingest_crm.ingest_macos_calendar(records=calendar_records, attendees=calendar_attendees)
+    ingest_crm.ingest_macos_mail(rows=mail_records)
+    counts_after_reingest = (
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+        ingest_crm.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+    )
+    check("ingest_reingest_idempotent", counts_after_reingest == counts_before_reingest)
+
+    # ── 81. Cadence Auto-Tuning (12 tests) ──
+
+    cadence_dir = tempfile.mkdtemp()
+    cadence_db = os.path.join(cadence_dir, "cadence.db")
+    cadence_crm = CRM(cadence_db)
+
+    # 81a. an empty CRM returns the complete static fallback schedule
+    static_cadence = cadence_crm.tuned_cadence()
+    check("tuned_cadence_defaults", static_cadence == CRM.CADENCE_DEFAULTS)
+
+    # 81b. status lookup returns the same scalar interval as the full schedule
+    check("tuned_cadence_status_lookup",
+          cadence_crm.tuned_cadence("proposal_drafted") == static_cadence["proposal_drafted"])
+
+    # One ten-day gap in won history becomes the learned contacted-stage base.
+    cadence_crm.add_contact("Cadence Winner", email="winner@cadence.test",
+                            status="active_customer")
+    cadence_winner_id = cadence_crm.get_contact("winner@cadence.test")["id"]
+    for days in (20, 10):
+        cadence_crm.conn.execute(
+            "INSERT INTO activity (contact_id, type, summary, created_at) "
+            "VALUES (?, 'email', 'Winning cadence fixture', datetime('now', ?))",
+            (cadence_winner_id, f"-{days} days"),
+        )
+    cadence_crm.conn.commit()
+
+    # 81c. learned values scale from the winning gap and report their source
+    learned_cadence = cadence_crm.tuned_cadence()
+    learned_rows = cadence_crm._tuned_cadence_rows()
+    check("tuned_cadence_learned_values",
+          learned_cadence["contacted"] == 10 and learned_cadence["prospect"] == 20
+          and all(row["source"] == "learned" for row in learned_rows))
+
+    # 81d. late-stage follow-up remains tighter than top-of-funnel follow-up
+    check("tuned_cadence_stage_shape",
+          learned_cadence["verbal_yes"] < learned_cadence["proposal_drafted"]
+          < learned_cadence["prospect"])
+
+    cadence_crm.add_contact("Just Past", email="past@cadence.test", status="contacted")
+    cadence_crm.update_contact(
+        "past@cadence.test",
+        last_contacted=(_date.today() - timedelta(days=11)).isoformat(),
+    )
+    cadence_crm.add_contact("Still Inside", email="inside@cadence.test", status="contacted")
+    cadence_crm.update_contact(
+        "inside@cadence.test",
+        last_contacted=(_date.today() - timedelta(days=10)).isoformat(),
+    )
+    cadence_actions = {item["contact"]: item for item in cadence_crm.next_actions(limit=50)}
+
+    # 81e. a contact just past the tuned interval is cadence-overdue
+    check("next_actions_uses_tuned_boundary_past",
+          "cadence_overdue" in {signal["name"]
+                                 for signal in cadence_actions["Just Past"]["signals"]})
+
+    # 81f. a contact exactly inside the tuned interval is not cadence-overdue
+    check("next_actions_uses_tuned_boundary_inside",
+          "cadence_overdue" not in {signal["name"]
+                                     for signal in cadence_actions["Still Inside"]["signals"]})
+
+    # 81g. stale-contact detection uses the same per-status boundary
+    stale_cadence_names = {contact["name"] for contact in cadence_crm.stale_contacts()}
+    check("stale_contacts_use_tuned_cadence",
+          "Just Past" in stale_cadence_names and "Still Inside" not in stale_cadence_names)
+
+    # 81h. reminders without an explicit date use the contact's tuned status cadence
+    cadence_crm.add_contact("Verbal Val", email="val@cadence.test", status="verbal_yes")
+    cadence_reminder_id = cadence_crm.set_reminder(
+        "val@cadence.test", note="Send the contract"
+    )
+    cadence_due = cadence_crm.conn.execute(
+        "SELECT due_date FROM reminders WHERE id = ?", (cadence_reminder_id,)
+    ).fetchone()["due_date"]
+    check("reminder_default_uses_tuned_cadence",
+          cadence_due == (_date.today() + timedelta(
+              days=learned_cadence["verbal_yes"]
+          )).isoformat())
+
+    # 81i. adding activity invalidates a previously cached no-win result
+    cache_crm = CRM(os.path.join(tempfile.mkdtemp(), "cadence-cache.db"))
+    cache_crm.add_contact("Cache Winner", email="cache@cadence.test",
+                          status="active_customer")
+    cache_winner_id = cache_crm.get_contact("cache@cadence.test")["id"]
+    cache_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) "
+        "VALUES (?, 'email', 'First cache touch', datetime('now', '-8 days'))",
+        (cache_winner_id,),
+    )
+    cache_crm.conn.commit()
+    cached_default = cache_crm.tuned_cadence("contacted")
+    cache_crm.conn.execute(
+        "INSERT INTO activity (contact_id, type, summary, created_at) "
+        "VALUES (?, 'email', 'Second cache touch', datetime('now'))",
+        (cache_winner_id,),
+    )
+    cache_crm.conn.commit()
+    check("tuned_cadence_cache_invalidates",
+          cached_default == CRM.CADENCE_DEFAULTS["contacted"]
+          and cache_crm.tuned_cadence("contacted") == 8)
+    cache_crm.close()
+
+    # 81j. unchanged activity history produces deterministic values
+    check("tuned_cadence_deterministic",
+          cadence_crm.tuned_cadence() == cadence_crm.tuned_cadence())
+
+    # 81k. evolve reports tuned and static values side by side
+    cadence_evolution = cadence_crm.evolve()
+    check("evolve_reports_tuned_cadence",
+          cadence_evolution["cadence"]["contacted"] == {
+              "tuned_days": 10, "default_days": 7, "source": "learned",
+          })
+
+    # 81l. MCP registers and serves the tuned-cadence tool
+    import mcp_server
+    original_cadence_mcp_db = mcp_server.DB_PATH
+    mcp_server.DB_PATH = cadence_db
+    cadence_mcp_names = {tool["name"] for tool in mcp_server.TOOLS}
+    cadence_mcp_value = json.loads(
+        mcp_server.handle_tool_call("crm_tuned_cadence", {"status": "verbal_yes"})
+    )
+    mcp_server.DB_PATH = original_cadence_mcp_db
+    check("tuned_cadence_mcp_tool",
+          "crm_tuned_cadence" in cadence_mcp_names
+          and cadence_mcp_value == learned_cadence["verbal_yes"])
+
+    # ── 82. Benchmark Integrity — hot-operation regression gate (8 tests) ──
+
+    integrity_perf_crm = make_performance_fixture()
+    performance_operations = (
+        ("list_contacts", integrity_perf_crm.list_contacts),
+        (
+            "get_contact_email",
+            lambda: integrity_perf_crm.get_contact(
+                "perf+250@tenant-50.benchmark.test"
+            ),
+        ),
+        (
+            "get_contact_partial_name",
+            lambda: integrity_perf_crm.get_contact("Contact 250"),
+        ),
+        ("pipeline", integrity_perf_crm.pipeline),
+        ("next_actions_10", lambda: integrity_perf_crm.next_actions(10)),
+        ("forecast", integrity_perf_crm.forecast),
+        (
+            "intro_paths",
+            lambda: integrity_perf_crm.intro_paths(
+                "perf+499@tenant-99.benchmark.test"
+            ),
+        ),
+        ("export_full", integrity_perf_crm.export_full),
+    )
+    for operation_name, operation in performance_operations:
+        threshold_ms = PERFORMANCE_THRESHOLDS_MS[operation_name]
+        elapsed_ms = None
+        operation_error = None
+        try:
+            operation()  # Warm caches so this gate measures the hot path.
+            started = time.perf_counter()
+            operation()
+            elapsed_ms = (time.perf_counter() - started) * 1000
+        except Exception as exc:
+            operation_error = f"{type(exc).__name__}: {exc}"
+        PERFORMANCE_TIMINGS.append({
+            "name": operation_name,
+            "elapsed_ms": elapsed_ms,
+            "threshold_ms": threshold_ms,
+            "error": operation_error,
+        })
+        check(
+            f"perf_regression_{operation_name}",
+            operation_error is None and elapsed_ms <= threshold_ms,
+        )
+    integrity_perf_crm.close()
+
+    # ── 83. Benchmark Integrity — seeded CRUD properties (8 tests) ──
+
+    property_crm = CRM(os.path.join(tempfile.mkdtemp(), "integrity-property.db"))
+    property_rng = random.Random(PROPERTY_SEED)
+    property_invariants = {
+        "no_exception": True,
+        "add_returns_id": True,
+        "get_after_add_identity": True,
+        "add_roundtrip_fields": True,
+        "update_targeted_field": True,
+        "update_preserves_other_fields": True,
+        "archive_preserves_record": True,
+        "archive_visibility": True,
+    }
+    property_exceptions = []
+    unicode_names = (
+        "Zoë 東京", "Łukasz 🚀", "नमस्ते दोस्त", "Мария Иванова",
+        "李雷", "Renée O’Connor", "أمل الزهراني", "Δημήτρης Παπάς",
+    )
+    statuses = (
+        "prospect", "contacted", "met", "proposal_drafted",
+        "verbal_yes", "active_customer", "lost",
+    )
+    tracked_input_fields = (
+        "name", "email", "company", "title", "deal_size", "status",
+        "source", "notes", "tags",
+    )
+    update_fields = (
+        "name", "company", "title", "deal_size", "status", "source",
+        "notes", "tags", "last_contacted",
+    )
+    preserved_fields = (
+        "id", "email", "name", "company", "title", "deal_size", "status",
+        "source", "notes", "tags", "archived", "last_contacted", "created_at",
+    )
+
+    for index in range(200):
+        base_name = property_rng.choice(unicode_names)
+        name = f"{base_name} {index:03d}"
+        if index % 41 == 0:
+            name += " " + ("界" * 512)
+
+        odd_token = f"{property_rng.getrandbits(32):08x}"
+        email_shapes = (
+            f"prop.{index}+{odd_token}@sub-{index % 17}.example.test",
+            f"odd_%{index}-{odd_token}@x{index % 19}.example.test",
+            f"UPPER+{index}.{odd_token}@Case-{index % 13}.Example.TEST",
+        )
+        email = None if index % 11 == 0 else email_shapes[index % len(email_shapes)]
+        contact_input = {
+            "name": name,
+            "email": email,
+            "company": "" if index % 4 == 0 else f"Café 会社 {property_rng.randrange(50)}",
+            "title": "" if index % 5 == 0 else f"R&D / 🛠️ {property_rng.randrange(30)}",
+            "deal_size": "" if index % 6 == 0 else f"${property_rng.randrange(1, 999)}K",
+            "status": property_rng.choice(statuses),
+            "source": "" if index % 7 == 0 else "seeded property pass",
+            "notes": (
+                "長" * 4096 if index % 37 == 0
+                else ("" if index % 3 == 0 else f"Odd note ☃ {odd_token}\nline two")
+            ),
+            "tags": "" if index % 8 == 0 else f"δelta,{property_rng.randrange(20)},🌍",
+        }
+
+        try:
+            contact_id = property_crm.add_contact(**contact_input)
+            property_invariants["add_returns_id"] &= (
+                isinstance(contact_id, int) and contact_id > 0
+            )
+
+            identifier = email if email is not None else name
+            stored = property_crm.get_contact(identifier)
+            property_invariants["get_after_add_identity"] &= bool(
+                stored and stored["id"] == contact_id
+            )
+            property_invariants["add_roundtrip_fields"] &= bool(
+                stored and all(
+                    stored[field] == contact_input[field]
+                    for field in tracked_input_fields
+                )
+            )
+
+            target_field = update_fields[index % len(update_fields)]
+            update_values = {
+                "name": f"更新 {base_name} {index:03d}",
+                "company": f"Updated 公司 {index}",
+                "title": f"Updated title 🧪 {index}",
+                "deal_size": f"${1000 + index}K",
+                "status": statuses[(statuses.index(contact_input["status"]) + 1) % len(statuses)],
+                "source": f"updated-source-{index}",
+                "notes": "更新-" + (("🧠" * 2048) if index % 31 == 0 else str(index)),
+                "tags": f"updated,βeta,{index}",
+                "last_contacted": f"2026-02-{1 + (index % 28):02d}",
+            }
+            target_value = update_values[target_field]
+            updated = property_crm.update_contact(
+                identifier, **{target_field: target_value}
+            )
+            post_identifier = (
+                email if email is not None
+                else (target_value if target_field == "name" else name)
+            )
+            after_update = property_crm.get_contact(post_identifier)
+            property_invariants["update_targeted_field"] &= bool(
+                updated and after_update
+                and updated[target_field] == target_value
+                and after_update[target_field] == target_value
+            )
+            property_invariants["update_preserves_other_fields"] &= bool(
+                stored and after_update and all(
+                    stored[field] == after_update[field]
+                    for field in preserved_fields if field != target_field
+                )
+            )
+
+            archived = property_crm.archive_contact(post_identifier)
+            archived_record = property_crm.get_contact(post_identifier)
+            property_invariants["archive_preserves_record"] &= bool(
+                archived is True and archived_record
+                and archived_record["id"] == contact_id
+                and archived_record["archived"] == 1
+                and all(
+                    archived_record[field] == after_update[field]
+                    for field in preserved_fields
+                    if field not in {"archived"}
+                )
+            )
+            visible_ids = {
+                row["id"] for row in property_crm.list_contacts()
+            }
+            all_ids = {
+                row["id"] for row in property_crm.list_contacts(
+                    include_archived=True
+                )
+            }
+            property_invariants["archive_visibility"] &= (
+                contact_id not in visible_ids and contact_id in all_ids
+            )
+        except Exception as exc:
+            property_invariants["no_exception"] = False
+            for invariant_name in property_invariants:
+                if invariant_name != "no_exception":
+                    property_invariants[invariant_name] = False
+            if len(property_exceptions) < 3:
+                property_exceptions.append(
+                    f"case {index}: {type(exc).__name__}: {exc}"
+                )
+
+    exception_detail = (
+        f" ({'; '.join(property_exceptions)})" if property_exceptions else ""
+    )
+    check(
+        f"property_crud_no_exception{exception_detail}",
+        property_invariants["no_exception"],
+    )
+    check("property_crud_add_returns_id", property_invariants["add_returns_id"])
+    check(
+        "property_crud_get_after_add_identity",
+        property_invariants["get_after_add_identity"],
+    )
+    check(
+        "property_crud_add_roundtrip_fields",
+        property_invariants["add_roundtrip_fields"],
+    )
+    check(
+        "property_crud_update_targeted_field",
+        property_invariants["update_targeted_field"],
+    )
+    check(
+        "property_crud_update_preserves_other_fields",
+        property_invariants["update_preserves_other_fields"],
+    )
+    check(
+        "property_crud_archive_preserves_record",
+        property_invariants["archive_preserves_record"],
+    )
+    check(
+        "property_crud_archive_visibility",
+        property_invariants["archive_visibility"],
+    )
+    property_crm.close()
+
+    # ── 84. Forecast Calibration & Learned Weights (20 tests) ──
+
+    prediction_crm = CRM(os.path.join(tempfile.mkdtemp(), "prediction-facts.db"))
+    prediction_crm.add_contact(
+        "Predict Pat", email="pat@prediction.test", status="prospect",
+        source="referral",
+    )
+    prediction_crm.deal_probability("pat@prediction.test")
+    recorded_prediction_facts = prediction_crm.conn.execute(
+        """SELECT key, value, source, observed_at FROM facts
+           WHERE entity = 'prediction:pat@prediction.test'
+           ORDER BY key"""
+    ).fetchall()
+
+    # 84a. A public prediction records all three forecast facts with timestamps.
+    check(
+        "prediction_facts_recorded",
+        {row["key"] for row in recorded_prediction_facts}
+        == {"probability", "status", "signals_snapshot"}
+        and all(row["source"] == "forecast" and row["observed_at"]
+                for row in recorded_prediction_facts),
+    )
+
+    # 84b. An unchanged prediction is below the materiality threshold.
+    prediction_crm.deal_probability("pat@prediction.test")
+    unchanged_fact_count = prediction_crm.conn.execute(
+        "SELECT COUNT(*) FROM facts WHERE entity = 'prediction:pat@prediction.test'"
+    ).fetchone()[0]
+    check("prediction_material_dedupe", unchanged_fact_count == 3)
+
+    # 84c. A stage-driven material probability change records a second event.
+    prediction_crm.update_contact("pat@prediction.test", status="verbal_yes")
+    prediction_crm.deal_probability("pat@prediction.test")
+    material_probability_count = prediction_crm.conn.execute(
+        """SELECT COUNT(*) FROM facts
+           WHERE entity = 'prediction:pat@prediction.test'
+             AND key = 'probability' AND source = 'forecast'"""
+    ).fetchone()[0]
+    check("prediction_material_change_recorded", material_probability_count == 2)
+
+    # 84d. Bulk forecast records predictions through the same path.
+    prediction_crm.add_contact(
+        "Forecast Fran", email="fran@prediction.test", status="contacted"
+    )
+    prediction_crm.forecast()
+    forecast_fact_keys = {
+        row["key"] for row in prediction_crm.conn.execute(
+            """SELECT key FROM facts
+               WHERE entity = 'prediction:fran@prediction.test'
+                 AND source = 'forecast'"""
+        ).fetchall()
+    }
+    check(
+        "forecast_records_prediction_facts",
+        forecast_fact_keys == {"probability", "status", "signals_snapshot"},
+    )
+    prediction_crm.close()
+
+    empty_calibration_crm = CRM(os.path.join(tempfile.mkdtemp(), "empty-calibration.db"))
+    empty_calibration = empty_calibration_crm.calibration_report()
+    # 84e. Empty calibration data is explicit rather than an error or NaN.
+    check(
+        "calibration_empty_case",
+        empty_calibration["scored_predictions"] == 0
+        and empty_calibration["brier_score"] is None
+        and empty_calibration["weights_source"] == "default"
+        and len(empty_calibration["reliability"]) == 10,
+    )
+    empty_calibration_crm.close()
+
+    calibration_crm = CRM(os.path.join(tempfile.mkdtemp(), "calibration.db"))
+
+    def seed_closed_prediction(
+            crm, index, probability, outcome, stage, scores,
+            prior_probabilities=()):
+        email = f"closed-{index}@calibration.test"
+        crm.add_contact(
+            f"Closed Calibration {index}", email=email, status="prospect",
+            source="fixture",
+        )
+        entity = f"prediction:{email}"
+        snapshot = {
+            name: {
+                "value": stage if name == "stage" else scores[name],
+                "score": scores[name],
+            }
+            for name in CRM.FORECAST_SIGNAL_NAMES
+        }
+        prediction_rows = []
+        for rewrite_index, recorded_probability in enumerate(prior_probabilities):
+            observed_at = (
+                f"2026-01-{1 + index:02d} "
+                f"12:00:00.{rewrite_index:06d}"
+            )
+            prediction_rows.append(
+                (entity, "probability", str(recorded_probability), observed_at),
+            )
+        observed_at = (
+            f"2026-01-{1 + index:02d} "
+            f"12:00:00.{len(prior_probabilities):06d}"
+        )
+        prediction_rows.extend((
+            (entity, "probability", str(probability), observed_at),
+            (entity, "status", stage, observed_at),
+            (entity, "signals_snapshot", json.dumps(snapshot, sort_keys=True),
+             observed_at),
+        ))
+        with crm.conn:
+            crm.conn.executemany(
+                """INSERT INTO facts (entity, key, value, source, observed_at)
+                   VALUES (?, ?, ?, 'forecast', ?)""",
+                prediction_rows,
+            )
+        crm.update_contact(email, status=outcome)
+
+    low_scores = {name: 0.1 for name in CRM.FORECAST_SIGNAL_NAMES}
+    high_scores = {name: 0.9 for name in CRM.FORECAST_SIGNAL_NAMES}
+    seed_closed_prediction(
+        calibration_crm, 0, 0.6, "active_customer", "prospect", low_scores,
+        prior_probabilities=(0.1, 0.4),
+    )
+    seed_closed_prediction(
+        calibration_crm, 1, 0.75, "lost", "proposal_drafted", high_scores
+    )
+    calibration = calibration_crm.calibration_report()
+
+    # 84f-g. Three rewrites for one contact count once at the final value.
+    check(
+        "calibration_latest_prediction_per_contact",
+        calibration["scored_predictions"] == 2
+        and calibration["by_stage"]["prospect"]["count"] == 1,
+    )
+    check(
+        "calibration_latest_prediction_probability",
+        calibration["reliability"][1]["count"] == 0
+        and calibration["reliability"][4]["count"] == 0
+        and calibration["reliability"][6]["count"] == 1
+        and calibration["reliability"][6]["mean_prediction"] == 0.6,
+    )
+
+    # 84h. ((.6 - 1)^2 + (.75 - 0)^2) / 2 = .36125 exactly.
+    check(
+        "calibration_brier_exact",
+        calibration["scored_predictions"] == 2
+        and calibration["brier_score"] == 0.36125,
+    )
+
+    # 84i. Brier errors are also grouped by the recorded prediction stage.
+    check(
+        "calibration_stage_buckets",
+        calibration["by_stage"]["prospect"]
+        == {"count": 1, "brier_score": 0.16}
+        and calibration["by_stage"]["proposal_drafted"]
+        == {"count": 1, "brier_score": 0.5625},
+    )
+
+    # 84j. Reliability deciles expose observed win rates for occupied buckets.
+    check(
+        "calibration_reliability_buckets",
+        calibration["reliability"][6]["predicted_decile"] == "60-70%"
+        and calibration["reliability"][6]["actual_win_rate"] == 1.0
+        and calibration["reliability"][7]["actual_win_rate"] == 0.0,
+    )
+
+    # 84k. Two closed outcomes are below the 20-outcome learning threshold.
+    check("learned_weights_minimum", calibration_crm.learned_weights() is None)
+    calibration_crm.close()
+
+    learned_db = os.path.join(tempfile.mkdtemp(), "learned-weights.db")
+    learned_crm = CRM(learned_db)
+    for index in range(20):
+        won = index < 10
+        seed_closed_prediction(
+            learned_crm,
+            index,
+            0.9 if won else 0.1,
+            "active_customer" if won else "lost",
+            "verbal_yes" if won else "prospect",
+            high_scores if won else low_scores,
+        )
+        learned_crm.update_contact(
+            f"closed-{index}@calibration.test",
+            source="winning-source" if won else "losing-source",
+        )
+
+    first_fit = learned_crm.learned_weights()
+    second_fit = learned_crm.learned_weights()
+    # 84l. Fixed initialization and iterations make repeated fits identical.
+    check(
+        "learned_weights_deterministic",
+        first_fit == second_fit and first_fit["outcome_count"] == 20,
+    )
+
+    learned_crm.add_contact(
+        "Clearly Winning", email="winning@calibration.test",
+        status="verbal_yes", source="winning-source",
+    )
+    learned_crm.add_contact(
+        "Clearly Losing", email="losing@calibration.test",
+        status="prospect", source="losing-source",
+    )
+    for days in (1, 3, 5, 7):
+        winning_id = learned_crm.get_contact("winning@calibration.test")["id"]
+        learned_crm.conn.execute(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, 'meeting', 'Strong buying signal', datetime('now', ?))""",
+            (winning_id, f"-{days} days"),
+        )
+    learned_crm.conn.commit()
+
+    gate_history = learned_crm.win_loss_analysis()
+    gate_contact = learned_crm.get_contact("winning@calibration.test")
+    gate_default = learned_crm._deal_probability_for_contact(
+        gate_contact, gate_history, weight_model=None
+    )
+    gate_prediction = learned_crm.deal_probability("winning@calibration.test")
+    gate_losing_prediction = learned_crm.deal_probability(
+        "losing@calibration.test"
+    )
+    check(
+        "deal_probability_blend_gate_is_default",
+        gate_prediction["blend_alpha"] == 0.0
+        and gate_prediction["weights_source"] == "default"
+        and gate_losing_prediction["weights_source"] == "default"
+        and gate_prediction["probability"] == gate_default["probability"],
+    )
+
+    for index in range(20, 25):
+        won = index % 2 == 0
+        seed_closed_prediction(
+            learned_crm,
+            index,
+            0.85 if won else 0.15,
+            "active_customer" if won else "lost",
+            "verbal_yes" if won else "prospect",
+            high_scores if won else low_scores,
+        )
+        learned_crm.update_contact(
+            f"closed-{index}@calibration.test",
+            source="winning-source" if won else "losing-source",
+        )
+
+    midpoint_history = learned_crm.win_loss_analysis()
+    midpoint_contact = learned_crm.get_contact("winning@calibration.test")
+    midpoint_model = learned_crm.learned_weights()
+    midpoint_default = learned_crm._deal_probability_for_contact(
+        midpoint_contact, midpoint_history, weight_model=None
+    )
+    midpoint_pure_model = dict(midpoint_model)
+    midpoint_pure_model["outcome_count"] = 30
+    midpoint_learned = learned_crm._deal_probability_for_contact(
+        midpoint_contact, midpoint_history, weight_model=midpoint_pure_model
+    )
+    midpoint_prediction = learned_crm.deal_probability(
+        "winning@calibration.test"
+    )
+    midpoint_expected = round(
+        (midpoint_default["probability"] + midpoint_learned["probability"]) / 2,
+        4,
+    )
+    check(
+        "deal_probability_midpoint_blends",
+        midpoint_prediction["blend_alpha"] == 0.5
+        and abs(midpoint_prediction["probability"] - midpoint_expected) <= 0.0001,
+    )
+    check(
+        "deal_probability_blend_reports_learned_source",
+        midpoint_prediction["blend_alpha"] > 0
+        and midpoint_prediction["weights_source"] == "learned",
+    )
+
+    for index in range(25, 30):
+        won = index % 2 == 0
+        seed_closed_prediction(
+            learned_crm,
+            index,
+            0.85 if won else 0.15,
+            "active_customer" if won else "lost",
+            "verbal_yes" if won else "prospect",
+            high_scores if won else low_scores,
+        )
+        learned_crm.update_contact(
+            f"closed-{index}@calibration.test",
+            source="winning-source" if won else "losing-source",
+        )
+
+    full_history = learned_crm.win_loss_analysis()
+    full_model = learned_crm.learned_weights()
+    full_contact = learned_crm.get_contact("winning@calibration.test")
+    pure_learned_prediction = learned_crm._deal_probability_for_contact(
+        full_contact, full_history, weight_model=full_model
+    )
+    winning_prediction = learned_crm.deal_probability("winning@calibration.test")
+    losing_prediction = learned_crm.deal_probability("losing@calibration.test")
+    check(
+        "deal_probability_full_blend_is_pure_learned",
+        winning_prediction["blend_alpha"] == 1.0
+        and winning_prediction["probability"]
+        == pure_learned_prediction["probability"],
+    )
+
+    # 84m. Once blending is complete, public scoring identifies learned mode.
+    check(
+        "deal_probability_learned_mode",
+        winning_prediction["weights_source"] == "learned"
+        and losing_prediction["weights_source"] == "learned",
+    )
+
+    # 84n. A separable history ranks the clearly winning profile higher.
+    check(
+        "learned_weights_rank_profiles",
+        winning_prediction["probability"] > losing_prediction["probability"],
+    )
+
+    # 84o. Logistic scoring remains a valid probability in learned mode.
+    check(
+        "learned_probability_range",
+        all(0.0 <= prediction["probability"] <= 1.0
+            for prediction in (winning_prediction, losing_prediction)),
+    )
+
+    # 84p. MCP registers and serves the same calibration report.
+    try:
+        import mcp_server
+        original_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = learned_db
+        calibration_tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        calibration_output = mcp_server.handle_tool_call("crm_calibration", {})
+        mcp_server.DB_PATH = original_mcp_db
+        check(
+            "calibration_mcp_tool",
+            "crm_calibration" in calibration_tool_names
+            and '"brier_score"' in calibration_output
+            and '"weights_source": "learned"' in calibration_output,
+        )
+    except (AttributeError, TypeError, KeyError):
+        check("calibration_mcp_tool", False)
+
+    learned_crm.close()
+
+    # ── 85. Self-Proposing Roadmap (12 tests) ──
+
+    proposal_dir = tempfile.mkdtemp()
+    proposal_crm_path = os.path.join(proposal_dir, "synthetic_crm.py")
+    proposal_benchmark_path = os.path.join(proposal_dir, "synthetic_benchmark.py")
+    proposal_roadmap_path = os.path.join(proposal_dir, "roadmap.md")
+    with open(proposal_crm_path, "w", encoding="utf-8") as synthetic_crm_file:
+        synthetic_crm_file.write(
+            "class CRM:\n"
+            "    def covered(self):\n"
+            "        return True\n"
+            "    def uncovered_capability(self):\n"
+            "        return True\n"
+            "    def _private_helper(self):\n"
+            "        return True\n"
+        )
+    with open(proposal_benchmark_path, "w", encoding="utf-8") as synthetic_benchmark_file:
+        synthetic_benchmark_file.write("crm.covered()\n")
+    with open(proposal_roadmap_path, "w", encoding="utf-8") as synthetic_roadmap_file:
+        synthetic_roadmap_file.write(
+            "# Roadmap\n\n### Twelve. Existing roadmap item\nAlready planned.\n"
+        )
+
+    proposal_crm = CRM(os.path.join(proposal_dir, "empty.db"))
+    proposal_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    proposal_titles = [item["title"] for item in proposal_output["proposals"]]
+    coverage_proposals = [
+        item for item in proposal_output["proposals"]
+        if item["kind"] == "untested capability"
+    ]
+
+    # 85a. AST coverage finds a public method with zero benchmark references.
+    check(
+        "propose_ticks_untested_method",
+        [item["title"] for item in coverage_proposals]
+        == ["Benchmark uncovered_capability capability"],
+    )
+
+    # 85b. Covered and private methods are not reported as coverage gaps.
+    check(
+        "propose_ticks_public_methods_only",
+        all("covered" not in title or "uncovered_capability" in title
+            for title in proposal_titles)
+        and all("private_helper" not in title for title in proposal_titles),
+    )
+
+    # 85c. Data-dependent signal gaps can only use names declared by CRM.
+    signal_proposals = [
+        item for item in proposal_output["proposals"]
+        if item["kind"] == "signal never fires on this data"
+    ]
+    proposed_signal_names = {
+        item["title"][len("Activate "):-len(" signal")]
+        for item in signal_proposals
+    }
+    known_signal_names = set(
+        CRM.NEXT_ACTION_SIGNAL_NAMES + CRM.FORECAST_SIGNAL_NAMES
+    )
+    check(
+        "propose_ticks_known_signals_only",
+        bool(proposed_signal_names)
+        and proposed_signal_names <= known_signal_names,
+    )
+
+    # 85d. Two scans of unchanged sources and data are byte-for-byte stable.
+    repeated_proposal_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    check("propose_ticks_deterministic", proposal_output == repeated_proposal_output)
+
+    # 85e. Markdown uses the same ordinal tick-heading shape as roadmap.md.
+    check(
+        "propose_ticks_markdown_format",
+        bool(re.search(
+            r"(?m)^### Thirteen\. .+\n.+\nKind: .+ Evidence: .+\.$",
+            proposal_output["markdown"],
+        )),
+    )
+
+    # 85f. An empty connected DB still produces a complete structured response.
+    check(
+        "propose_ticks_empty_db",
+        set(proposal_output) == {"proposals", "markdown"}
+        and isinstance(proposal_output["proposals"], list)
+        and isinstance(proposal_output["markdown"], str),
+    )
+
+    # 85g. Every ranked item has exactly the public contract and usable evidence.
+    check(
+        "propose_ticks_evidence",
+        bool(proposal_output["proposals"])
+        and all(
+            set(item) == {"title", "rationale", "kind", "evidence"}
+            and all(isinstance(item[key], str) and item[key].strip()
+                    for key in item)
+            for item in proposal_output["proposals"]
+        ),
+    )
+
+    # 85h. Stable kind priority makes the output a ranked list, not a set dump.
+    proposal_kind_rank = {
+        "untested capability": 0,
+        "signal never fires on this data": 1,
+        "performance trend": 2,
+    }
+    output_ranks = [
+        proposal_kind_rank[item["kind"]]
+        for item in proposal_output["proposals"]
+    ]
+    check(
+        "propose_ticks_ranked",
+        output_ranks == sorted(output_ranks),
+    )
+
+    # 85i. Existing tick title words suppress the matching proposal.
+    with open(proposal_roadmap_path, "w", encoding="utf-8") as synthetic_roadmap_file:
+        synthetic_roadmap_file.write(
+            "# Roadmap\n\n"
+            "### Thirteen. Benchmark uncovered capability\nAlready planned.\n"
+        )
+    deduped_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    check(
+        "propose_ticks_roadmap_dedupe",
+        "Benchmark uncovered_capability capability"
+        not in [item["title"] for item in deduped_output["proposals"]],
+    )
+
+    # 85j. A cached PERF block is parsed without importing or running the benchmark.
+    cached_benchmark_path = os.path.join(proposal_dir, "benchmark_results.txt")
+    with open(cached_benchmark_path, "w", encoding="utf-8") as cached_benchmark_file:
+        cached_benchmark_file.write(
+            "PERFORMANCE TIMINGS (seed=1, fixture):\n"
+            "  slow_operation                  9.000 ms  limit 10.000 ms  PASS\n"
+        )
+    perf_output = proposal_crm.propose_ticks(
+        benchmark_path=proposal_benchmark_path,
+        crm_path=proposal_crm_path,
+        roadmap_path=proposal_roadmap_path,
+    )
+    performance_proposals = [
+        item for item in perf_output["proposals"]
+        if item["kind"] == "performance trend"
+    ]
+    check(
+        "propose_ticks_cached_perf",
+        len(performance_proposals) == 1
+        and "9.000 ms / 10.000 ms" in performance_proposals[0]["evidence"],
+    )
+
+    # 85k. MCP advertises and serves the same structured proposal contract.
+    try:
+        import mcp_server
+        original_proposal_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = os.path.join(proposal_dir, "mcp-empty.db")
+        proposal_tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        proposal_mcp_output = json.loads(
+            mcp_server.handle_tool_call("crm_propose_ticks", {})
+        )
+        mcp_server.DB_PATH = original_proposal_mcp_db
+        check(
+            "propose_ticks_mcp_tool",
+            "crm_propose_ticks" in proposal_tool_names
+            and set(proposal_mcp_output) == {"proposals", "markdown"},
+        )
+    except (AttributeError, TypeError, KeyError, json.JSONDecodeError):
+        check("propose_ticks_mcp_tool", False)
+
+    # 85l. The CLI prints a paste-ready tick block against an empty temp DB.
+    cli_env = os.environ.copy()
+    cli_env["CRM_DB"] = os.path.join(proposal_dir, "cli-empty.db")
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    cli_proposal = subprocess.run(
+        [sys.executable, os.path.join(repo_dir, "crm.py"), "propose"],
+        cwd=repo_dir,
+        env=cli_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    check(
+        "propose_ticks_cli",
+        cli_proposal.returncode == 0
+        and bool(re.search(r"(?m)^### [A-Za-z-]+\. .+$", cli_proposal.stdout)),
+    )
+    proposal_crm.close()
+
+    # ── 86. find_intros — self-proposed coverage (4 tests) ──
+
+    find_intros_crm = CRM(os.path.join(tempfile.mkdtemp(), "find-intros.db"))
+    find_intros_crm.add_contact(
+        "Alex Acme", email="alex@acme.test", company="Acme"
+    )
+    find_intros_crm.add_contact(
+        "Taylor Target", email="taylor@acme.test", company="Acme"
+    )
+    find_intros_crm.add_contact(
+        "Blair Bridge", email="blair@bridge.test", company="Bridge Co"
+    )
+    with find_intros_crm.conn:
+        find_intros_crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ("contact:alex acme", "imessage_total", "140", "imessage",
+                 "2026-03-05 09:00:00"),
+                ("contact:alex acme", "message_intensity", "high", "imessage",
+                 "2026-03-05 09:00:01"),
+                ("contact:blair bridge", "imessage_total", "75", "imessage",
+                 "2026-03-05 09:00:02"),
+                ("contact:blair bridge", "message_intensity", "medium", "imessage",
+                 "2026-03-05 09:00:03"),
+                ("contact:blair bridge", "knows", "contact:taylor target", "fixture",
+                 "2026-03-05 09:00:04"),
+            ),
+        )
+    intro_matches = find_intros_crm.find_intros("Acme")
+    intro_by_connector = {item["connector"]: item for item in intro_matches}
+
+    # 86a. Direct and graph-backed paths are both returned from seeded data.
+    check(
+        "find_intros_known_paths",
+        [item["connector"] for item in intro_matches]
+        == ["Alex Acme", "Blair Bridge", "Taylor Target"],
+    )
+
+    # 86b. A strong employee relationship carries its measured warmth details.
+    check(
+        "find_intros_direct_warm_path",
+        intro_by_connector["Alex Acme"]["connection_to_target"] == "Works at Acme"
+        and intro_by_connector["Alex Acme"]["relationship_to_you"]
+        == {"imessage_total": 140, "intensity": "high"}
+        and intro_by_connector["Alex Acme"]["warmth_score"] == 90,
+    )
+
+    # 86c. A warm referrer to a target employee is exposed as a second path.
+    check(
+        "find_intros_graph_warm_path",
+        intro_by_connector["Blair Bridge"]["connection_to_target"]
+        == "Connected to Taylor Target"
+        and intro_by_connector["Blair Bridge"]["warmth_score"] == 65,
+    )
+
+    # 86d. An unrelated target has no fabricated intro paths.
+    check(
+        "find_intros_empty_case",
+        find_intros_crm.find_intros("Nobody Incorporated") == [],
+    )
+    find_intros_crm.close()
+
+    # ── 87. network_summary — self-proposed coverage (4 tests) ──
+
+    network_crm = CRM(os.path.join(tempfile.mkdtemp(), "network-summary.db"))
+    network_crm.add_contact(
+        "Nora North", email="nora@acme.test", company="Acme-Labs",
+        deal_size="$10K",
+    )
+    network_crm.add_contact(
+        "Owen Orbit", email="owen@openai.test", company="OpenAI",
+        deal_size="$15K",
+    )
+    network_crm.add_contact("Pam Pine", email="pam@independent.test")
+    with network_crm.conn:
+        network_crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ("phone:+15550001", "name", "Nora North", "macos_contacts",
+                 "2026-03-01 09:00:00"),
+                ("phone:+15550001", "imessage_total", "42", "imessage",
+                 "2026-03-01 09:00:01"),
+                ("phone:+15550002", "imessage_total", "25", "imessage",
+                 "2026-03-01 09:00:02"),
+                ("contact:owen orbit", "imessage_total", "30", "imessage",
+                 "2026-03-01 09:00:03"),
+                ("contact:pam pine", "company", "Acme Labs", "macos_contacts",
+                 "2026-03-01 09:00:04"),
+                ("company:beta-corp", "meeting_count", "2", "macos_calendar",
+                 "2026-03-01 09:00:05"),
+                ("contact:nora north", "mail_total", "7", "macos_mail",
+                 "2026-03-01 09:00:06"),
+                ("company:beta-corp", "stage", "target", "manual",
+                 "2026-03-01 09:00:07"),
+            ),
+        )
+    network = network_crm.network_summary()
+
+    # 87a. Fixture totals are 3 contacts, 6 entities, and 8 facts.
+    check(
+        "network_summary_totals",
+        network["total_contacts"] == 3
+        and network["total_graph_entities"] == 6
+        and network["total_facts"] == 8,
+    )
+
+    # 87b. Source counts match the seven fixture facts from supported ingestors.
+    check(
+        "network_summary_sources",
+        network["sources"] == {
+            "macos_contacts": 2,
+            "imessage": 3,
+            "macos_calendar": 1,
+            "macos_mail": 1,
+        },
+    )
+
+    # 87c. Message leaders are numeric-descending and one of two phones resolves.
+    check(
+        "network_summary_top_contacts",
+        network["top_contacts"] == [
+            {"name": "Nora North", "messages": 42},
+            {"name": "Owen Orbit", "messages": 30},
+            {"name": "+15550002", "messages": 25},
+        ]
+        and network["resolution_rate"] == 50.0,
+    )
+
+    # 87d. Company normalization deduplicates names and deal sizes sum to $25K.
+    check(
+        "network_summary_companies_pipeline",
+        network["companies"] == ["Acme Labs", "Beta Corp", "Openai"]
+        and network["pipeline_value"] == 25_000,
+    )
+    network_crm.close()
+
+    # ── 88. unified_search — self-proposed coverage (4 tests) ──
+
+    unified_crm = CRM(os.path.join(tempfile.mkdtemp(), "unified-search.db"))
+    uma_id = unified_crm.add_contact(
+        "Uma Vale", email="uma@example.test", notes="Aurora migration"
+    )
+    victor_id = unified_crm.add_contact(
+        "Victor Vale", email="victor@example.test", company="Aurora Labs"
+    )
+    unified_crm.add_contact("Quiet Quinn", email="quiet@example.test")
+    unified_crm.update_contact("uma@example.test", last_contacted="2026-03-03")
+    unified_crm.update_contact("victor@example.test", last_contacted="2026-03-02")
+    with unified_crm.conn:
+        unified_crm.conn.executemany(
+            """INSERT INTO facts (entity, key, value, source, observed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                ("company:aurora-labs", "launch", "Green", "fixture-source",
+                 "2026-03-05 09:00:00"),
+                ("contact:uma vale", "initiative", "Aurora migration", "fixture-source",
+                 "2026-03-04 09:00:00"),
+                ("contact:victor vale", "project", "Northstar", "aurora-research",
+                 "2026-03-03 09:00:00"),
+            ),
+        )
+        unified_crm.conn.executemany(
+            """INSERT INTO activity (contact_id, type, summary, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                (uma_id, "meeting", "Aurora kickoff", "2026-03-06 09:00:00"),
+                (victor_id, "email", "Aurora follow-up", "2026-03-05 09:00:00"),
+            ),
+        )
+    unified_matches = unified_crm.unified_search("aurora")
+
+    # 88a. Contact fields are searched and sorted by last-contacted descending.
+    check(
+        "unified_search_contacts",
+        set(unified_matches) == {"contacts", "facts", "activities"}
+        and [row["name"] for row in unified_matches["contacts"]]
+        == ["Uma Vale", "Victor Vale"],
+    )
+
+    # 88b. Entity, value, and source matches retain observed-at ordering.
+    check(
+        "unified_search_facts",
+        [row["entity"] for row in unified_matches["facts"]] == [
+            "company:aurora-labs", "contact:uma vale", "contact:victor vale",
+        ],
+    )
+
+    # 88c. Activity summaries are searched and newest activity appears first.
+    check(
+        "unified_search_activities",
+        [row["contact_name"] for row in unified_matches["activities"]]
+        == ["Uma Vale", "Victor Vale"]
+        and [row["summary"] for row in unified_matches["activities"]]
+        == ["Aurora kickoff", "Aurora follow-up"],
+    )
+
+    # 88d. Repeated reads are stable and an absent token yields empty sections.
+    no_unified_matches = unified_crm.unified_search("no-such-token-9f3")
+    check(
+        "unified_search_deterministic_no_match",
+        unified_crm.unified_search("aurora") == unified_matches
+        and no_unified_matches
+        == {"contacts": [], "facts": [], "activities": []},
+    )
+    unified_crm.close()
+
+    # ── 89. Outcome-Driven Action Tuning (14 tests) ──
+
+    queue_log_crm = CRM(os.path.join(tempfile.mkdtemp(), "queue-surface-log.db"))
+    queue_log_crm.add_contact(
+        "Surface Sue", email="sue@queue.test", status="prospect"
+    )
+    queue_log_crm.next_actions()
+    surface_facts = queue_log_crm.conn.execute(
+        """SELECT key, source, event_day FROM facts
+           WHERE entity = 'surfaced:sue@queue.test' AND source = 'queue'
+           ORDER BY key"""
+    ).fetchall()
+
+    # 89a. A returned action records the three public queue facts.
+    check(
+        "queue_surface_facts_recorded",
+        {row["key"] for row in surface_facts}
+        == {"signal_name", "action", "urgency"}
+        and all(row["source"] == "queue" and row["event_day"]
+                for row in surface_facts),
+    )
+
+    # 89b. Re-reading the queue on the same day updates instead of appending.
+    queue_log_crm.next_actions()
+    check(
+        "queue_surface_same_day_dedup",
+        queue_log_crm.conn.execute(
+            """SELECT COUNT(*) FROM facts
+               WHERE entity = 'surfaced:sue@queue.test'
+                 AND source = 'queue'"""
+        ).fetchone()[0] == 3,
+    )
+    queue_log_crm.close()
+
+    def seed_queue_outcome(crm, label, signal, *, acted, moved,
+                           late_activity=False):
+        email = f"{label}@queue-outcome.test"
+        contact_id = crm.add_contact(
+            f"Queue Outcome {label}", email=email, status="prospect"
+        )
+        surfaced_at = datetime.now() - timedelta(days=60 + contact_id)
+        observed_at = surfaced_at.isoformat(sep=" ", timespec="microseconds")
+        event_day = surfaced_at.date().isoformat()
+        entity = f"surfaced:{email}"
+        with crm.conn:
+            crm.conn.executemany(
+                """INSERT INTO facts
+                   (entity, key, value, source, observed_at, event_day)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    (entity, "signal_name", signal, "queue", observed_at, event_day),
+                    (entity, "action", f"Act on {label}", "queue", observed_at,
+                     event_day),
+                    (entity, "urgency", "50.0", "queue", observed_at, event_day),
+                    (entity, "contact_id", str(contact_id), "queue_meta", observed_at,
+                     event_day),
+                    (entity, "status", "prospect", "queue_meta", observed_at,
+                     event_day),
+                ),
+            )
+            if acted or late_activity:
+                activity_at = surfaced_at + timedelta(
+                    days=10 if late_activity else 2
+                )
+                crm.conn.execute(
+                    """INSERT INTO activity
+                       (contact_id, type, summary, created_at)
+                       VALUES (?, 'email', 'Queue fixture action', ?)""",
+                    (contact_id, activity_at.isoformat(
+                        sep=" ", timespec="microseconds")),
+                )
+        if moved:
+            crm.update_contact(email, status="contacted")
+            moved_at = (surfaced_at + timedelta(days=3)).isoformat(
+                sep=" ", timespec="microseconds"
+            )
+            canonical = crm._canonical_contact_entity(crm.get_contact(email))
+            with crm.conn:
+                crm.conn.execute(
+                    """UPDATE facts SET observed_at = ?
+                       WHERE entity = ? AND key = 'status'
+                         AND source = 'crm_status'""",
+                    (moved_at, canonical),
+                )
+                crm.conn.execute(
+                    "UPDATE contacts SET updated_at = ? WHERE id = ?",
+                    (moved_at, contact_id),
+                )
+        crm.archive_contact(email)
+        return contact_id
+
+    outcome_crm = CRM(os.path.join(tempfile.mkdtemp(), "queue-outcomes.db"))
+    seed_queue_outcome(
+        outcome_crm, "acted-moved", "cadence_overdue", acted=True, moved=True
+    )
+    seed_queue_outcome(
+        outcome_crm, "too-late", "cadence_overdue", acted=False, moved=False,
+        late_activity=True,
+    )
+    cadence_outcomes = next(
+        row for row in outcome_crm.action_outcomes(window_days=7)
+        if row["signal"] == "cadence_overdue"
+    )
+
+    # 89c. Activity inside the configured window counts as acted.
+    check("queue_outcome_acted_true", cadence_outcomes["acted"] == 1)
+
+    # 89d. Activity after the configured window does not count as acted.
+    check(
+        "queue_outcome_acted_false",
+        cadence_outcomes["surfaced"] - cadence_outcomes["acted"] == 1,
+    )
+
+    # 89e. A later status fact with a higher stage counts as moved.
+    check("queue_outcome_moved", cadence_outcomes["moved"] == 1)
+
+    # 89f. Two surfaces with one action and one move yield exact half rates.
+    check(
+        "queue_outcome_rates_exact",
+        cadence_outcomes == {
+            "signal": "cadence_overdue", "surfaced": 2, "acted": 1,
+            "moved": 1, "act_rate": 0.5, "move_rate": 0.5,
+        },
+    )
+
+    # 89g. Fewer than ten outcomes always keeps the default multiplier.
+    check(
+        "queue_weights_minimum",
+        outcome_crm.tuned_urgency_weights()["cadence_overdue"] == 1.0,
+    )
+    outcome_crm.close()
+
+    learned_queue_db = os.path.join(tempfile.mkdtemp(), "learned-queue.db")
+    learned_queue_crm = CRM(learned_queue_db)
+    learned_queue_crm.add_contact(
+        "Ranked Stale", email="stale@learned-queue.test", status="contacted"
+    )
+    learned_queue_crm.update_contact(
+        "stale@learned-queue.test", last_contacted=_date.today().isoformat()
+    )
+    learned_queue_crm.add_deal(
+        "stale@learned-queue.test", "Stale learned deal", "$25K", "proposal"
+    )
+    learned_queue_crm.conn.execute(
+        """UPDATE deals SET updated_at = datetime('now', '-45 days')
+           WHERE contact_id = ?""",
+        (learned_queue_crm.get_contact("stale@learned-queue.test")["id"],),
+    )
+    learned_queue_crm.add_contact(
+        "Ranked Reminder", email="reminder@learned-queue.test", status="contacted"
+    )
+    learned_queue_crm.update_contact(
+        "reminder@learned-queue.test", last_contacted=_date.today().isoformat()
+    )
+    learned_queue_crm.set_reminder(
+        "reminder@learned-queue.test", _date.today().isoformat(), "Due learned reminder"
+    )
+    default_rank = [
+        row["contact"] for row in learned_queue_crm.next_actions(limit=20)
+    ]
+    default_sources = {
+        row["contact"]: row["weights_source"]
+        for row in learned_queue_crm.next_actions(limit=20)
+    }
+
+    for index in range(10):
+        seed_queue_outcome(
+            learned_queue_crm, f"high-{index}", "stale_open_deal",
+            acted=True, moved=True,
+        )
+        seed_queue_outcome(
+            learned_queue_crm, f"low-{index}", "due_reminder",
+            acted=True, moved=False,
+        )
+
+    first_queue_weights = learned_queue_crm.tuned_urgency_weights()
+    second_queue_weights = learned_queue_crm.tuned_urgency_weights()
+
+    # 89h. Above-mean movement is capped at the upper bound.
+    check(
+        "queue_weight_upper_clamp",
+        first_queue_weights["stale_open_deal"] == 1.4,
+    )
+
+    # 89i. Below-mean movement is floored at the lower bound.
+    check(
+        "queue_weight_lower_clamp",
+        first_queue_weights["due_reminder"] == 0.6,
+    )
+
+    # 89j. Identical outcome history produces byte-for-byte-identical weights.
+    check(
+        "queue_weights_deterministic",
+        first_queue_weights == second_queue_weights,
+    )
+
+    learned_actions = learned_queue_crm.next_actions(limit=20)
+    learned_rank = [row["contact"] for row in learned_actions]
+    learned_sources = {
+        row["contact"]: row["weights_source"] for row in learned_actions
+    }
+
+    # 89k. Learning reverses the default reminder-over-stale ordering.
+    check(
+        "queue_learning_changes_rank",
+        default_rank.index("Ranked Reminder") < default_rank.index("Ranked Stale")
+        and learned_rank.index("Ranked Stale") < learned_rank.index("Ranked Reminder"),
+    )
+
+    # 89l. Public queue rows flip from default to learned signal weights.
+    check(
+        "queue_weights_source_flips",
+        default_sources["Ranked Stale"] == "default"
+        and default_sources["Ranked Reminder"] == "default"
+        and learned_sources["Ranked Stale"] == "learned"
+        and learned_sources["Ranked Reminder"] == "learned",
+    )
+
+    # 89m. queue-stats CLI prints rates and the active multiplier.
+    queue_cli = subprocess.run(
+        [sys.executable, os.path.abspath("crm.py"), "--db", learned_queue_db,
+         "queue-stats"],
+        capture_output=True, text=True, timeout=30,
+    )
+    check(
+        "queue_stats_cli",
+        queue_cli.returncode == 0
+        and "stale_open_deal" in queue_cli.stdout
+        and "1.40x" in queue_cli.stdout,
+    )
+
+    # 89n. MCP advertises and serves the same queue statistics.
+    try:
+        import mcp_server
+        original_queue_mcp_db = mcp_server.DB_PATH
+        mcp_server.DB_PATH = learned_queue_db
+        queue_tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+        queue_mcp_output = json.loads(
+            mcp_server.handle_tool_call("crm_queue_stats", {})
+        )
+        mcp_server.DB_PATH = original_queue_mcp_db
+        stale_stats = next(
+            row for row in queue_mcp_output
+            if row["signal"] == "stale_open_deal"
+        )
+        check(
+            "queue_stats_mcp_tool",
+            "crm_queue_stats" in queue_tool_names
+            and stale_stats["multiplier"] == 1.4
+            and stale_stats["weights_source"] == "learned",
+        )
+    except (AttributeError, TypeError, KeyError, ValueError, StopIteration):
+        check("queue_stats_mcp_tool", False)
+    # 89o. queue_stats() rows expose the full documented shape directly.
+    try:
+        qs = learned_queue_crm.queue_stats()
+        required = {"signal", "surfaced", "acted", "moved", "act_rate",
+                    "move_rate", "multiplier", "weights_source"}
+        check("queue_stats_method_shape",
+              bool(qs) and all(required.issubset(row) for row in qs))
+    except (AttributeError, TypeError):
+        check("queue_stats_method_shape", False)
+
+    # 89p. every known queue signal appears exactly once.
+    try:
+        qs = learned_queue_crm.queue_stats()
+        names = [row["signal"] for row in qs]
+        check("queue_stats_covers_all_signals",
+              set(CRM.NEXT_ACTION_SIGNAL_NAMES).issubset(names)
+              and len(names) == len(set(names)))
+    except (AttributeError, TypeError):
+        check("queue_stats_covers_all_signals", False)
+
+    # 89q. rates agree with the raw surfaced/acted/moved counts.
+    try:
+        qs = learned_queue_crm.queue_stats()
+        ok = all(
+            (row["surfaced"] == 0 and row["act_rate"] == 0.0 and row["move_rate"] == 0.0)
+            or (abs(row["act_rate"] - row["acted"] / row["surfaced"]) < 1e-6
+                and abs(row["move_rate"] - row["moved"] / row["surfaced"]) < 1e-6)
+            for row in qs
+        )
+        check("queue_stats_rate_math", bool(qs) and ok)
+    except (AttributeError, TypeError, ZeroDivisionError):
+        check("queue_stats_rate_math", False)
+
+    # 89r. two consecutive calls return identical rows.
+    try:
+        check("queue_stats_deterministic",
+              learned_queue_crm.queue_stats() == learned_queue_crm.queue_stats())
+    except (AttributeError, TypeError):
+        check("queue_stats_deterministic", False)
+
+    # ── 90. Full MCP registered-tool sweep (10 category checks) ──
+    run_mcp_tool_sweep()
+
+    # ── 91-94. Canonical statuses, proof statuses, fit rules, forecast log ──
+    run_status_fit_benchmarks()
+
+    learned_queue_crm.close()
+
+    cadence_crm.close()
+
+    ingest_crm.close()
+
+    for roundtrip_crm in (
+        roundtrip_source, roundtrip_target, merge_crm, csv_roundtrip_crm,
+        odd_csv_crm, malformed_csv_crm, multi_vcard_crm, folded_vcard_crm,
+    ):
+        roundtrip_crm.close()
+
     # Clean up temp files
     try:
         os.unlink(TEST_DB)
@@ -3642,7 +7559,9 @@ def run_benchmarks():
         pass
 
 
-if __name__ == "__main__":
+def main():
+    global FAIL
+
     try:
         run_benchmarks()
     except Exception as e:
@@ -3650,9 +7569,43 @@ if __name__ == "__main__":
         FAIL += 1
         ERRORS.append(f"CRASH: {e}")
 
-    total = PASS + FAIL
+    results_line, score_line = result_lines(PASS, FAIL)
+    integrity_errors = score_integrity_errors(
+        PASS, FAIL, results_line, score_line
+    )
+    if integrity_errors:
+        FAIL += len(integrity_errors)
+        ERRORS.extend(integrity_errors)
+        results_line, score_line = result_lines(PASS, FAIL)
+
     print(f"\n{'=' * 40}")
-    print(f"RESULTS: {PASS}/{total} tests passed")
+    print(
+        "PERFORMANCE TIMINGS "
+        f"(seed={PERFORMANCE_SEED}, 500 contacts / 2000 activities):"
+    )
+    if PERFORMANCE_TIMINGS:
+        for timing in PERFORMANCE_TIMINGS:
+            if timing["elapsed_ms"] is None:
+                elapsed = "ERROR"
+                status = timing["error"]
+            else:
+                elapsed = f"{timing['elapsed_ms']:.3f} ms"
+                status = (
+                    "PASS" if timing["elapsed_ms"] <= timing["threshold_ms"]
+                    else "FAIL"
+                )
+            print(
+                f"  {timing['name']:<26} {elapsed:>12}  "
+                f"limit {timing['threshold_ms']:.3f} ms  {status}"
+            )
+    else:
+        print("  not run")
+    print(results_line)
     if ERRORS:
         print(f"FAILURES: {', '.join(ERRORS[:10])}")
-    print(f"score: {PASS}")
+    print(score_line)
+    return benchmark_exit_code(FAIL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

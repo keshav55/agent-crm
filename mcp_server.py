@@ -146,9 +146,45 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "crm_forecast",
+        "description": "Rank open-pipeline contacts by close probability and weighted value",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum contacts to return"},
+            },
+        },
+    },
+    {
+        "name": "crm_calibration",
+        "description": "Measure forecast Brier score, reliability, and learned-weight status",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "crm_stats",
         "description": "Get CRM statistics — total contacts, by status, recent activity",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_export_full",
+        "description": "Export a lossless, versioned backup of contacts, activity, deals, and facts",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_import_csv",
+        "description": "Import contacts from a local CSV file with automatic or explicit header mapping",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to the CSV file"},
+                "mapping": {
+                    "type": "object",
+                    "description": "Optional CSV-header to CRM-field mapping (the reverse form is also accepted)",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["path"],
+        },
     },
     {
         "name": "crm_score_contact",
@@ -174,13 +210,23 @@ TOOLS = [
     },
     {
         "name": "crm_next_actions",
-        "description": "Get recommended next actions across all contacts, prioritized",
+        "description": "Get the ranked do-this-today queue from reminders, cadence, relationship health, stale deals, and close probability",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "description": "Max actions to return", "default": 10},
             },
         },
+    },
+    {
+        "name": "crm_queue_stats",
+        "description": "Get per-signal queue outcomes, rates, and learned urgency multipliers",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_propose_ticks",
+        "description": "Propose deterministic roadmap ticks from benchmark coverage, live CRM signals, and cached performance timings",
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "crm_context_for_agent",
@@ -234,6 +280,18 @@ TOOLS = [
                 "target": {"type": "string", "description": "Company name, person name, or email to find intros to"},
             },
             "required": ["target"],
+        },
+    },
+    {
+        "name": "crm_intro_paths",
+        "description": "Find ranked 2-3 hop introduction paths through facts and shared affiliations",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_identifier": {"type": "string", "description": "Company, person, email, or contact entity to reach"},
+                "max_hops": {"type": "integer", "minimum": 2, "maximum": 3, "default": 3},
+            },
+            "required": ["target_identifier"],
         },
     },
     {
@@ -306,7 +364,7 @@ TOOLS = [
     },
     {
         "name": "crm_merge_contacts",
-        "description": "Merge two contacts into one. Combines activities, deals, and facts.",
+        "description": "Merge two contacts with a complete undo record. Combines activities, deals, reminders, custom fields, and facts.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -314,6 +372,40 @@ TOOLS = [
                 "merge": {"type": "string", "description": "Contact to absorb and delete"},
             },
             "required": ["keep", "merge"],
+        },
+    },
+    {
+        "name": "crm_doctor",
+        "description": "Report CRM integrity issues and optionally repair safe issues",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fix": {
+                    "type": "boolean",
+                    "description": "Repair safe issues such as orphan ownership and email normalization",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "crm_auto_merge",
+        "description": "Dry-run or apply deterministic duplicate merges above a confidence threshold",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threshold": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 0.9,
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "List merges without changing data",
+                    "default": True,
+                },
+            },
         },
     },
     {
@@ -420,7 +512,7 @@ TOOLS = [
     },
     {
         "name": "crm_set_reminder",
-        "description": "Schedule a follow-up reminder for a contact",
+        "description": "Schedule a follow-up reminder; omit due_date to use tuned status cadence",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -428,7 +520,7 @@ TOOLS = [
                 "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)"},
                 "note": {"type": "string", "description": "Reminder note"},
             },
-            "required": ["identifier", "due_date", "note"],
+            "required": ["identifier", "note"],
         },
     },
     {
@@ -497,9 +589,55 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "crm_log_experiment",
+        "description": "Start a GTM experiment with a hypothesis, metric, and baseline",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Human-readable experiment name"},
+                "hypothesis": {"type": "string", "description": "Expected outcome and rationale"},
+                "metric": {"type": "string", "description": "Metric used to judge the experiment"},
+                "baseline_value": {
+                    "type": ["string", "number"],
+                    "description": "Metric value before the experiment",
+                },
+            },
+            "required": ["name", "hypothesis", "metric", "baseline_value"],
+        },
+    },
+    {
+        "name": "crm_conclude_experiment",
+        "description": "Complete an experiment and record its result and verdict",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug_or_name": {"type": "string", "description": "Experiment slug or name"},
+                "result_value": {
+                    "type": ["string", "number"],
+                    "description": "Observed metric value",
+                },
+                "verdict": {
+                    "type": "string",
+                    "enum": ["win", "loss", "neutral"],
+                    "description": "Required when baseline and result are not numeric",
+                },
+            },
+            "required": ["slug_or_name", "result_value"],
+        },
+    },
+    {
         "name": "crm_experiments",
         "description": "List all past CRM experiments with status and results",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "completed"],
+                    "description": "Optional experiment status filter",
+                },
+            },
+        },
     },
     {
         "name": "crm_win_patterns",
@@ -510,6 +648,16 @@ TOOLS = [
         "name": "crm_optimal_cadence",
         "description": "Data-driven follow-up timing from actual conversion data",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "crm_tuned_cadence",
+        "description": "Get the per-status follow-up intervals currently used by the CRM",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Optional contact status"},
+            },
+        },
     },
     {
         "name": "crm_dead_pipeline",
@@ -626,8 +774,21 @@ def handle_tool_call(name, arguments):
         elif name == "crm_pipeline":
             return crm.markdown()
 
+        elif name == "crm_forecast":
+            return json.dumps(crm.forecast(limit=arguments.get("limit")), default=str, indent=2)
+
+        elif name == "crm_calibration":
+            return json.dumps(crm.calibration_report(), default=str, indent=2)
+
         elif name == "crm_stats":
             return json.dumps(crm.stats(), default=str, indent=2)
+
+        elif name == "crm_export_full":
+            return json.dumps(crm.export_full(), default=str, indent=2)
+
+        elif name == "crm_import_csv":
+            result = crm.import_csv(arguments["path"], mapping=arguments.get("mapping"))
+            return json.dumps(result, default=str, indent=2)
 
         elif name == "crm_score_contact":
             score = crm.score_contact(arguments["identifier"])
@@ -640,6 +801,12 @@ def handle_tool_call(name, arguments):
         elif name == "crm_next_actions":
             actions = crm.next_actions(limit=arguments.get("limit", 10))
             return json.dumps(actions, default=str, indent=2)
+
+        elif name == "crm_queue_stats":
+            return json.dumps(crm.queue_stats(), default=str, indent=2)
+
+        elif name == "crm_propose_ticks":
+            return json.dumps(crm.propose_ticks(), default=str, indent=2)
 
         elif name == "crm_context_for_agent":
             ctx = crm.context_for_agent(arguments.get("identifier"))
@@ -676,6 +843,13 @@ def handle_tool_call(name, arguments):
 
         elif name == "crm_find_intros":
             results = crm.find_intros(arguments["target"])
+            return json.dumps(results, default=str, indent=2)
+
+        elif name == "crm_intro_paths":
+            results = crm.intro_paths(
+                arguments["target_identifier"],
+                max_hops=arguments.get("max_hops", 3),
+            )
             return json.dumps(results, default=str, indent=2)
 
         elif name == "crm_relationship_health":
@@ -716,6 +890,23 @@ def handle_tool_call(name, arguments):
             if result:
                 return json.dumps(result, default=str, indent=2)
             return "One or both contacts not found"
+
+        elif name == "crm_doctor":
+            return json.dumps(
+                crm.doctor(fix=arguments.get("fix", False)),
+                default=str,
+                indent=2,
+            )
+
+        elif name == "crm_auto_merge":
+            return json.dumps(
+                crm.auto_merge(
+                    threshold=arguments.get("threshold", 0.9),
+                    dry_run=arguments.get("dry_run", True),
+                ),
+                default=str,
+                indent=2,
+            )
 
         elif name == "crm_unified_search":
             results = crm.unified_search(arguments["term"])
@@ -758,7 +949,9 @@ def handle_tool_call(name, arguments):
             return result if result else f"Not found: {arguments['identifier']}"
 
         elif name == "crm_set_reminder":
-            rid = crm.set_reminder(arguments["identifier"], arguments["due_date"], arguments["note"])
+            rid = crm.set_reminder(
+                arguments["identifier"], arguments.get("due_date"), arguments["note"]
+            )
             return f"Reminder set (id={rid})" if rid else f"Not found: {arguments['identifier']}"
 
         elif name == "crm_due_reminders":
@@ -787,14 +980,42 @@ def handle_tool_call(name, arguments):
         elif name == "crm_evolve":
             return json.dumps(crm.evolve(), default=str, indent=2)
 
+        elif name == "crm_log_experiment":
+            slug = crm.log_experiment(
+                arguments["name"],
+                arguments["hypothesis"],
+                arguments["metric"],
+                arguments["baseline_value"],
+            )
+            return json.dumps({"slug": slug}, indent=2)
+
+        elif name == "crm_conclude_experiment":
+            experiment = crm.conclude_experiment(
+                arguments["slug_or_name"],
+                arguments["result_value"],
+                verdict=arguments.get("verdict"),
+            )
+            if experiment is None:
+                return f"Experiment not found: {arguments['slug_or_name']}"
+            return json.dumps(experiment, default=str, indent=2)
+
         elif name == "crm_experiments":
-            return json.dumps(crm.experiments(), default=str, indent=2)
+            return json.dumps(
+                crm.experiment_history(status=arguments.get("status")),
+                default=str,
+                indent=2,
+            )
 
         elif name == "crm_win_patterns":
             return json.dumps(crm.win_patterns(), default=str, indent=2)
 
         elif name == "crm_optimal_cadence":
             return json.dumps(crm.optimal_cadence(), default=str, indent=2)
+
+        elif name == "crm_tuned_cadence":
+            return json.dumps(
+                crm.tuned_cadence(arguments.get("status")), default=str, indent=2
+            )
 
         elif name == "crm_dead_pipeline":
             return json.dumps(crm.dead_pipeline(stale_days=arguments.get("stale_days", 60)), default=str, indent=2)
