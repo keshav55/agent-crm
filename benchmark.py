@@ -864,9 +864,20 @@ def run_status_fit_benchmarks():
         "WHERE f.made_at = '2026-10-16'").fetchall())
     check("forecast_settles_from_status",
           outcomes == {"Fran Finance": 1, "Tia Tail": 0, "Nora NoEmail": None})
+    # A lead already replied when forecast does not settle from that old
+    # status; a later move to met does.
+    fitdb.add_contact("Rita Replied", email="rita@r.test", status="replied", title="CFO")
+    fitdb.forecast_log(rules_path, today=_date(2026, 10, 17))
+    rita_id = fitdb.get_contact("rita@r.test")["id"]
+    rita = lambda: fitdb.conn.execute(  # noqa: E731
+        "SELECT outcome FROM forecasts WHERE contact_id = ?", (rita_id,)).fetchone()[0]
+    check("forecast_no_settle_from_old_status", rita() is None)
+    fitdb.update_contact("rita@r.test", status="met")
+    fitdb.settle_forecasts(_date(2026, 10, 18))
+    check("forecast_settles_on_later_change", rita() == 1)
     waiting = fitdb.grade()
-    check("grade_waits_for_floor", not waiting["ready"] and waiting["settled"] == 2
-          and "2 of 30" in waiting["message"])
+    check("grade_waits_for_floor", not waiting["ready"] and waiting["settled"] == 3
+          and "3 of 30" in waiting["message"])
     for i in range(30):
         fitdb.add_contact(f"Lead {i:02d}", email=f"l{i}@g.test", title="CFO" if i < 10 else "Intern")
     fitdb.forecast_log(rules_path, today=_date(2026, 10, 18))

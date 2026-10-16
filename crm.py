@@ -9248,16 +9248,24 @@ class CRM:
         )
 
     def settle_forecasts(self, today=None):
-        """Settle open forecasts from current statuses. Returns count settled."""
+        """Settle open forecasts from status changes made after the forecast.
+
+        A lead already replied, met, silent, or lost when it was forecast does
+        not settle from that old status: only a move to a different qualifying
+        status (compared with status_at, recorded at forecast time) counts.
+        Returns count settled."""
         today = (today or date.today()).isoformat()
         self._ensure_forecasts_table()
         settled = 0
         with self.conn:
             for row in self.conn.execute(
-                """SELECT f.id, c.status FROM forecasts f JOIN contacts c ON c.id = f.contact_id
+                """SELECT f.id, f.status_at, c.status FROM forecasts f
+                   JOIN contacts c ON c.id = f.contact_id
                    WHERE f.outcome IS NULL"""
             ).fetchall():
                 status = canonical_status(row["status"])
+                if status == canonical_status(row["status_at"]):
+                    continue  # no change since the forecast
                 outcome = (1 if status in self.FORECAST_POSITIVE
                            else 0 if status in self.FORECAST_NEGATIVE else None)
                 if outcome is None:
