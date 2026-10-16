@@ -828,6 +828,7 @@ def run_status_fit_benchmarks():
              "match": {"any_of": [{"field": "company", "any": ["freight"]},
                                   {"field": "tags", "equals": ["logistics"]}]}},
             {"id": "big", "weight": 20, "reason": "Big ticket", "match": {"monthly_value_min": 1000}},
+            {"id": "tail", "weight": -5, "reason": "Tail", "match": {"monthly_value_min": 7, "monthly_value_max": 25}},
             {"id": "no_email", "weight": -20, "reason": "No email", "match": {"field": "email", "missing": True}},
         ],
         "expected_value": {"default_monthly": 20},
@@ -849,7 +850,8 @@ def run_status_fit_benchmarks():
     nora = next(r for r in ranked if r["name"] == "Nora NoEmail")
     check("fit_reasons_and_negative_weights",
           nora["fit_score"] == 60 and {x["id"] for x in nora["reasons"]} == {"finance", "freight", "no_email"})
-    check("fit_default_value", nora["value_source"] == "default" and nora["monthly_value"] == 20)
+    check("fit_default_value", nora["value_source"] == "default" and nora["monthly_value"] == 20
+          and "tail" not in {x["id"] for x in nora["reasons"]})
     check("fit_default_rules_path", fitdb._default_fit_path() == rules_path)
     first = fitdb.forecast_log(rules_path, today=_date(2026, 10, 16))
     again = fitdb.forecast_log(rules_path, today=_date(2026, 10, 16))

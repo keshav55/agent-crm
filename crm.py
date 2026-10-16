@@ -9206,9 +9206,11 @@ class CRM:
                 continue
             facts = facts_by_entity.get(self._canonical_contact_entity(c), {})
             monthly, value_source = self._monthly_value(c, open_deals, rules)
+            # Value clauses judge the deal on file, never the assumed default.
+            deal_monthly = monthly if value_source == "deal" else 0
             points, reasons = 0, []
             for criterion in rules["criteria"]:
-                if self._fit_match(c, facts, criterion["match"], monthly):
+                if self._fit_match(c, facts, criterion["match"], deal_monthly):
                     points += criterion["weight"]
                     reasons.append({"id": criterion.get("id"), "weight": criterion["weight"],
                                     "reason": criterion.get("reason", "")})
@@ -10325,7 +10327,7 @@ def main():
                         print(f"    {u['name']}: {u['status']}")
                 if result.get("error"):
                     print(f"  Not applied: {result['error']}")
-                elif not result["applied"]:
+                elif not result["applied"] and result["changes"]:
                     print("  Dry run. Pass --apply to write (back up the database first).")
             if result.get("error"):
                 crm.close()
